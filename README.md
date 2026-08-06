@@ -119,6 +119,59 @@ node scripts/codex-dispatch.mjs <verb> [...]
 
 Prerequisites: Node 18+, `npm install -g @openai/codex`, `codex login`.
 
+## Usage
+
+A typical session, start to finish:
+
+```
+/codex-dispatch:dispatch review-brief.md --role review
+  → job: review-1786031944-36232        (returns immediately; the job runs in
+    out: C:\...\out.txt                  the background, minutes to half an hour)
+
+/codex-dispatch:status review-1786031944-36232     # check on it whenever
+/codex-dispatch:result review-1786031944-36232     # collect the verbatim answer
+```
+
+`dispatch` takes either a **path to an existing file** (used as the brief,
+byte-for-byte) or **inline text** (written verbatim to a temp file first — a
+brief never travels on a command line). The other commands — `:status`,
+`:result`, `:cancel`, `:list`, `:watch` — are one-argument wrappers over the
+runtime verbs below.
+
+All six commands are **user-typed only** (`disable-model-invocation: true`):
+Claude never fires a dispatch on its own, because a dispatch bills.
+
+**Writing a brief.** The brief is transported verbatim and Codex sees nothing
+else — not your conversation, not your session context. So it must stand alone:
+
+- name the working directory to read (`--cd D:\repo` points the sandbox there,
+  and the brief should say what to look at inside it);
+- state the question and the shape of answer you want (a review with findings?
+  a design with trade-offs? a diagnosis with a root cause?);
+- include any context the model needs, pasted in — it cannot ask follow-ups.
+
+**Wiring your own agents.** The plugin ships a model-facing skill
+(`codex-dispatch-runtime`, not user-invocable) that carries the full contract —
+verbatim transport, poll `result` instead of watching, never read `out.txt`
+around a refusal, never add `--allow-unproven-sight` to get past a gate. Any
+session with the plugin installed has it; you do not need to restate the rules.
+What the skill cannot know is **when your project wants a dispatch**, so if you
+want agents to reach for it as part of a workflow, say so in your `CLAUDE.md`,
+e.g.:
+
+```markdown
+## Second opinions
+For architecture decisions and pre-merge reviews, prepare a standalone brief
+and ask me to run /codex-dispatch:dispatch <brief> --role review --cd <repo>.
+Poll with /codex-dispatch:result; deliver the answer verbatim, including any
+warnings on stderr. Frontier tier (--model gpt-5.6-sol --effort xhigh) only
+when I ask for it.
+```
+
+(Keep the dispatch itself user-fired — that is what the
+`disable-model-invocation` flag enforces, and "ask me to run" is the phrasing
+that respects it.)
+
 ## Releases and versioning
 
 **A push that changes behavior MUST bump the version**, in all three places that
