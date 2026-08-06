@@ -17,8 +17,12 @@ plugin does not make:
 1. **Verbatim brief in.** The brief is a markdown file fed to `codex exec -` on
    stdin, byte-for-byte. Never inlined on a command line — Windows quoting
    mangles large briefs (learned in production, not a preference).
-2. **Model and effort pinned as defaults**, overridable per call:
-   `--model gpt-5.6-sol`, effort `xhigh` (via `-c model_reasoning_effort=...`).
+2. **Model and effort are pinned, recorded, and cheap by default.** Every job
+   records the exact model and effort it ran on in `job.json` — never "whatever
+   the CLI felt like". What *ships* is the budget pair, `gpt-5.6-luna` at
+   `medium` (via `-c model_reasoning_effort=...`), so a fresh install cannot
+   bill frontier prices by accident. Frontier is two flags away:
+   `--model gpt-5.6-sol --effort xhigh`.
 3. **Sandbox controlled.** Default `--sandbox read-only`; write access only via
    an explicit `--write` flag. A review dispatch can never scribble on the
    target repo by accident.
@@ -44,12 +48,12 @@ something.
 |  | official `codex` plugin | this (`codex-dispatch`) |
 | --- | --- | --- |
 | **Brief transport** | codex's own reviewer (no brief), prompt templates with interpolated variables, optional focus text | a markdown file on `codex exec -` stdin, byte-for-byte; never inlined on a command line |
-| **Model & effort** | deliberately unset — Codex's defaults, or your `config.toml` | pinned defaults (`gpt-5.6-sol`, `xhigh`), overridable per call, recorded in `job.json` |
+| **Model & effort** | deliberately unset — Codex's defaults, or your `config.toml` | explicit defaults, recorded in `job.json`; ships budget (`gpt-5.6-luna`, `medium`), frontier per call (`--model gpt-5.6-sol --effort xhigh`) |
 | **Sandbox** | `read-only` for reviews; the rescue agent defaults to write-capable | `read-only` unless `--write`, plus a functional sandbox preflight and post-run blind-job detection |
 | **Job model** | background jobs polled from the session via a companion app-server broker | detached supervisor, on-disk records, unique job dirs, same-role guard, kill-before-retry, stale reaping, atomic type-checked records, whitelisted ids |
 | **Hooks** | `SessionStart`/`SessionEnd` lifecycle, plus an opt-in stop-time review gate | none, ever — enforced by a test |
 | **Footprint** | companion app-server, agents, skills, prompt templates, output schemas, 8 commands | one zero-dependency script, 5 commands, 1 skill |
-| **Tests** | 8 test files, CI on every pull request | 29 tests — fake-codex lifecycle drills, blind/sighted regressions, plus an opt-in live smoke |
+| **Tests** | 8 test files, CI on every pull request | 30 tests — fake-codex lifecycle drills, blind/sighted regressions, plus an opt-in live smoke |
 
 Things the official plugin has that this one deliberately does not: the
 `codex-rescue` subagent, `/codex:review`'s zero-brief native reviewer, the
@@ -164,7 +168,11 @@ node scripts/codex-dispatch.mjs dispatch --brief review-brief.md --role review
   #   bin: C:\Users\me\AppData\Roaming\npm\codex.cmd
   #   out: C:\Users\me\AppData\Local\codex-dispatch\jobs\review-1785972364-11696\out.txt
 
-node scripts/codex-dispatch.mjs dispatch --brief b.md --role fix --cd D:\repo --write --model gpt-5.3-codex-spark --effort low
+node scripts/codex-dispatch.mjs dispatch --brief b.md --role fix --cd D:\repo --write
+node scripts/codex-dispatch.mjs dispatch --brief b.md --role review --model gpt-5.6-sol --effort xhigh
+  # ↑ the frontier escalation. Without those two flags a dispatch runs on the
+  #   shipped budget defaults: gpt-5.6-luna at medium effort.
+
 node scripts/codex-dispatch.mjs status            # all jobs
 node scripts/codex-dispatch.mjs status <job-id>   # one job: state, runtime, log size, out path
 node scripts/codex-dispatch.mjs result <job-id>   # the answer, verbatim, stdout only; nonzero + out: path if not done
@@ -284,7 +292,7 @@ writer of `job.json` (cancel excepted), so there are no write races.
 ## Tests
 
 ```
-node --test                            # everything: 29 tests (bare form — see below)
+node --test                            # everything: 30 tests (bare form — see below)
 node --test tests/dispatch.test.mjs    # lifecycle, against a fake codex
 node --test tests/packaging.test.mjs   # manifests, command frontmatter, no-hooks invariant
 node --test tests/resolution.test.mjs  # binary resolution, blind scan, id whitelist (imported, not spawned)
@@ -310,15 +318,20 @@ classification, a blind job being failed despite exit 0 and refused by `result`,
 a sighted job that echoes the signatures **not** being failed, a corrupt
 `job.json` leaving every other verb working, a *wrong-typed* `job.json` field
 being contained the same way rather than crashing `list`/`status`/`dispatch`,
-`cancel` reaping a corrupt job's pids without touching its record, and
-traversal-shaped ids and roles being refused.
+`cancel` reaping a corrupt job's pids without touching its record,
+traversal-shaped ids and roles being refused, and the shipped defaults landing
+in `job.json` as the budget pair while `--model`/`--effort` still override them
+— the last of those is a cost guard, not a preference, so it is asserted rather
+than assumed.
 
 `tests/resolution.test.mjs` imports the runtime instead of spawning it, which is
 why the runtime only calls `main()` when it is the process entry point.
 
 Live smoke verified 2026-08-06 against codex-cli 0.146.0: preflight, dispatch
 with `--model gpt-5.3-codex-spark --effort low`, poll to done, byte-verbatim
-`DISPATCH-OK` result. No drift from the pinned CLI contract observed.
+`DISPATCH-OK` result. No drift from the pinned CLI contract observed. It pins
+its model explicitly rather than riding the defaults, so it keeps exercising the
+override path — and keeps costing the same — whatever the defaults later become.
 
 End-to-end verified the same day, and it is the check that matters most: a
 `--role reviewer` dispatch whose brief was one line — *"Review
@@ -350,6 +363,25 @@ not just always saying yes.
 
 Things the brief left open, decided here:
 
+- **The shipped defaults are budget, not frontier** — `gpt-5.6-luna` at
+  `medium`, where they were once `gpt-5.6-sol` at `xhigh`. Having *explicit,
+  recorded* defaults is the structural difference from the official plugin,
+  which leaves them deliberately unset; that is unchanged. What changed is the
+  values, because a public repo whose defaults are the frontier pair bills
+  frontier prices to anyone who clones it and dispatches once, for a decision
+  they never made. Frontier is two flags away —
+  `--model gpt-5.6-sol --effort xhigh` — and power users override per call.
+  `medium` rather than `low` as the balanced public default: `low` is a
+  smoke-test setting, and an answer too shallow to use is its own kind of waste.
+  Orchestration consumers (anything dispatching on a contract — a second-opinion
+  arm pinned to a particular model, say) should pass `--model`/`--effort`
+  explicitly rather than inherit whatever this repo happens to ship.
+  Verified live against codex-cli 0.146.0 on 2026-08-06: `gpt-5.6-luna`
+  dispatched and answered verbatim in 4s, while the near-miss id `gpt-5.6-lua`
+  failed the job with `Model metadata for 'gpt-5.6-lua' not found` plus a 400
+  `The 'gpt-5.6-lua' model is not supported when using Codex with a ChatGPT
+  account` — which is also the evidence that the CLI validates model ids rather
+  than quietly accepting anything, so the accepted one is a real model.
 - **`--write` maps to `--sandbox workspace-write`**, not `danger-full-access`.
   Escalating past workspace writes is out of scope for a dispatch runtime.
 - **Default `--role` is `dispatch`** when none is given.
@@ -411,7 +443,7 @@ Things the brief left open, decided here:
 - **`out.txt` existence overrides `job.json` state**: if the supervisor died
   after codex finished but before finalizing the record, the job still reads as
   done — the out file is the authoritative done signal.
-- **Effort is passed as `-c model_reasoning_effort=xhigh`** (no embedded
+- **Effort is passed as `-c model_reasoning_effort=<effort>`** (no embedded
   quotes): that is the argv the verified production contract actually delivered
   after shell quote-stripping.
 - **`result` prints the answer to stdout only; all diagnostics go to stderr**,

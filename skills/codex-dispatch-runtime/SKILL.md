@@ -18,8 +18,13 @@ Runtime: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" <verb>`
 1. **Verbatim brief in.** The brief is a markdown FILE fed to `codex exec -` on
    stdin, byte-for-byte. Never inline a brief on a command line (Windows quoting
    mangles it) and never rewrite the brief on the way in.
-2. **Pinned defaults, per-call overrides.** Model defaults to `gpt-5.6-sol`,
-   reasoning effort to `xhigh`. Override only with explicit `--model` / `--effort`.
+2. **Pinned defaults, per-call overrides.** Defaults are explicit and recorded
+   in `job.json`, and they ship budget on purpose: model `gpt-5.6-luna`,
+   reasoning effort `medium`, so a fresh install cannot bill frontier prices by
+   accident. Frontier is two flags away — `--model gpt-5.6-sol --effort xhigh`.
+   If a dispatch is part of a contract that names a model (a second-opinion arm,
+   say), pass `--model`/`--effort` explicitly rather than relying on whatever
+   the runtime currently ships.
 3. **Sandbox controlled.** Default `--sandbox read-only`. Only `--write` (maps to
    `workspace-write`) allows writes, and only when the task genuinely needs them.
    Review/architecture/design dispatches stay read-only, always.

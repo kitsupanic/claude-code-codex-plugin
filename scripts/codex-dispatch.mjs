@@ -12,8 +12,14 @@ import { fileURLToPath } from 'node:url';
 
 const SELF = fileURLToPath(import.meta.url);
 const WIN = process.platform === 'win32';
-const DEFAULT_MODEL = 'gpt-5.6-sol';
-const DEFAULT_EFFORT = 'xhigh';
+// Defaults are pinned and recorded, but deliberately NOT the frontier pair. A
+// fresh install must not be able to bill frontier prices by accident, so what
+// ships is the budget model at medium effort; frontier is two explicit flags
+// away (`--model gpt-5.6-sol --effort xhigh`). Orchestration consumers should
+// pass their own model/effort per call rather than inherit whatever ships here.
+// `gpt-5.6-luna` verified live against codex-cli 0.146.0 on 2026-08-06.
+const DEFAULT_MODEL = 'gpt-5.6-luna';
+const DEFAULT_EFFORT = 'medium';
 
 // Job ids are the only strings that ever become a path segment from user input.
 // Whitelist, never sanitize: anything outside this shape is refused, loudly.

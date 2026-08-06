@@ -82,6 +82,32 @@ test('dispatch returns immediately, job dir is complete, result is verbatim', as
   );
 });
 
+test('the shipped defaults are the budget pair, and explicit flags override them', async () => {
+  // The defaults are a safety property, not a preference: an install that has
+  // only ever been cloned must not be able to bill frontier prices by accident.
+  // Asserted on job.json rather than the constants because the record is what
+  // the supervisor hands to `codex exec --model/-c model_reasoning_effort`.
+  const brief = writeBrief('briefdefaults.md', 'quick');
+
+  const d = run(['dispatch', '--brief', brief, '--role', 'defaults']);
+  assert.equal(d.status, 0, d.stderr);
+  const defaulted = record(jobIdFrom(d.stdout));
+  assert.equal(defaulted.model, 'gpt-5.6-luna', 'ships at the budget model, not the frontier one');
+  assert.equal(defaulted.effort, 'medium', 'and at medium effort, not xhigh');
+  assert.equal(defaulted.sandbox, 'read-only', 'and read-only, as always');
+
+  const o = run(['dispatch', '--brief', brief, '--role', 'overridden',
+    '--model', 'gpt-5.6-sol', '--effort', 'xhigh']);
+  assert.equal(o.status, 0, o.stderr);
+  const overridden = record(jobIdFrom(o.stdout));
+  assert.equal(overridden.model, 'gpt-5.6-sol', 'frontier is two flags away');
+  assert.equal(overridden.effort, 'xhigh');
+
+  for (const id of [jobIdFrom(d.stdout), jobIdFrom(o.stdout)]) {
+    await poll(() => fs.existsSync(path.join(JOBS, id, 'out.txt')));
+  }
+});
+
 test('rapid successive dispatches get unique job dirs', async () => {
   const brief = writeBrief('brief2.md', 'quick');
   // roles are [a-z]+ only, so that job ids stay inside the id whitelist
