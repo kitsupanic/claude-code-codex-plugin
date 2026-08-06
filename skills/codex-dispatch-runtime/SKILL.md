@@ -30,27 +30,43 @@ Runtime: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" <verb>`
    Review/architecture/design dispatches stay read-only, always.
 4. **Verbatim answer out.** `result` prints the model's answer byte-for-byte.
    Never summarize, truncate, filter, re-rank, or reformat it — deliver it whole.
-5. **No blind answers — sight is PROVEN, per job, before the run.** A codex whose
+5. **No unproven answer without an explicit, recorded opt-in.** A codex whose
    sandbox cannot run commands sees no files and answers anyway, exiting 0. So
    before each job's codex is launched, the supervisor reads a file inside that
-   job's own `--cd` through codex's sandbox and requires the bytes back. No proof,
-   no job: it fails as `failed / sandbox-blind-precheck` before anything is spent,
-   and `result` refuses it. A finished job records how sight was established
-   (`sight: cwd-file:<name>`, the strong form; `job-nonce`, weaker; `unproven` on a
-   codex with no `sandbox` subcommand). Never work around a blind verdict by
-   reading the out file yourself: a sourceless second opinion is worse than none.
-   A `warning:` on a delivered job (sandbox signatures in the log, or unproven
-   sight) is not a blind verdict — relay the answer, and relay the warning with it.
+   job's own `--cd` through codex's sandbox and requires the bytes back. That proof
+   is the deliverability gate:
+   - **Proven** — `sight: cwd-file:<name>`. The job runs and delivers normally.
+   - **Disproven** — the sandbox failed: `failed / sandbox-blind-precheck`, before
+     anything is spent. `result` refuses it.
+   - **Unprovable** — a codex with no `sandbox` subcommand, or a `--cd` with no
+     readable file to prove a read against: `failed / sight-unproven`, also before
+     anything is spent, also refused. This is NOT a defect to route around; it
+     names its cure (usually `npm install -g @openai/codex`, or a `--cd` pointed at
+     the directory the model actually has to read). Fix it and re-dispatch.
+   - **Unprovable, accepted** — `--allow-unproven-sight` on the dispatch. Only then
+     does an unprovable job run; the record carries
+     `sight: unproven (accepted by caller)`, and `result` delivers the bytes with
+     an `UNPROVEN SIGHT` caveat on stderr.
+
+   Pass `--allow-unproven-sight` only when a human asked for it or the situation is
+   understood and stated; never as a reflex to get past a refusal. If a dispatch is
+   refused for unproven sight, **say so and name the cure** rather than retrying
+   with the flag. And never work around any of this by reading the out file
+   yourself: a sourceless second opinion is worse than none. When an answer does
+   arrive carrying `UNPROVEN SIGHT` or a `warning:`, relay the answer AND the
+   caveat — both, every time.
 
 ## Verbs
 
-- `dispatch --brief <file> [--role <stem>] [--cd <dir>] [--model <m>] [--effort <e>] [--write] [--force] [--watch]`
+- `dispatch --brief <file> [--role <stem>] [--cd <dir>] [--model <m>] [--effort <e>] [--write] [--force] [--watch] [--allow-unproven-sight]`
   — returns immediately with `job: <id>`, `bin: <codex binary>` and `out: <path>`.
   Refuses if a job with the same role may still have live processes (running,
   stale, or kill-failed); `--force` kills that job's tree first **and verifies it
   died** — if anything survived, the new job is refused rather than launched
   beside it. `--role` must be lowercase letters only (`^[a-z]+$`), and the role is
   claimed atomically, so of two dispatches racing for one role exactly one wins.
+  `--allow-unproven-sight` is invariant 5's opt-in; it is never a default and never
+  a way around a refusal you have not read.
 - `status [<job-id>]` — state (running / done / failed / killed / kill-failed /
   stale / corrupt), a `reason:` line when there is one, `sight:`, `warning:` and
   `survivors:` lines when they apply, runtime, log size, `out:` path.
@@ -60,10 +76,11 @@ Runtime: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" <verb>`
   but whose run was never vouched for. An existing `out.txt` is bytes, not a
   verdict.
 - `cancel <job-id>` — kills the whole job tree and checks it died. Survivors mean
-  `kill-failed` (not `killed`), a nonzero exit, and the role stays blocked. On a
-  job whose `job.json` is corrupt it reaps the pid files instead, preserves the
-  record as evidence, and renames the spent pid files so a second cancel replays
-  nothing — that second cancel reports `already reaped` and changes nothing.
+  `kill-failed` (not `killed`), a nonzero exit, and the role stays blocked; a pid
+  the OS refuses to answer about counts as a survivor, not as a death. On a job
+  whose `job.json` is corrupt it reaps the pid files instead, preserves the record
+  as evidence, and marks the spent pids so a second cancel replays nothing — that
+  second cancel reports `already reaped` and changes nothing.
 - `list` — all jobs, newest first, one line each.
 - `watch <job-id>` — opens a console window that follows the job and shouts when
   it finishes. **For humans only** (see below).
@@ -97,7 +114,9 @@ until the record says done, which is exactly the signal to wait on.
   who has been burned by dropped notifications. An agent gains nothing from a
   console window it cannot see and must never block on one — poll `result`, which
   exits nonzero until the record says done.
-- A job that comes back `failed / sandbox-blind-precheck` was not a bad answer, it
-  was no answer — codex never ran, and nothing was billed. Fix the install
-  (`preflight` names how) and re-dispatch; do not relay it, and do not read the
-  out file in its place (there is none).
+- A job that comes back `failed / sandbox-blind-precheck` or `failed /
+  sight-unproven` was not a bad answer, it was no answer — codex never ran, and
+  nothing was billed. Fix what the refusal names (`preflight` names the install
+  half; a `--cd` with nothing readable in it is the other half) and re-dispatch.
+  Do not relay it, do not read the out file in its place (there is none), and do
+  not reach for `--allow-unproven-sight` to make the refusal go away.

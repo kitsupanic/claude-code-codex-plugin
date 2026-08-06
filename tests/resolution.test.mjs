@@ -17,10 +17,14 @@ import {
   ROLE_RE,
   binCandidates,
   isDesktopApp,
+  livenessFromError,
+  parseArgs,
   pickProbeTarget,
   scanBlindLog,
   scanBlindText,
+  stripControlBytes,
   validateRecord,
+  verifyClaim,
 } from '../scripts/codex-dispatch.mjs';
 
 const NPM = path.join('C:\\Users\\me\\AppData\\Roaming', 'npm', 'codex.cmd');
@@ -148,6 +152,73 @@ test('the record fields the new states carry are type-checked like the rest', ()
   assert.match(validateRecord({ ...base, warning: 5 }), /field "warning" is not a string \(number\)/);
   assert.match(validateRecord({ ...base, sight: {} }), /field "sight" is not a string \(object\)/);
   assert.match(validateRecord({ ...base, killSurvivors: [1, 2] }), /field "killSurvivors" is not a string \(array\)/);
+
+  // The opt-in and the spent-pid list are read by the supervisor and by every
+  // reap, so they are validated exactly as hard as the rest.
+  assert.equal(validateRecord({ ...base, allowUnprovenSight: true, reapedPids: [1, 2] }), null);
+  assert.equal(validateRecord({ ...base, allowUnprovenSight: false, reapedPids: [] }), null);
+  assert.match(validateRecord({ ...base, allowUnprovenSight: 'yes' }),
+    /field "allowUnprovenSight" is not a boolean \(string\)/,
+    'a truthy string must not be able to buy an unproven delivery');
+  assert.match(validateRecord({ ...base, reapedPids: '1,2' }),
+    /field "reapedPids" is not an array \(string\)/);
+  assert.match(validateRecord({ ...base, reapedPids: [1, '2'] }),
+    /field "reapedPids" holds a non-number \(string\)/);
+});
+
+test('only ESRCH means dead: an access-denied liveness probe means ALIVE', () => {
+  // The inversion this fixes: every exception used to read as "dead", so a kill
+  // that failed because the target could not be signalled — elevated, another
+  // user's, protected — reported itself as verified. EPERM is the shape of a
+  // survivor, and a survivor may be codex, and codex alive is codex billing.
+  assert.equal(livenessFromError({ code: 'ESRCH' }), false, 'no such process: dead');
+  assert.equal(livenessFromError({ errno: -3 }), false, 'UV_ESRCH by errno: dead');
+  for (const err of [
+    { code: 'EPERM' },            // POSIX: exists, may not signal
+    { code: 'EACCES' },           // Windows access-denied shapes
+    { code: 'UNKNOWN' },
+    { code: undefined },
+    {},
+    null,
+  ]) {
+    assert.equal(livenessFromError(err), true,
+      `${JSON.stringify(err)} is not evidence of death, so it must read as alive`);
+  }
+});
+
+test('control bytes are stripped from log output; text and whitespace survive', () => {
+  assert.equal(stripControlBytes('\x1b]0;title\x07after'), ']0;titleafter', 'ESC and BEL go');
+  assert.equal(stripControlBytes('\x1b[2J\x1b[1;1Hcleared'), '[2J[1;1Hcleared');
+  assert.equal(stripControlBytes('a\x00b\x08c\x7fd'), 'abcd');
+  assert.equal(stripControlBytes('keep\tthese\r\nand\nthese'), 'keep\tthese\r\nand\nthese',
+    'tab, CR and LF are the log\'s own formatting and must survive');
+  assert.equal(stripControlBytes('hyphens-and-dashes — stay'), 'hyphens-and-dashes — stay',
+    'the character class must not eat a literal hyphen');
+  assert.equal(stripControlBytes("C1controlstoo"), "C1controlstoo",
+    'the C1 range some terminals still act on goes too');
+});
+
+test('verify-own-claim compares the owner, not the existence of the lock', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-claim-'));
+  try {
+    assert.equal(verifyClaim(dir, 'a-1-2'), false, 'no owner file: the claim is not ours');
+    fs.writeFileSync(path.join(dir, 'owner'), 'a-1-2\n');
+    assert.equal(verifyClaim(dir, 'a-1-2'), true);
+    assert.equal(verifyClaim(dir, 'b-1-2'), false, 'somebody else took it over');
+    assert.equal(verifyClaim(path.join(dir, 'gone'), 'a-1-2'), false, 'the lock dir vanished');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('--allow-unproven-sight parses as a flag, not as a value-taking option', () => {
+  const o = parseArgs(['dispatch', '--brief', 'b.md', '--role', 'r', '--allow-unproven-sight', '--force']);
+  assert.equal(o.allowUnprovenSight, true);
+  assert.equal(o.force, true);
+  assert.equal(o.brief, 'b.md');
+  assert.equal(o.role, 'r', 'the flag must not swallow the next argument');
+  assert.equal(parseArgs(['dispatch', '--brief', 'b.md']).allowUnprovenSight, undefined,
+    'and it is off unless it is asked for');
 });
 
 test('the states that may still own processes are the ones that block a role', () => {
