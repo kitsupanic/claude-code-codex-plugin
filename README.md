@@ -172,6 +172,14 @@ when I ask for it.
 `disable-model-invocation` flag enforces, and "ask me to run" is the phrasing
 that respects it.)
 
+If you want a dedicated subagent instead — one that composes the brief,
+dispatches, polls, and relays verbatim when you ask for a second opinion —
+copy [examples/second-opinion-agent.md](examples/second-opinion-agent.md) into
+your project's `.claude/agents/` and adjust the description to your workflow.
+It encodes the same contract: budget defaults unless you ask for frontier,
+poll `result` (never `watch`), refusals relayed as-is, no
+`--allow-unproven-sight` on its own initiative.
+
 ## Releases and versioning
 
 **A push that changes behavior MUST bump the version**, in all three places that
