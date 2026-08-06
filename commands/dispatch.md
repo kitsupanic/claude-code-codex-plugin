@@ -7,6 +7,8 @@ allowed-tools: Bash(node:*), Write, Read
 
 Dispatch a background Codex job from the user's arguments: `$ARGUMENTS`
 
+Two layers, and the distinction matters: the runtime verb takes a brief **only** as `--brief <file>` — it has no inline-text argument. Accepting inline text is this command's convenience, and it works by writing that text to a temp file first (step 1) before calling the verb.
+
 1. Determine the brief file:
    - If the first non-flag argument is a path to an existing file, that file IS the brief. Use it as-is — do not read, edit, or reformat it.
    - Otherwise the non-flag text is an inline brief. Resolve the real OS temp directory first — `node -e "console.log(require('node:os').tmpdir())"`, which is shell-independent and agrees with `$env:TEMP` in PowerShell and `${TMPDIR:-/tmp}` in Git Bash — then write the text VERBATIM (every byte, no reframing, no additions) to `<temp-dir>/codex-dispatch-brief-<epoch>.md`. Never write a brief under `${CLAUDE_PLUGIN_ROOT}` or next to it: that is the plugin's install tree inside the marketplace directory, not scratch space. Inline text always goes through a file, never a command line.

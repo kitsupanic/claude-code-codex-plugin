@@ -7,4 +7,4 @@ allowed-tools: Bash(node:*)
 
 !`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" status $ARGUMENTS`
 
-Present the command output to the user unchanged. Every job block ends with an `out:` line naming the literal output file path — always keep it; it is the fallback delivery channel if notifications drop.
+Present the command output to the user unchanged. Every job block ends with an `out:` line naming the literal output file path — always keep it; it is the fallback delivery channel if notifications drop. With no jobs on disk there is no block at all: the command prints a single `no jobs in <jobs-root>` line.
