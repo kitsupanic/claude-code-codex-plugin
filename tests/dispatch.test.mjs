@@ -328,6 +328,80 @@ test('a liveness probe that hits EPERM means ALIVE, so the kill counts as failed
   assert.equal(record(id).state, 'killed');
 });
 
+test('a recorded pid the OS has reissued is not fired at, and is not read as alive', async () => {
+  // Pid reuse. The numbers in a record are written down once and fired at
+  // whenever a cancel gets round to them — `taskkill /PID <n> /T /F`, hours
+  // later, at whatever holds that number by then. reaped.pids does not cover it:
+  // that stops a SECOND shot, and the first is the one that hits a stranger. The
+  // same number read as alive is how a dead job reads `running` for ever.
+  //
+  // The reuse itself is not producible on demand — it needs the OS to reissue a
+  // chosen number — so CODEX_DISPATCH_TEST_START_TIME stands in for what the OS
+  // would report, exactly as CODEX_DISPATCH_TEST_EPERM stands in for a denied
+  // liveness probe. The sleepers below are the innocent processes: real, alive,
+  // and nothing to do with these jobs.
+  const sleeper = () => {
+    const child = spawn(process.execPath, ['-e', 'setTimeout(() => {}, 120000)'], { stdio: 'ignore' });
+    child.unref();
+    return child;
+  };
+  const mine = sleeper();
+  const stranger = sleeper();
+  const fixture = (id, pid, recordedStart) => {
+    const dir = path.join(JOBS, id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+      recordVersion: RECORD_VERSION, id, role: id.split('-')[0], state: 'running',
+      started: new Date(Date.now() - 3600000).toISOString(),
+      launch: 'spawned', supervisorPid: pid, codexPid: null,
+      pidStarts: { [pid]: recordedStart },
+    }));
+    return id;
+  };
+  try {
+    assert.ok(await poll(() => pidAlive(mine.pid) && pidAlive(stranger.pid)), 'both sleepers must be up');
+    const AT = '2026-08-06T13:49:29.0000000+00:00';
+    const LATER = '2026-08-06T19:20:21.0000000+00:00';
+
+    // The control: the number still carries the start time the record wrote down,
+    // so it IS this job's process. Nothing about identity may change that.
+    const same = fixture('reusedsame-1-99989', mine.pid, AT);
+    const sameEnv = { CODEX_DISPATCH_TEST_START_TIME: `${mine.pid}:${AT}` };
+    assert.match(run(['status', same], sameEnv).stdout, /^state: running$/m,
+      'a matching start time leaves the pid alive, as before');
+    const killed = run(['cancel', same], sameEnv);
+    assert.equal(killed.status, 0, killed.stderr);
+    assert.ok(await poll(() => !pidAlive(mine.pid)), 'and the kill still lands on it');
+
+    // The reused number: alive, but started long after this job recorded it.
+    const reused = fixture('reused-1-99988', stranger.pid, AT);
+    const reusedEnv = { CODEX_DISPATCH_TEST_START_TIME: `${stranger.pid}:${LATER}` };
+    assert.match(run(['status', reused], reusedEnv).stdout, /^state: stale$/m,
+      'a live number that is not ours must not read as running');
+
+    const c = run(['cancel', reused], reusedEnv);
+    assert.equal(c.status, 0, c.stderr);
+    assert.equal(record(reused).state, 'killed', 'the job is dead: its process went, the number stayed');
+    assert.ok(c.stderr.includes(String(stranger.pid)), 'and the pid it declined to signal is named');
+    assert.match(c.stderr, /reissued/);
+    assert.ok(pidAlive(stranger.pid), 'the process holding that number now must be untouched');
+
+    // Fail open, both ways round: a record from before start times were kept, and
+    // one whose current start time cannot be read, keep the old behaviour.
+    const legacy = path.join(JOBS, 'reusedold-1-99987');
+    fs.mkdirSync(legacy, { recursive: true });
+    fs.writeFileSync(path.join(legacy, 'job.json'), JSON.stringify({
+      recordVersion: RECORD_VERSION, id: 'reusedold-1-99987', role: 'reusedold', state: 'running',
+      started: new Date(Date.now() - 3600000).toISOString(),
+      launch: 'spawned', supervisorPid: stranger.pid, codexPid: null,
+    }));
+    assert.match(run(['status', 'reusedold-1-99987'], reusedEnv).stdout, /^state: running$/m,
+      'nothing recorded, nothing to check: the pid keeps the standing it had');
+  } finally {
+    for (const child of [mine, stranger]) { try { process.kill(child.pid); } catch { /* gone */ } }
+  }
+});
+
 test('a claimer descheduled after winning the role detects the takeover and aborts', async () => {
   // mkdir-then-write-owner left a fence: a claimer paused inside the window could
   // be reclaimed and then wake up and write its own name back over the new

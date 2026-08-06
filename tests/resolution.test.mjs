@@ -19,6 +19,7 @@ import {
   KNOWN_STATES,
   LIVE_STATES,
   PID_MAX,
+  PROBE_UNSAFE_NAME,
   PROVEN_SIGHT_PREFIX,
   RECORD_VERSION,
   ROLE_RE,
@@ -42,8 +43,10 @@ import {
   pickProbeTarget,
   pickProbeToken,
   roleOfJob,
+  sameStartTime,
   scanBlindLog,
   scanBlindText,
+  shQuote,
   sightVerdict,
   stripControlBytes,
   validateRecord,
@@ -150,16 +153,18 @@ test('the sight probe reads the cwd and never writes to it', () => {
     fs.mkdirSync(path.join(dir, 'sub'));
     assert.equal(pickProbeTarget(dir), null, 'a directory is not a file');
 
-    // Sorted, so the order below is the order examined: the %-name is skipped
-    // (cmd.exe would expand it), the binary yields no ASCII token, the text file
-    // wins — and nothing new appears in the directory.
+    // Sorted, so the order below is the order examined: the $-name is skipped
+    // (sh would RUN it — `sh -c "cat $(hostname).md"` executes the substitution),
+    // the %-name is skipped (cmd.exe would expand it), the binary yields no ASCII
+    // token, the text file wins — and nothing new appears in the directory.
+    fs.writeFileSync(path.join(dir, '$(hostname).md'), 'command substitution names are skipped\n');
     fs.writeFileSync(path.join(dir, 'a%pct.txt'), 'percent names are skipped\n');
     fs.writeFileSync(path.join(dir, 'a.bin'), Buffer.from([0, 1, 2, 3, 4, 5]));
     fs.writeFileSync(path.join(dir, 'b.txt'), '\n  \nhello from b\nmore\n');
     const picked = pickProbeTarget(dir);
     assert.equal(picked.name, 'b.txt');
     assert.equal(picked.token, 'hello from b', 'the token is a short ASCII line to verify the read by');
-    assert.deepEqual(fs.readdirSync(dir).sort(), ['a%pct.txt', 'a.bin', 'b.txt', 'sub'],
+    assert.deepEqual(fs.readdirSync(dir).sort(), ['$(hostname).md', 'a%pct.txt', 'a.bin', 'b.txt', 'sub'],
       'a job cwd is somebody\'s repo: the probe must leave nothing in it');
 
     fs.writeFileSync(path.join(dir, 'b.txt'), '');
@@ -167,6 +172,61 @@ test('the sight probe reads the cwd and never writes to it', () => {
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('a file name a shell would expand is never quoted, and never picked', () => {
+  // The POSIX probe is `sh -c "cat <name>"`, and the name comes off a directory
+  // somebody else fills. JSON.stringify was doing the quoting, and it produces a
+  // DOUBLE-quoted string — inside which sh expands $(...), backticks and
+  // backslashes — so a file called `$(cmd).md` in the probed cwd RAN during the
+  // read that was meant to prove sight. Single quotes expand nothing.
+  const bs = String.fromCharCode(92);
+  assert.equal(shQuote('plain.txt'), "'plain.txt'");
+  assert.equal(shQuote('$(id).md'), "'$(id).md'", 'a substitution inside single quotes is inert text');
+  assert.equal(shQuote('a`b`c'), "'a`b`c'");
+  assert.equal(shQuote(`a${bs}b`), `'a${bs}b'`, 'a backslash is literal in single quotes, so it stays');
+  // The one character single quotes cannot hold: closed, escaped, reopened.
+  assert.equal(shQuote("it's.md"), `'it'${bs}''s.md'`);
+
+  // And the second lock: both shells' expansion characters are skipped outright
+  // rather than trusted to that quoting.
+  for (const name of ['$(id).md', 'a`b', "it's.md", `a${bs}b`, 'a%b', 'a^b', 'a&b', 'a!b', 'a"b']) {
+    assert.equal(PROBE_UNSAFE_NAME.test(name), true, `${name} must be passed over, not quoted`);
+  }
+  for (const name of ['README.md', 'a-b_c.1.txt', 'a b.txt', 'ünïcode.txt']) {
+    assert.equal(PROBE_UNSAFE_NAME.test(name), false, `${name} is an ordinary name`);
+  }
+});
+
+test('a recorded pid whose start time has moved is not that process any more', () => {
+  // Pid identity, decided in one place. Absence on either side is the fail-open
+  // case: an older record, or an OS that would not answer, must leave the pid
+  // exactly the standing it had — killed, and read as alive.
+  const t = '2026-08-06T13:49:29.0000000+00:00';
+  assert.equal(sameStartTime(t, t), true);
+  assert.equal(sameStartTime(t, '2026-08-06T13:49:30.5000000+00:00'), true,
+    'two readings of one instant differ by whatever rounded them');
+  assert.equal(sameStartTime(t, '2026-08-06T13:49:40.0000000+00:00'), false,
+    'ten seconds apart is a different process wearing a recycled number');
+  assert.equal(sameStartTime(undefined, t), true, 'nothing recorded: keep the old behaviour');
+  assert.equal(sameStartTime(t, undefined), true, 'nothing readable now: keep the old behaviour');
+  assert.equal(sameStartTime('', t), true);
+  assert.equal(sameStartTime('not a time', 'not a time'), true, 'identical text is identical');
+  assert.equal(sameStartTime('not a time', 'some other text'), false,
+    'both readings come from the same command on the same machine');
+});
+
+test('the pid start-time map is validated like every other record field', () => {
+  const base = { state: 'running', started: '2026-08-06T00:00:00.000Z' };
+  assert.equal(validateRecord({ ...base, pidStarts: { 1234: '2026-08-06T13:49:29Z' } }), null);
+  assert.equal(validateRecord({ ...base }), null, 'a record without one stays valid');
+  assert.equal(validateRecord({ ...base, pidStarts: {} }), null);
+  assert.match(validateRecord({ ...base, pidStarts: [] }), /field "pidStarts" is not an object \(array\)/);
+  assert.match(validateRecord({ ...base, pidStarts: '1234=x' }), /field "pidStarts" is not an object \(string\)/);
+  assert.match(validateRecord({ ...base, pidStarts: { 0: 'x' } }), /is keyed by something that is not a pid/,
+    'the keys are kill targets, so they live in the pid domain like every other pid');
+  assert.match(validateRecord({ ...base, pidStarts: { '../x': 'y' } }), /is keyed by something that is not a pid/);
+  assert.match(validateRecord({ ...base, pidStarts: { 1234: 5 } }), /holds a start time that is not a string/);
 });
 
 test('the record fields the new states carry are type-checked like the rest', () => {
