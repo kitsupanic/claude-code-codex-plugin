@@ -523,24 +523,40 @@ than opening nothing and claiming otherwise.
   at again.
 - **Windows `shell: true` quoting refuses what it cannot escape.** `codex.cmd`
   needs a shell, so `spawnCodex`/`runCodexSync` join argv into one command line
-  with `cmdQuote`. Two defects lived here until 0.7.0, both found by a Codex
-  review of this file's own subject:
-  - `%` is expanded by `cmd.exe` *after* quote stripping, so `"%PATH%"` expands
-    exactly like `%PATH%` and no quoting reaches it. There is no in-band escape,
-    so it is now **refused**: `dispatch` rejects a `--model`, `--effort` or `--cd`
-    carrying one (naming the cure), and `cmdQuote` throws if one arrives anyway.
-    `%` is a legal NTFS filename character, so a `--cd` with one in it is a real
-    directory this runtime will not point at — fail-closed by construction, and
-    the cure is one directory away.
-  - a **trailing backslash** run turned `foo bar\` into `"foo bar\"`, which
-    `CommandLineToArgvW` reads as an escaped quote: the argument lost its
-    delimiter and swallowed the next one. The run against the closing delimiter
-    is now doubled, which that parser reads back as N literal backslashes and a
-    delimiter that survives. Interior backslashes are untouched.
+  with `cmdQuote`. Three characters cannot survive that command line and are
+  **refused** rather than escaped (`CMD_UNSAFE`), because a value that silently
+  becomes something else is the blind-answer failure in another costume:
+  - `%` and `!` are expanded by `cmd.exe` *after* quote stripping, so `"%PATH%"`
+    expands exactly like `%PATH%` and no quoting reaches either. `!` is inert
+    under the `cmd.exe /d /s /c` Node launches, so refusing it is a guarantee
+    about somebody else's future setting rather than a live defect.
+  - `"` is the one character whose two escaping conventions disagree: `cmd.exe`
+    tracks quote *parity* to find metacharacters, while `CommandLineToArgvW` reads
+    `\"` as an escape — so `""` satisfies one parser and breaks the other, and
+    there is no spelling that satisfies both. Windows paths cannot contain one, so
+    refusing costs nothing real. (0.7.0 escaped it as `""`, and `a\"` did not
+    round-trip.)
 
-  What remains: `CODEX_DISPATCH_BIN` is documented as trusted and unchecked, so a
-  binary path containing `%` reaches `cmdQuote`'s throw rather than a clean
-  refusal — fail-closed, but it surfaces as a stack trace instead of a message.
+  Separately, a **trailing backslash** run turned `foo bar\` into `"foo bar\"`,
+  which `CommandLineToArgvW` reads as an escaped quote: the argument lost its
+  delimiter and swallowed the next one. The run against the closing delimiter is
+  doubled now, which that parser reads back as N literal backslashes and a
+  delimiter that survives. Interior runs are untouched — only the run against the
+  delimiter is ambiguous, and a Windows path is mostly interior runs.
+
+  **The refusal is applied to the RESOLVED value, and it lands somewhere.** 0.7.0
+  got both halves of that wrong. It validated `opts.cd`, so a dispatch with no
+  `--cd` skipped the check entirely and put `process.cwd()` into the record
+  unexamined; run from a directory with a `%` in its name, the supervisor then
+  threw inside a detached process with nobody to catch it, and the job sat
+  `stale` holding its role. So the check now runs on the resolved cwd (the same
+  rule the jobs root states: check the value where it is *read*), the record is
+  written from the values that were checked rather than from a second computation
+  of them, and the supervisor's spawn is wrapped so a refusal finalizes the record
+  as `failed / codex-argv-refused` instead of stranding it. `main()` catches the
+  same refusal — tagged `CMD_UNQUOTABLE`, so the catch cannot widen to every other
+  throw — and reports it through `fail()`, which covers preflight and the sight
+  probe, where a `CODEX_DISPATCH_BIN` path is documented as trusted and unchecked.
 - **The POSIX process-group kill is unit-tested everywhere and integration-tested
   only on POSIX.** `killPlan` pins the targets (`[-pid, pid]` off Windows,
   `taskkill /T /F` on it) as data, so the decision is asserted on both platforms;

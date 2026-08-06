@@ -55,7 +55,7 @@ this is orchestration infrastructure.
 | **Job model** | background jobs polled from the session via a companion app-server broker | detached supervisor, on-disk records, unique job dirs, atomic role claims, verified kill-before-retry, stale reaping, atomic type-checked records, whitelisted ids and roles proved inside the jobs root |
 | **Hooks** | `SessionStart`/`SessionEnd` lifecycle, plus an opt-in stop-time review gate | none, ever — enforced by a test |
 | **Footprint** | companion app-server, agents, skills, prompt templates, output schemas, 8 commands | one zero-dependency script, 6 commands, 1 skill |
-| **Tests** | 8 test files, CI on every pull request | 101 tests — fake-codex lifecycle drills, the deliverability matrix, sight-gate and kill-verification drills, path-escape canaries, a concurrency race and a fenced-claim takeover, plus an opt-in live smoke |
+| **Tests** | 8 test files, CI on every pull request | 103 tests — fake-codex lifecycle drills, the deliverability matrix, sight-gate and kill-verification drills, path-escape canaries, a concurrency race and a fenced-claim takeover, plus an opt-in live smoke |
 
 Things the official plugin has that this one deliberately does not: the
 `codex-rescue` subagent, `/codex:review`'s zero-brief native reviewer, the
@@ -194,12 +194,13 @@ every install was pinned to the first of them — the fix landed in the repo and
 nowhere else, silently, which is the same shape of failure as a blind answer:
 confident, and wrong in a way nothing surfaces.
 
-Current release: **0.7.0** — Windows command-line construction, fixed, from a
-Codex dispatch reviewing this runtime's own quoting: a trailing backslash can no
-longer eat the closing quote and merge two arguments, and a `%` in `--model`,
-`--effort` or `--cd` is now refused rather than silently expanded by `cmd.exe`.
-Behavioral on Windows — a value that previously ran, mangled, is a clean refusal
-now. 0.6.0 records remain deliverable. Full history, including the
+Current release: **0.7.1** — 0.7.0's Windows quoting fix, reviewed by a second
+dispatch and repaired. 0.7.0 checked the `--cd` you typed rather than the cwd it
+resolved, so dispatching from a directory with a `%` in its name skipped the gate
+and stranded the job; the check now runs on the resolved value and a refusal
+finalizes the record instead of leaving it to go stale. `"` and `!` join `%` as
+refused rather than escaped. 0.6.0 and 0.7.0 records remain deliverable. Full
+history, including the
 `RECORD_VERSION` 2 cutoff that makes 0.1–0.4 records undeliverable, in
 [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
@@ -264,14 +265,14 @@ node scripts/codex-dispatch.mjs preflight         # install / auth / functional-
 ## Tests
 
 ```
-node --test                            # everything: 101 tests (bare form — see below)
+node --test                            # everything: 103 tests (bare form — see below)
 node --test tests/dispatch.test.mjs    # lifecycle, against a fake codex
 node --test tests/packaging.test.mjs   # manifests, command frontmatter, no-hooks invariant
 node --test tests/resolution.test.mjs  # binary resolution, sight-probe targeting, blind scan, whitelists, deliverability (imported, not spawned)
 node tests/live-smoke.mjs              # one real cheap dispatch; skips loudly if codex absent/logged out
 ```
 
-One of the 101 is skipped on Windows and runs on POSIX: the process-group kill has
+One of the 103 is skipped on Windows and runs on POSIX: the process-group kill has
 no Windows analogue to assert (`taskkill /T` is the path there), so the *choice* of
 targets is unit-tested on both platforms via `killPlan` and the kill itself is
 integration-tested only where it applies.

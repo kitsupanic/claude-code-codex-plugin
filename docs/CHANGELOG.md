@@ -3,6 +3,36 @@
 Versioning rule: **a push that changes behavior MUST bump the version** — see
 [README → Releases and versioning](../README.md#releases-and-versioning) for why.
 
+## 0.7.1
+
+0.7.0's own fix, reviewed by another dispatch, and it had left three holes.
+
+**A regression 0.7.0 introduced.** The `%` check ran on `opts.cd`, so a dispatch
+with no `--cd` at all skipped it and put `process.cwd()` into the record
+unexamined. Run from a directory with a `%` in its name, the supervisor then
+threw on a command line nothing had inspected — inside a detached process with
+no catch around it, so the record kept saying `running`, the job read `stale`,
+and it held its role until someone cancelled it. Reproduced by hand before
+being fixed. The check now runs on the **resolved** cwd, the record is written
+from the values that were checked rather than from a second computation of them,
+and the supervisor's spawn is wrapped so a refusal finalizes as
+`failed / codex-argv-refused` rather than stranding the job. `main()` catches the
+same refusal (tagged, so it cannot widen to every other throw) and reports it
+through the normal failure path, which covers preflight and the sight probe.
+
+**`"` is refused, not escaped.** 0.7.0 escaped it as `""`, which keeps `cmd.exe`'s
+quote parity even and breaks `CommandLineToArgvW`, where `\"` is the escape — so
+`a\"` did not round-trip. There is no spelling that satisfies both parsers.
+Windows paths cannot contain a quote and no model or effort name does, so
+refusing removes the mismatch at no real cost.
+
+**`!` is refused too.** Same expansion hazard as `%` under delayed expansion.
+Node launches `cmd.exe /d /s /c`, where it is off, so this is a guarantee about
+somebody else's future setting rather than a live defect — the cheapest kind to
+keep.
+
+No record-schema change: 0.7.0 and 0.6.0 records remain deliverable.
+
 ## 0.7.0
 
 Windows command-line construction, fixed — both defects found by a Codex

@@ -13,7 +13,7 @@ import path from 'node:path';
 import {
   ACCEPTED_SIGHT,
   BLIND_SIGNATURES,
-  CMD_EXPANDS,
+  CMD_UNSAFE,
   JOB_ID_RE,
   JOB_REASONS,
   KNOWN_LAUNCH_PHASES,
@@ -216,21 +216,29 @@ test('cmdQuote: a trailing backslash cannot eat the closing quote', () => {
   // Interior backslashes are NOT doubled: only the run against the delimiter is
   // ambiguous, and a path is mostly interior backslashes.
   assert.equal(cmdQuote(`C:${bs}Program Files${bs}x`), `"C:${bs}Program Files${bs}x"`);
-  // Quotes are escaped before the run is measured, so what gets doubled is the
-  // run that really does precede the closing delimiter.
-  assert.equal(cmdQuote('say "hi"'), '"say ""hi"""');
 });
 
-test('cmdQuote: % is refused, because cmd.exe expands it after quote stripping', () => {
-  // No in-band escape exists: `"%PATH%"` expands exactly like `%PATH%`. A value
-  // that silently becomes something else is the blind-answer failure in another
-  // costume, so the runtime refuses rather than mangles.
-  for (const v of ['%COMSPEC%', 'gpt-5 %PATH%', 'D:\\rep%o', '%']) {
-    assert.throws(() => cmdQuote(v), /contains "%"/, `${v} must be refused, not quoted`);
+test('cmdQuote: % ! and " are refused, because no escaping on a command line reaches them', () => {
+  // `%` and `!` are expanded by cmd.exe AFTER quote stripping, so `"%PATH%"`
+  // expands exactly like `%PATH%` — quoting is not a defence and no in-band escape
+  // exists. `"` is refused for a different reason: cmd.exe tracks quote PARITY
+  // while CommandLineToArgvW reads `\"` as an escape, so `""` satisfies one parser
+  // and breaks the other. 0.7.0 escaped it as `""`, and `a\"` did not round-trip.
+  const bs = String.fromCharCode(92);
+  for (const v of ['%COMSPEC%', 'gpt-5 %PATH%', `D:${bs}rep%o`, '%', '!MODEL!', 'a!b', `a${bs}"`, 'say "hi"']) {
+    assert.throws(() => cmdQuote(v), (err) => {
+      assert.match(err.message, /cannot quote for cmd\.exe/);
+      // Tagged, so main() can report it as the refusal it is instead of a stack
+      // trace — and so that catch cannot silently widen to every other throw.
+      assert.equal(err.code, 'CMD_UNQUOTABLE');
+      return true;
+    }, `${v} must be refused, not quoted`);
   }
-  // And the refusal is reachable from where the value actually comes from.
-  assert.equal(CMD_EXPANDS.test('%COMSPEC%'), true);
-  assert.equal(CMD_EXPANDS.test('gpt-5.6-sol'), false);
+  // Ordinary values are untouched by the guard.
+  for (const v of ['gpt-5.6-sol', 'xhigh', `D:${bs}github${bs}repo`, 'C:\\Program Files\\x']) {
+    assert.equal(CMD_UNSAFE.test(v), false, `${v} is an ordinary value`);
+    assert.doesNotThrow(() => cmdQuote(v));
+  }
 });
 
 test('a recorded pid whose start time has moved is not that process any more', () => {

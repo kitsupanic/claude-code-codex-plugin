@@ -23,6 +23,7 @@ A job that records a reason is printed as `state(reason)`. This is the complete 
 - `failed(sight-probe-error)` — the probe could not be **run**: the spawn failed or produced nothing to judge, after a bounded retry. This is a transport failure, **not** a finding that codex is blind, and the cure is different — re-dispatch, or run the probe by hand.
 - `failed(supervisor-spawn-failed)` — the detached supervisor would not spawn. Nothing was billed.
 - `failed(codex-spawn-failed)` — the supervisor could not launch codex.
+- `failed(codex-argv-refused)` — a value bound for codex's command line carried a character cmd.exe expands or re-parses after quote stripping (`%`, `!`, `"`), so the launch was refused rather than mangled. Nothing was billed. Windows only.
 - `failed(claim-lost)` — the role was taken over while this job was starting, so it refused to launch beside the job that legitimately holds it.
 - `failed(record-version-mismatch)` — the dispatch that wrote the record and the supervisor that picked it up are different releases of this runtime. A record stamped by one delivery gate is not evidence that another was met.
 - `failed(dispatch-failed)` — the dispatch fell over after writing the record and before handing the job off. Recorded as failed rather than left reading `running` forever.

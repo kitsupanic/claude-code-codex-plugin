@@ -101,6 +101,7 @@ export const JOB_REASONS = [
   'sight-probe-error',
   'supervisor-spawn-failed',
   'codex-spawn-failed',
+  'codex-argv-refused',
   'claim-lost',
   'cancelled-during-registration',
   'cancelled-during-exec',
@@ -1065,35 +1066,51 @@ const UNPROVEN_EXPLANATION =
 
 const isScript = (bin) => /\.(mjs|cjs|js)$/i.test(bin);
 
-// cmd.exe expands `%VAR%` AFTER quote stripping, so no amount of quoting on a
-// command line escapes it — `"%PATH%"` expands exactly like `%PATH%` does. There
-// is no in-band escape to reach for, which makes refusal the only honest answer:
-// a `--model %COMSPEC%` that silently becomes something else is the same shape of
-// failure as a blind answer, confident and wrong with nothing surfacing it. The
-// dispatch boundary calls this so the user gets a clean refusal; cmdQuote asserts
-// it again where the command line actually exists, on the same reasoning the jobs
-// root uses two checks — a rule enforced only at the boundary is one refactor away
-// from being enforced nowhere.
-export const CMD_EXPANDS = /%/;
+// Three characters no quoting on a cmd.exe command line can hold, so all three
+// are refused rather than escaped. A value that silently becomes something else
+// is the blind-answer failure in another costume: confident, wrong, unsurfaced.
+//   %  cmd.exe expands `%VAR%` AFTER quote stripping — `"%PATH%"` expands exactly
+//      like `%PATH%`, so quoting is not a defence and no in-band escape exists.
+//   !  the same, under delayed expansion. Node launches `cmd.exe /d /s /c`, where
+//      it is off, so this is a guarantee about somebody else's future setting
+//      rather than a live defect — which is the cheapest kind to keep.
+//   "  the one character whose two escaping conventions disagree. cmd.exe tracks
+//      quote PARITY to decide what is "inside quotes" for metacharacter purposes,
+//      while CommandLineToArgvW reads `\"` as an escaped quote — so `""` keeps
+//      cmd happy and breaks the CRT, `\"` does the reverse, and there is no
+//      spelling that satisfies both. Windows paths cannot contain one and no
+//      model or effort name does, so refusing costs nothing real and removes the
+//      whole mismatch. (Codex arm, round two: the old `""` escaping made `a\"`
+//      fail to round-trip.)
+export const CMD_UNSAFE = /[%!"]/;
+
+const cmdUnsafeError = (s) => {
+  const err = new Error(
+    `cannot quote for cmd.exe: ${JSON.stringify(s)} contains one of % ! " — cmd.exe ` +
+    'expands or re-parses these after quote stripping, and no escaping on a command ' +
+    'line reaches them. Remove it (or point --cd at a path without one).'
+  );
+  // Tagged so main() can report it as a refusal instead of a stack trace, without
+  // swallowing every other throw in the process. See the catch there.
+  err.code = 'CMD_UNQUOTABLE';
+  return err;
+};
 
 // Windows cmd-line quoting for shell:true spawns (codex.cmd needs a shell).
-// Exported for the unit tests: this is argv construction, and the two defects
-// below were both invisible until the output was asserted directly.
+// Exported for the unit tests: this is argv construction, and every defect here
+// has been invisible until the output was asserted directly.
 export function cmdQuote(s) {
-  if (CMD_EXPANDS.test(s)) {
-    throw new Error(
-      `cannot quote for cmd.exe: ${JSON.stringify(s)} contains "%", which cmd.exe expands ` +
-      'after quote stripping. Remove it (or point --cd at a path without one).'
-    );
-  }
-  if (!/[\s&|<>()^"]/.test(s)) return s;
+  if (CMD_UNSAFE.test(s)) throw cmdUnsafeError(s);
+  if (!/[\s&|<>()^]/.test(s)) return s;
   // The trailing backslash run is doubled because the closing quote we are about
   // to add is read by CommandLineToArgvW, not by cmd.exe: there `\"` is an ESCAPED
   // quote, so `"foo bar\"` loses its delimiter and swallows whatever argument
   // comes next. N backslashes become 2N, which the same parser reads back as N
-  // literal backslashes followed by a delimiter that survives. Quotes are escaped
-  // first, so what this sees is the run that really does precede the delimiter.
-  return `"${s.replace(/"/g, '""').replace(/(\\+)$/, '$1$1')}"`;
+  // literal backslashes followed by a delimiter that survives. Interior runs are
+  // left alone — only the run against the delimiter is ambiguous, and a Windows
+  // path is mostly interior runs. With `"` refused above, this is the only rule
+  // left to get right.
+  return `"${s.replace(/(\\+)$/, '$1$1')}"`;
 }
 
 // Returns { child, viaShell }. `viaShell` matters because of what it does to the
@@ -2418,19 +2435,30 @@ function cmdDispatch(opts) {
     );
   }
 
+  // RESOLVED, not typed — and that distinction is the whole fix. 0.7.0 validated
+  // `opts.cd`, so a dispatch with no --cd at all skipped the check and put
+  // `process.cwd()` into the record unexamined: run it from a directory with a `%`
+  // in the name and the supervisor threw on a command line nothing had inspected.
+  // This is the rule the jobs root already states — check the value where it is
+  // READ, not where it is typed — applied to the one place it was not.
+  const cwd = path.resolve(opts.cd || process.cwd());
+  const model = opts.model || DEFAULT_MODEL;
+  const effort = opts.effort || DEFAULT_EFFORT;
+
   // Windows only, because only Windows builds a command line: elsewhere argv is
-  // handed to spawn as an array and nothing re-parses it. See CMD_EXPANDS for why
-  // this is a refusal rather than an escaping scheme. `%` is a legal filename
-  // character on NTFS, so a --cd carrying one is refused rather than silently
-  // pointed somewhere else — the cure is named, and it is one directory away.
+  // handed to spawn as an array and nothing re-parses it. See CMD_UNSAFE for why
+  // this is a refusal rather than an escaping scheme. Those characters are legal
+  // in NTFS filenames, so a cwd carrying one is a real directory this runtime will
+  // not point at — the cure is named, and it is one directory away.
   if (WIN) {
-    for (const [flag, value] of [['--model', opts.model], ['--effort', opts.effort], ['--cd', opts.cd]]) {
-      if (value && CMD_EXPANDS.test(value)) {
+    for (const [flag, value] of [['--model', model], ['--effort', effort], ['--cd', cwd]]) {
+      if (value && CMD_UNSAFE.test(value)) {
         fail(
-          `dispatch: ${flag} ${JSON.stringify(value)} contains "%", which cmd.exe expands after\n` +
-          'quote stripping — codex would be launched with something other than what you typed.\n' +
-          'There is no escape for it on a command line, so this is refused rather than mangled.\n' +
-          `Cure: a ${flag} value without "%".`
+          `dispatch: ${flag} ${JSON.stringify(value)} contains one of % ! " — cmd.exe expands or\n` +
+          're-parses these after quote stripping, so codex would be launched with something\n' +
+          'other than this. No escaping on a command line reaches them, so it is refused\n' +
+          `rather than mangled. Cure: a ${flag} value without them` +
+          `${flag === '--cd' ? ' (this one defaults to the current directory, so --cd may be what you need)' : ''}.`
         );
       }
     }
@@ -2508,10 +2536,13 @@ function cmdDispatch(opts) {
       recordVersion: RECORD_VERSION,
       id,
       role,
-      model: opts.model || DEFAULT_MODEL,
-      effort: opts.effort || DEFAULT_EFFORT,
+      // The validated values from above, not a second computation of them: a
+      // check that runs on one expression and a record written from another is
+      // exactly how the process.cwd() default slipped past 0.7.0's gate.
+      model,
+      effort,
       sandbox: opts.write ? 'workspace-write' : 'read-only',
-      cwd: path.resolve(opts.cd || process.cwd()),
+      cwd,
       bin,
       started: new Date().toISOString(),
       state: 'running',
@@ -2913,11 +2944,32 @@ function cmdSupervise(dir) {
   // Detached on POSIX so codex leads its own process group: that group IS the
   // tree a kill has to reach, since there is no `taskkill /T` off Windows and the
   // sandbox helpers codex spawns are its children, not ours.
-  const { child, viaShell } = spawnCodex(record.bin, args, {
-    stdio: [promptFd, logFd, logFd],
-    windowsHide: true,
-    detached: !WIN,
-  });
+  //
+  // Wrapped because cmdQuote can REFUSE, and a refusal here used to be an
+  // unhandled throw in a detached process with nobody to catch it: the record kept
+  // saying `running` with no supervisor behind it, so the job read `stale` and held
+  // its role until someone noticed and cancelled it. Reproduced by dispatching from
+  // a directory with a `%` in its name (0.7.0 validated --cd but not the
+  // process.cwd() default). The gate is closed at the boundary now, but a record
+  // written by an older dispatch reaches this same line, so the throw has to land
+  // somewhere that finalizes rather than nowhere at all.
+  let child, viaShell;
+  try {
+    ({ child, viaShell } = spawnCodex(record.bin, args, {
+      stdio: [promptFd, logFd, logFd],
+      windowsHide: true,
+      detached: !WIN,
+    }));
+  } catch (err) {
+    const msg = `supervisor: refusing to launch codex: ${clean(err.message)}`;
+    try { fs.appendFileSync(runLogPath(dir), msg + '\n'); } catch { /* best effort */ }
+    console.error(msg);
+    updateRecord(dir, {
+      state: 'failed', reason: 'codex-argv-refused', exitCode: -1, finished: new Date().toISOString(),
+    });
+    releaseRole(root, record.role, id);
+    process.exit(1);
+  }
   child.on('error', (err) => {
     fs.appendFileSync(runLogPath(dir), `supervisor: spawn failed: ${clean(err.message)}\n`);
     updateRecord(dir, {
@@ -3584,6 +3636,21 @@ export function parseArgs(argv) {
 }
 
 function main() {
+  try {
+    return run();
+  } catch (err) {
+    // Only the quoting refusal, and only so it reads as the refusal it is rather
+    // than as a crash. Everything else keeps its stack: a broad catch here would
+    // turn real defects into tidy one-liners, which is the opposite of what this
+    // runtime is for. Reachable from preflight and the sight probe, where a binary
+    // path — `CODEX_DISPATCH_BIN` is documented as trusted and unchecked — carries
+    // one of the refused characters.
+    if (err && err.code === 'CMD_UNQUOTABLE') fail(err.message);
+    throw err;
+  }
+}
+
+function run() {
   const [verb, ...rest] = process.argv.slice(2);
   const opts = parseArgs(rest);
 

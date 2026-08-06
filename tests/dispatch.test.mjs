@@ -2059,3 +2059,84 @@ test('list classifies states including stale pids', async () => {
   assert.match(r.stdout, /done  out: /, 'finished jobs listed as done');
   assert.match(r.stdout, /killed  out: /, 'cancelled jobs listed as killed');
 });
+
+test('a cwd carrying a cmd.exe metacharacter is refused, even with no --cd to inspect',
+  { skip: process.platform === 'win32' ? false : 'Windows-only: only Windows builds a command line' },
+  () => {
+    // The 0.7.0 regression, reproduced. That release validated `opts.cd` — so a
+    // dispatch with NO --cd skipped the check entirely and put `process.cwd()`
+    // into the record unexamined. The supervisor then threw inside a detached
+    // process with nobody to catch it: the record kept saying `running` with no
+    // supervisor behind it, the job read `stale`, and it held its role until
+    // someone noticed. Confirmed by hand against 0.7.0 before this was written.
+    const odd = fs.mkdtempSync(path.join(os.tmpdir(), 'pct%dir-'));
+    fs.writeFileSync(path.join(odd, 'readable.txt'), 'line one\nenough content to yield a token\n');
+    const brief = path.join(odd, 'b.md');
+    fs.writeFileSync(brief, 'review something');
+
+    const before = fs.readdirSync(JOBS).length;
+    const r = spawnSync(process.execPath, [RUNTIME, 'dispatch', '--brief', brief, '--role', 'pct'], {
+      env: baseEnv, cwd: odd, encoding: 'utf8',
+    });
+
+    assert.notEqual(r.status, 0, 'must be refused, not dispatched');
+    assert.match(r.stderr + r.stdout, /--cd .*contains one of/,
+      'the refusal names the resolved cwd, which is the value that was never checked');
+    assert.equal(fs.readdirSync(JOBS).length, before,
+      'refused before anything was created: no job dir, no role claim, no ghost');
+
+    fs.rmSync(odd, { recursive: true, force: true });
+  });
+
+test('a refused argv finalizes the record instead of stranding the job',
+  { skip: process.platform === 'win32' ? false : 'Windows-only: only Windows builds a command line' },
+  async () => {
+    // The other half of the same fix. The boundary gate is closed now, but a
+    // record written by an OLDER dispatch reaches the supervisor's spawn with the
+    // same unquotable value, so the throw has to land somewhere that finalizes.
+    // Written straight to disk, which is exactly what an older dispatch left.
+    //
+    // Two details this test has to get right, both learned by getting them wrong.
+    // The cwd must REALLY EXIST and hold a readable file, because the sight probe
+    // runs first and a missing directory fails the job as blind long before the
+    // argv is built. And `bin` must be the .cmd shim: a `.mjs` is spawned through
+    // node with an argv ARRAY, which never touches cmdQuote at all — the shell
+    // branch is the only one that builds a command line.
+    const odd = fs.mkdtempSync(path.join(os.tmpdir(), 'pct%cwd-'));
+    fs.writeFileSync(path.join(odd, 'readable.txt'), 'line one\nenough content to yield a token\n');
+
+    const id = 'argv-1-4242';
+    const dir = path.join(JOBS, id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'prompt.md'), 'brief');
+    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+      recordVersion: RECORD_VERSION, generation: 1, id, role: 'argv',
+      model: 'gpt-5.6-luna', effort: 'medium', sandbox: 'read-only',
+      cwd: odd, bin: FAKE_CMD, started: new Date().toISOString(),
+      state: 'running', launch: 'spawned', supervisorPid: process.pid,
+      codexPid: null, exitCode: null, finished: null,
+      allowUnprovenSight: false,
+    }));
+    // The supervisor re-reads its claim before spawning anything and aborts as
+    // `claim-lost` if the role is not still ours — so a hand-written record needs
+    // the claim a real dispatch would have taken.
+    const lock = path.join(JOBS, '.role-locks', 'argv');
+    fs.mkdirSync(lock, { recursive: true });
+    fs.writeFileSync(path.join(lock, 'owner'), id);
+
+    const r = spawnSync(process.execPath, [RUNTIME, '_supervise', dir], {
+      env: baseEnv, cwd: REPO, encoding: 'utf8',
+    });
+
+    assert.notEqual(r.status, 0, 'the supervisor exits nonzero rather than carrying on');
+    const rec = record(id);
+    assert.equal(rec.state, 'failed', 'finalized — NOT left saying running for staleness to infer');
+    assert.equal(rec.reason, 'codex-argv-refused', 'and it says which refusal, not just that one happened');
+    assert.equal(rec.exitCode, -1, 'codex never ran');
+    // Sight was PROVEN before the argv was built — which is the point: this is not
+    // a blind job wearing a different label, it is a readable cwd whose own name
+    // cannot survive a cmd.exe command line.
+    assert.match(rec.sight || '', /^cwd-file:/, 'the probe passed; the refusal came later');
+
+    fs.rmSync(odd, { recursive: true, force: true });
+  });
