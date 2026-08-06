@@ -925,7 +925,7 @@ function assertJobId(id) {
 }
 
 // The RECORD is authoritative. An earlier revision promoted a job to `done` the
-// moment out.txt existed; that is revoked (see README → Decisions). The answer
+// moment out.txt existed; that is revoked (see docs/DECISIONS.md). The answer
 // file appears the instant codex writes it — BEFORE the exit code is recorded and
 // BEFORE any sight verdict — so file-existence promotion opened a window in which
 // a job read `done` while nothing had yet vouched for it. A supervisor that dies
@@ -973,7 +973,7 @@ function humanDuration(ms) {
 // could not read the file it was asked to review, delivered as a success.
 // These are the signatures that failure prints.
 //
-// DEMOTED (see README → Decisions): this scan no longer decides anything. It is
+// DEMOTED (see docs/DECISIONS.md): this scan no longer decides anything. It is
 // negative, post-hoc inference — it cannot see a failure shape it has never met,
 // and it cannot tell a fatal failure from one codex recovered from. Sight is now
 // established positively, per job, before the run (`sightProbe`), and a hit here
