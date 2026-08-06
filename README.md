@@ -153,7 +153,17 @@ every install was pinned to the first of them — the fix landed in the repo and
 nowhere else, silently, which is the same shape of failure as a blind answer:
 confident, and wrong in a way nothing surfaces.
 
-Current release: **0.5.0** — the 0.4.0 dual review, fixed, around the one change
+Current release: **0.6.0** — the post-0.5.0 review, fixed. The POSIX sight
+probe quotes its filename for `sh` and skips names carrying shell-expansion
+characters, so a hostile name in a probed cwd cannot run anything; a recorded
+pid the OS has reissued is identified by its start time (`pidStarts`) and is
+neither read as alive nor fired at, which is what stops a stale job's kill from
+landing on an innocent process; the supervisor's exit-time record write carries
+the same only-if-still-running precondition as every other racy write; and
+`reaped.pids` is written atomically, like the record it exists to outlive.
+`RECORD_VERSION` does not move: 0.5.0 records remain deliverable.
+
+Previous: **0.5.0** — the 0.4.0 dual review, fixed, around the one change
 both arms prescribed: **a version-aware, fail-closed semantic validator in front of
 every ownership, kill and delivery decision** (see "The validator"). Out of it fall
 the specifics: an unrecognised state is `unknown` — live, role-blocking,
