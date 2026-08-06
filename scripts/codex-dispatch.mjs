@@ -46,18 +46,75 @@ export const ROLE_RE = /^[a-z]+$/;
 // written before this stamp existed (0.1–0.3) was written under a different
 // delivery gate, so nothing in it may be read as proof or as consent. Bump this
 // when the meaning of a field the gate reads changes.
-export const RECORD_VERSION = 1;
+//
+// 2 (0.5.0): the gate stopped reading fields and started VALIDATING them — a
+// `sight` that merely begins with the proof prefix is no longer proof, a state
+// outside the known set is live-and-unvouched rather than terminal, and a pid
+// field outside the pid domain is corruption. A record written under version 1
+// was written by a runtime that did none of that, so it cannot be evidence that
+// this gate was met.
+export const RECORD_VERSION = 2;
 
 // The only `sight` value that is proof, and the only one that is a recorded
 // opt-in. Both are compared exactly; neither is ever inferred from prose.
 export const PROVEN_SIGHT_PREFIX = 'cwd-file:';
 export const ACCEPTED_SIGHT = 'unproven (accepted by caller)';
 
+// ------------------------------------------------- the semantic domains
+//
+// THE VALIDATOR IS THE SPINE (dual review round three, 2026-08-06). Every
+// ownership, kill and delivery decision reads the record through the functions
+// below, and every one of them FAILS CLOSED: a value outside its domain is
+// resolved to the reading that costs a refused dispatch, never to the one that
+// costs a second billing codex or an unvouched-for answer.
+//
+// The states this runtime writes. A record carrying anything else was not
+// written by this runtime, and the safe reading of "I do not recognise this
+// state" is NOT "therefore it is not running" — it is "therefore I know nothing
+// about what it owns", which is `unknown`: live, role-blocking, undeliverable.
+export const KNOWN_STATES = ['running', 'done', 'failed', 'killed', 'kill-pending', 'kill-failed'];
+
+// The launch phases, in the order a job passes through them. `spawning` and
+// `exec-spawning` are the two windows in which something was launched and has
+// not been registered — the phases in which "nothing to kill" must never be read
+// as "nothing is alive".
+export const KNOWN_LAUNCH_PHASES = ['pending', 'spawning', 'spawned', 'exec-spawning', 'exec'];
+// An unrecognised phase resolves to the most dangerous one: codex may be running
+// and unregistered.
+export const MOST_DANGEROUS_PHASE = 'exec-spawning';
+
+// A pid is a positive integer in a domain an OS could actually have issued.
+// `supervisorPid: -1` used to reach killPlan(-1), which off Windows signals the
+// process GROUP -1 — every process the user may signal — and then pid 1. A
+// machine-wide kill out of one corrupt record. (Codex arm, round three.)
+export const PID_MIN = 1;
+export const PID_MAX = 0xffffffff;
+export const isPid = (n) => Number.isSafeInteger(n) && n >= PID_MIN && n <= PID_MAX;
+
+// The reasons this runtime writes onto a record. `list` prints `state(reason)`,
+// so this is the source of truth commands/list.md documents and the packaging
+// test checks the source against.
+export const JOB_REASONS = [
+  'sandbox-blind-precheck',
+  'sight-unproven',
+  'sight-probe-error',
+  'supervisor-spawn-failed',
+  'codex-spawn-failed',
+  'claim-lost',
+  'cancelled-during-registration',
+  'cancelled-during-exec',
+  'record-version-mismatch',
+  'dispatch-failed',
+];
+
 // States in which a job may still own live processes. These block their role,
 // are cancellable, and are what `--force` has to kill (and verify) first.
 // `kill-pending` is one of them: a cancel that arrived before the job had a kill
-// target killed nothing, so nothing may treat it as dead.
-export const LIVE_STATES = ['running', 'kill-pending', 'stale', 'kill-failed'];
+// target killed nothing, so nothing may treat it as dead. `unknown` is one of
+// them for the same reason at one remove: a state this release cannot name is a
+// state it cannot reason about, and the only safe thing to assume about a job
+// you cannot reason about is that it is still going.
+export const LIVE_STATES = ['running', 'kill-pending', 'stale', 'kill-failed', 'unknown'];
 
 // run.log, job.json and a codex probe's error text are all UNTRUSTED text: they
 // carry whatever codex printed, including file contents and tool output it
@@ -111,21 +168,59 @@ export function isInsideRoot(root, target) {
   return rel !== '' && !rel.startsWith('..') && !path.isAbsolute(rel);
 }
 
+// LEXICAL CONTAINMENT IS NOT CONTAINMENT. `path.resolve` collapses `..`; it knows
+// nothing about reparse points, so a directory junction (or a symlink) named
+// `review-1-2` inside the jobs root passes every check above and then directs
+// every read, rename, removal and kill at wherever it points. Windows junctions
+// need no elevation to create. (Codex arm, round three.)
+//
+// So containment is proved against the REAL path: resolve the deepest ancestor
+// that exists — the target itself may be about to be created — and require the
+// resolved target to still be inside the resolved root.
+function realpathDeep(p) {
+  let cur = path.resolve(p);
+  const tail = [];
+  for (;;) {
+    try {
+      const real = (fs.realpathSync.native || fs.realpathSync)(cur);
+      return tail.length ? path.join(real, ...tail.reverse()) : real;
+    } catch { /* does not exist (yet): try the parent */ }
+    const parent = path.dirname(cur);
+    if (parent === cur) return path.resolve(p);
+    tail.push(path.basename(cur));
+    cur = parent;
+  }
+}
+
+export function isInsideRootReal(root, target) {
+  if (!isInsideRoot(root, target)) return false;
+  return isInsideRoot(realpathDeep(root), realpathDeep(target));
+}
+
+// A directory entry that is a link of any kind is not a job directory, whatever
+// it is named. Checked separately from the containment above because a junction
+// whose target happens to be inside the jobs root is still not something this
+// runtime created, and treating it as a job is how a rename lands somewhere else.
+function isRealDirectory(p) {
+  try { return fs.lstatSync(p).isDirectory(); } catch { return false; }
+}
+
 // The job directory for an id — or null when the id is not one this runtime could
 // have generated, or when joining it would leave the jobs root.
 export function jobDirFor(root, id) {
   if (typeof id !== 'string' || !JOB_ID_RE.test(id)) return null;
   const dir = path.join(root, id);
-  return isInsideRoot(root, dir) ? dir : null;
+  return isInsideRootReal(root, dir) ? dir : null;
 }
 
 // Loud refusal, never best-effort: a path that cannot be PROVED to be inside the
 // jobs root is not operated on at all.
 function assertInsideRoot(root, target, action) {
-  if (isInsideRoot(root, target)) return target;
+  if (isInsideRootReal(root, target)) return target;
   fail(
     `REFUSING to ${action}: ${JSON.stringify(String(clean(target)))}\n` +
-    `That path is outside the jobs root (${path.resolve(root)}).\n` +
+    `That path is outside the jobs root (${path.resolve(root)}) — lexically, or once its\n` +
+    `reparse points are resolved (a junction or symlink is not containment).\n` +
     `Something wrote a job id, role or claim owner this runtime would never generate. Nothing has\n` +
     `been read, renamed, removed or killed.`
   );
@@ -156,10 +251,21 @@ const STRING_FIELDS = [
   'started', 'finished', 'reason', 'blindSignature', 'warning', 'sight',
   'killSurvivors', 'launch',
 ];
-const NUMBER_FIELDS = ['supervisorPid', 'codexPid', 'exitCode', 'recordVersion'];
+const NUMBER_FIELDS = [
+  'supervisorPid', 'codexPid', 'codexPgid', 'exitCode', 'recordVersion', 'generation',
+];
 const BOOLEAN_FIELDS = ['allowUnprovenSight'];
-const NUMBER_ARRAY_FIELDS = ['reapedPids'];
+const NUMBER_ARRAY_FIELDS = ['reapedPids', 'codexPids'];
 const REQUIRED_FIELDS = ['state', 'started'];
+
+// Fields whose numbers become KILL TARGETS. Being a number was never enough:
+// `supervisorPid: -1` is a finite number, and `killPlan(-1)` off Windows signals
+// process group -1 — which is every process this account may signal — and then
+// pid 1. Whole-machine kill, from one corrupt record.
+const PID_NUMBER_FIELDS = ['supervisorPid', 'codexPid', 'codexPgid'];
+const PID_ARRAY_FIELDS = ['reapedPids', 'codexPids'];
+// Counters, which may be zero but never negative or fractional.
+const COUNTER_FIELDS = ['recordVersion', 'generation'];
 
 // Two of the record's fields become PATH SEGMENTS — `role` reaches
 // `<root>/.role-locks/<role>/`, which a release renames away and then removes
@@ -175,6 +281,61 @@ const PATTERN_FIELDS = [
 ];
 
 const typeName = (v) => (Array.isArray(v) ? 'array' : v === null ? 'null' : typeof v);
+
+// A proven sight is `cwd-file:<name>` where <name> is a FILE NAME — not a
+// prefix, not a prefix with a diagnosis stapled to it. `sight: "cwd-file:"`
+// passed the delivery gate before this existed (Codex arm, round three), and so
+// would `cwd-file:a.txt FAILED: the bytes never came back`, which is what the
+// supervisor used to write for a DISPROVEN read.
+//
+// The name is what the probe passed to codex as a relative path in the job's own
+// cwd, so: non-empty, no path separators, no `:` (which is both a Windows-invalid
+// filename character and the separator this runtime's own labels use), nothing
+// that could be a traversal, and short enough to be a name. A legitimate name
+// that fails this — a POSIX file with a colon in it — is classified malformed and
+// its job is refused, which is the fail-closed direction and is documented.
+export const PROBE_FILE_NAME_RE = /^[^\\/:*?"<>|\x00-\x1f]{1,255}$/;
+
+export function isProbeFileName(name) {
+  if (typeof name !== 'string' || !PROBE_FILE_NAME_RE.test(name)) return false;
+  if (name !== name.trim()) return false;
+  return name !== '.' && name !== '..';
+}
+
+// What a record's `sight` field MEANS, decided in one place:
+//   proven    — a well-formed cwd-file proof
+//   accepted  — the exact recorded-opt-in label (still needs the boolean)
+//   malformed — it claims the proof prefix and is not a proof: never deliverable
+//   unproven  — anything else, including absent
+export function sightVerdict(record) {
+  const sight = record && typeof record.sight === 'string' ? record.sight : '';
+  if (sight === ACCEPTED_SIGHT) return { kind: 'accepted', sight };
+  if (sight.startsWith(PROVEN_SIGHT_PREFIX)) {
+    const file = sight.slice(PROVEN_SIGHT_PREFIX.length);
+    if (isProbeFileName(file)) return { kind: 'proven', sight, file };
+    return { kind: 'malformed', sight, file };
+  }
+  return { kind: 'unproven', sight };
+}
+
+// The state this runtime will REASON with. A state outside the known set is not
+// "some other terminal state" — it is a state this release cannot reason about,
+// and `unknown` is how that is said out loud: live, role-blocking, never
+// reclaimable without a verified kill, never deliverable.
+export function canonicalState(record) {
+  if (!record || isCorrupt(record)) return 'corrupt';
+  return KNOWN_STATES.includes(record.state) ? record.state : 'unknown';
+}
+
+// The launch phase this runtime will reason with. Absent means the record
+// predates the field (0.3 and earlier) and gets the time-boxed conservative
+// reading; anything unrecognised gets the most dangerous one outright.
+export function launchPhase(record) {
+  if (!record || isCorrupt(record)) return MOST_DANGEROUS_PHASE;
+  const p = record.launch;
+  if (p === undefined || p === null) return 'legacy';
+  return KNOWN_LAUNCH_PHASES.includes(p) ? p : MOST_DANGEROUS_PHASE;
+}
 
 // Returns a corruptReason string, or null when the record is usable.
 export function validateRecord(parsed) {
@@ -210,6 +371,44 @@ export function validateRecord(parsed) {
     if (v === undefined || v === null) continue;
     if (typeof v === 'string' && re.test(v)) continue;
     return `field "${key}" is not ${what}: ${JSON.stringify(clean(String(v)).slice(0, 80))}`;
+  }
+  // ---- semantic domains, not just types --------------------------------------
+  for (const key of PID_NUMBER_FIELDS) {
+    const v = parsed[key];
+    if (v === undefined || v === null) continue;
+    if (!isPid(v)) {
+      return `field "${key}" is not a pid (${JSON.stringify(v)}; pids are integers ${PID_MIN}..${PID_MAX})`;
+    }
+  }
+  for (const key of PID_ARRAY_FIELDS) {
+    const v = parsed[key];
+    if (v === undefined || v === null) continue;
+    for (const n of v) {
+      if (!isPid(n)) {
+        return `field "${key}" holds something that is not a pid (${JSON.stringify(n)})`;
+      }
+    }
+  }
+  for (const key of COUNTER_FIELDS) {
+    const v = parsed[key];
+    if (v === undefined || v === null) continue;
+    if (!Number.isSafeInteger(v) || v < 0) {
+      return `field "${key}" is not a non-negative integer (${JSON.stringify(v)})`;
+    }
+  }
+  if (parsed.exitCode !== undefined && parsed.exitCode !== null && !Number.isSafeInteger(parsed.exitCode)) {
+    return `field "exitCode" is not an integer (${JSON.stringify(parsed.exitCode)})`;
+  }
+  // A sight that CLAIMS the proof prefix and is not a proof is corruption, not a
+  // weaker sight: something wrote the one string this runtime treats as evidence.
+  if (parsed.sight !== undefined && parsed.sight !== null) {
+    const verdict = sightVerdict(parsed);
+    if (verdict.kind === 'malformed') {
+      return (
+        `field "sight" claims the proof prefix "${PROVEN_SIGHT_PREFIX}" but does not name a file ` +
+        `(${JSON.stringify(clean(String(verdict.file)).slice(0, 80))})`
+      );
+    }
   }
   for (const key of REQUIRED_FIELDS) {
     if (!parsed[key]) return `field "${key}" is missing`;
@@ -263,6 +462,21 @@ export function deliverability(record) {
   if (!record || isCorrupt(record)) {
     return { ok: false, reason: 'the record is corrupt, so it vouches for nothing' };
   }
+  // The state gate lives HERE, not only in `result`, so there is exactly one
+  // place that decides deliverability. An unknown state is the case this closes:
+  // it is not `done`, and it is not safely anything else either.
+  const state = canonicalState(record);
+  if (state === 'unknown') {
+    return {
+      ok: false,
+      reason:
+        `the record's state ${JSON.stringify(clean(String(record.state)).slice(0, 40))} is not one this ` +
+        `release knows (${KNOWN_STATES.join(', ')}), so nothing can be concluded from it`,
+    };
+  }
+  if (state !== 'done') {
+    return { ok: false, reason: `the record says "${clean(state)}", not "done"` };
+  }
   if (record.recordVersion !== RECORD_VERSION) {
     return {
       ok: false,
@@ -275,9 +489,23 @@ export function deliverability(record) {
   if (record.exitCode !== 0) {
     return { ok: false, reason: `exitCode is ${JSON.stringify(record.exitCode ?? null)}, not 0` };
   }
-  const sight = typeof record.sight === 'string' ? record.sight : '';
-  if (sight.startsWith(PROVEN_SIGHT_PREFIX)) return { ok: true, how: `sight proven (${clean(sight)})` };
-  if (sight === ACCEPTED_SIGHT) {
+  const verdict = sightVerdict(record);
+  if (verdict.kind === 'proven') {
+    return { ok: true, how: `sight proven (${clean(verdict.sight)})` };
+  }
+  if (verdict.kind === 'malformed') {
+    // Unreachable through readRecord — validateRecord already calls this
+    // corruption — and kept because deliverability is also called on records
+    // this process assembled, and the one string that means "proved" must never
+    // be satisfied by a prefix.
+    return {
+      ok: false,
+      reason:
+        `sight claims the proof prefix but names no file ` +
+        `(${JSON.stringify(clean(verdict.sight).slice(0, 80))}) — a prefix is not a proof`,
+    };
+  }
+  if (verdict.kind === 'accepted') {
     if (record.allowUnprovenSight === true) {
       return { ok: true, accepted: true, how: 'unproven sight, opted into by the dispatch that ran it' };
     }
@@ -291,8 +519,9 @@ export function deliverability(record) {
   return {
     ok: false,
     reason:
-      `sight is ${sight ? JSON.stringify(clean(sight)) : 'not recorded'}, which is not proof — only ` +
-      `"${PROVEN_SIGHT_PREFIX}<name>" is, and only a recorded --allow-unproven-sight substitutes for it`,
+      `sight is ${verdict.sight ? JSON.stringify(clean(verdict.sight)) : 'not recorded'}, which is not ` +
+      `proof — only "${PROVEN_SIGHT_PREFIX}<name>" is, and only a recorded --allow-unproven-sight ` +
+      `substitutes for it`,
   };
 }
 
@@ -331,12 +560,82 @@ function writeRecord(dir, record) {
   }
 }
 
-function updateRecord(dir, patch) {
-  const current = readRecord(dir);
-  if (isCorrupt(current)) return null;
-  const record = { ...current, ...patch };
-  writeRecord(dir, record);
-  return record;
+// ------------------------------------------------- one writer at a time
+//
+// `updateRecord` is a READ-MODIFY-WRITE, and 0.4.0 opened a window in which
+// dispatch and cancel both write: dispatch records `{supervisorPid, launch}`
+// after the spawn, while a cancel may be writing `kill-pending` or `killed`.
+// Two interleavings were reachable, and the second is the dangerous one
+// (Claude arm, round three):
+//   - cancel's `kill-pending` lost to dispatch's later write;
+//   - cancel took the honest nothing-to-kill path, wrote `state: 'killed'`, and
+//     dispatch's write — built on a read from BEFORE that — put `running` back.
+//     The operator was told "killed", the role was released, and codex ran.
+//
+// The cure is a single-writer discipline over the read and the write together.
+// `mkdir` is the same atomic primitive the role claim uses: exactly one writer
+// can create the lock directory, and a writer that died holding it is broken out
+// of after RECORD_LOCK_STALE_MS rather than wedging the job forever.
+const RECORD_LOCK = 'job.json.lock';
+// The wait is long because the stale-break below bounds it: a holder that died is
+// broken out of after RECORD_LOCK_STALE_MS, so the only thing this wait covers is
+// live contention, and losing that race must never look like a successful write.
+const RECORD_LOCK_WAIT_MS = 15000;
+const RECORD_LOCK_STALE_MS = 5000;
+
+function withRecordLock(dir, fn) {
+  const lock = path.join(dir, RECORD_LOCK);
+  const deadline = Date.now() + RECORD_LOCK_WAIT_MS;
+  for (;;) {
+    try { fs.mkdirSync(lock); break; } catch (err) {
+      if (err.code !== 'EEXIST') return { locked: false, error: err };
+      let age = Infinity;
+      try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { age = Infinity; }
+      if (age > RECORD_LOCK_STALE_MS) {
+        // The holder died. Breaking the lock is safe in a way stealing a role
+        // claim is not: the loser of this race rewrites from a fresh read.
+        try { fs.rmSync(lock, { recursive: true, force: true }); } catch { /* raced */ }
+        continue;
+      }
+      if (Date.now() >= deadline) return { locked: false };
+      sleepSync(20);
+    }
+  }
+  try { return { locked: true, value: fn() }; }
+  finally { try { fs.rmSync(lock, { recursive: true, force: true }); } catch { /* best effort */ } }
+}
+
+// Compare-and-swap on the record. `expect` is the precondition, evaluated on the
+// record as it is INSIDE the lock — so a caller can say "only if this is still
+// running" and have that mean it. Returns the new record, or null when the
+// record is corrupt, the precondition failed, or the lock could not be taken;
+// `updateRecordOutcome` gives callers the reason when they need to act on it.
+function updateRecordOutcome(dir, patch, { expect } = {}) {
+  const held = withRecordLock(dir, () => {
+    const current = readRecord(dir);
+    // TEST HOOK: stands in for this process being descheduled between the read and
+    // the write — the window in which another writer's verdict used to be lost. A
+    // scheduler gap of a chosen length is not producible on demand; the runtime's
+    // decision (the other writer's value survives) is what is under test.
+    if (process.env.CODEX_DISPATCH_TEST_RECORD_PAUSE_MS) {
+      sleepSync(Number(process.env.CODEX_DISPATCH_TEST_RECORD_PAUSE_MS));
+    }
+    if (isCorrupt(current)) return { ok: false, why: 'corrupt', current };
+    if (expect && !expect(current)) return { ok: false, why: 'precondition', current };
+    const generation = Number.isSafeInteger(current.generation) ? current.generation + 1 : 1;
+    const record = { ...current, ...patch, generation };
+    writeRecord(dir, record);
+    return { ok: true, record };
+  });
+  if (!held.locked) {
+    return { ok: false, why: 'locked' };
+  }
+  return held.value;
+}
+
+function updateRecord(dir, patch, opts) {
+  const outcome = updateRecordOutcome(dir, patch, opts);
+  return outcome.ok ? outcome.record : null;
 }
 
 // The liveness probe decides whether a kill worked, whether a job is stale, and
@@ -376,14 +675,46 @@ export function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch (err) { return livenessFromError(err); }
 }
 
+// Every listing verb walks this, and every one of them then reads pid files,
+// kills, renames or removes through what it finds. So the walk is where the
+// containment is proved: a directory entry inside the jobs root is only a job if
+// its name is an id this runtime could have generated, it is a REAL directory
+// (not a junction or symlink pointing somewhere else), and it still resolves
+// inside the root once its reparse points are followed.
+//
+// An entry that carries a job.json and fails any of those is reported as corrupt
+// rather than skipped: skipping is how a live thing becomes invisible, and this
+// walk is the backstop that has to see everything.
 function allJobs() {
   const root = jobsRoot();
   if (!fs.existsSync(root)) return [];
   const jobs = [];
-  for (const name of fs.readdirSync(root)) {
+  let entries;
+  try { entries = fs.readdirSync(root, { withFileTypes: true }); } catch { return []; }
+  for (const entry of entries) {
+    const name = entry.name;
     const dir = path.join(root, name);
     if (!fs.existsSync(recordPath(dir))) continue; // not a job dir
-    jobs.push({ id: name, dir, record: readRecord(dir) });
+    if (!JOB_ID_RE.test(name)) {
+      jobs.push({
+        id: name, dir, contained: false,
+        record: { __corrupt: true, corruptReason: clean(`the directory name is not a job id (${name})`) },
+      });
+      continue;
+    }
+    if (!isRealDirectory(dir) || !isInsideRootReal(root, dir)) {
+      jobs.push({
+        id: name, dir, contained: false,
+        record: {
+          __corrupt: true,
+          corruptReason:
+            'the job directory is a link, or resolves outside the jobs root — nothing was read ' +
+            'through it',
+        },
+      });
+      continue;
+    }
+    jobs.push({ id: name, dir, contained: true, record: readRecord(dir) });
   }
   jobs.sort((a, b) => (b.record.started || '').localeCompare(a.record.started || ''));
   return jobs;
@@ -418,7 +749,12 @@ function assertJobId(id) {
 function effectiveState(job) {
   const r = job.record;
   if (isCorrupt(r)) return 'corrupt';
-  if (r.state !== 'running') return r.state;
+  // Through the validator, always: a state outside the known set reads as
+  // `unknown`, which is live. It used to pass through verbatim, so a record
+  // carrying a typo'd `"runnng"` or a future `"cancelling"` was neither running
+  // nor in LIVE_STATES — it lost its role claim while codex ran. (Codex arm.)
+  const state = canonicalState(r);
+  if (state !== 'running') return state;
   if (!pidAlive(r.supervisorPid)) {
     // grace: supervisor registers its own pid shortly after spawn
     if (!r.supervisorPid && Date.now() - Date.parse(r.started) < CLAIM_GRACE_MS) return 'running';
@@ -544,14 +880,30 @@ function cmdQuote(s) {
   return /[\s&|<>()^"]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
 }
 
+// Returns { child, viaShell }. `viaShell` matters because of what it does to the
+// pid: on Windows `codex.cmd` is not a script this runtime can run under node, so
+// it is spawned through cmd.exe — and the pid that comes back is the CMD.EXE
+// WRAPPER, not codex. Recording that as `codexPid` meant every kill verification
+// checked a proxy (measured live: wrapper 43124, real worker 40732 with ppid
+// 43124). See resolveWorkerPids.
 function spawnCodex(bin, args, opts) {
-  if (isScript(bin)) return spawn(process.execPath, [bin, ...args], opts);
-  if (WIN) return spawn([bin, ...args].map(cmdQuote).join(' '), { ...opts, shell: true });
-  return spawn(bin, args, opts);
+  if (isScript(bin)) return { child: spawn(process.execPath, [bin, ...args], opts), viaShell: false };
+  if (WIN) {
+    return { child: spawn([bin, ...args].map(cmdQuote).join(' '), { ...opts, shell: true }), viaShell: true };
+  }
+  return { child: spawn(bin, args, opts), viaShell: false };
 }
 
+// stdin is NUL, never a pipe. spawnSync's default stdio gives the child a pipe
+// for stdin and closes the write end immediately; a child (or a grandchild that
+// inherits the handle — `cmd /c type` does) that touches it can fail the launch
+// with ERROR_NO_DATA / 0x800700E8, "the pipe is being closed". That surfaced as a
+// console error box during a probe against a perfectly good binary. Nothing this
+// runtime spawns synchronously ever reads stdin, so there is no reason to give it
+// one. windowsHide for the same reason a probe must be invisible: it runs under a
+// detached supervisor, and a console window popping up is not a diagnostic.
 function runCodexSync(bin, args, opts = {}) {
-  const base = { encoding: 'utf8', ...opts };
+  const base = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, ...opts };
   if (isScript(bin)) return spawnSync(process.execPath, [bin, ...args], base);
   if (WIN) return spawnSync([bin, ...args].map(cmdQuote).join(' '), { ...base, shell: true });
   return spawnSync(bin, args, base);
@@ -559,7 +911,7 @@ function runCodexSync(bin, args, opts = {}) {
 
 function whereHits(name) {
   if (!WIN) return [];
-  const r = spawnSync('where', [name], { encoding: 'utf8' });
+  const r = spawnSync('where', [name], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
   if (r.status !== 0) return [];
   return (r.stdout || '').split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
 }
@@ -607,11 +959,46 @@ function resolveBin() {
 // in what we send, or an echo is indistinguishable from a read.
 const MIN_SIGHT_TOKEN = 12;
 
+// How many times a probe whose TRANSPORT failed is retried before the runtime
+// gives up and says so. Deliberately small: a real spawn failure repeats, a flake
+// does not.
+const SIGHT_PROBE_ATTEMPTS = 3;
+const SIGHT_PROBE_RETRY_MS = 250;
+
+// Test-only: makes the Nth probe spawn fail the way a Windows pipe/launch failure
+// does — `spawnSync` returning an `error` with no status at all. A transport
+// failure is not producible on demand in CI, and what is under test is the
+// runtime's DECISION: a probe that could not be RUN is not a probe that found
+// blindness. Format: a count of attempts to fail (`2` = the first two).
+function injectedProbeError() {
+  const raw = process.env.CODEX_DISPATCH_TEST_PROBE_ERROR;
+  if (!raw) return 0;
+  const n = Number(raw);
+  return Number.isSafeInteger(n) && n > 0 ? n : 0;
+}
+let injectedProbeErrorsUsed = 0;
+
 // One sandboxed read, verified by its content. `codex sandbox <cmd>` runs a real
 // command inside codex's own sandbox: no model call, no tokens, no billing,
 // ~300 ms. The check is POSITIVE — the bytes we expect have to come back — which
 // is what makes it robust against failure shapes nobody has seen yet.
-// Returns { state: 'functional' | 'broken' | 'unavailable' | 'unprovable', detail }.
+//
+// Returns { state, detail } where state is one of:
+//   functional  — the bytes came back on stdout: sight is PROVEN
+//   broken      — the sandbox ran and could not read: sight is DISPROVEN
+//   unavailable — this codex has no `sandbox` subcommand
+//   unprovable  — the read could not be posed as a proof
+//   probe-error — THE PROBE NEVER RAN. The spawn itself failed (Windows pipe
+//                 teardown, a binary that vanished, a transport error), so
+//                 nothing was learned about the sandbox at all.
+//
+// That last one is a distinction this runtime used to lack, and it matters
+// exactly as much as the rest of the gate: `spawnSync` sets `error` and leaves
+// `status` null when the launch fails, and every one of those used to fall out of
+// the bottom of this function as `broken` — i.e. as a job FAILED for
+// `sandbox-blind-precheck`, a verdict of proven blindness, on the strength of an
+// infrastructure hiccup. Under a fail-closed gate that is the expensive
+// direction: it refuses good jobs and blames the wrong thing.
 function sandboxRead(bin, file, { cwd, token } = {}) {
   const args = WIN
     ? ['sandbox', 'cmd', '/c', 'type', file]
@@ -633,23 +1020,61 @@ function sandboxRead(bin, file, { cwd, token } = {}) {
       detail: 'the verification token appears in the command being sent, so an echo would pass as a read',
     };
   }
-  const r = runCodexSync(bin, args, cwd ? { cwd } : {});
-  const stdout = r.stdout || '';
-  const text = `${stdout}${r.stderr || ''}`;
-  if (r.status === 0 && stdout.includes(token)) return { state: 'functional', detail: '' };
-  const firstLine = clean(text).split(/\r?\n/).map((s) => s.trim()).find(Boolean) || `exit ${r.status}`;
-  if (/unrecognized subcommand|unknown subcommand|invalid subcommand/i.test(text)) {
-    return { state: 'unavailable', detail: firstLine };
+
+  let transport = null;
+  for (let attempt = 1; attempt <= SIGHT_PROBE_ATTEMPTS; attempt++) {
+    let r;
+    if (injectedProbeErrorsUsed < injectedProbeError()) {
+      injectedProbeErrorsUsed++;
+      r = { error: Object.assign(new Error('simulated spawn failure'), { code: 'UNKNOWN', errno: -4094 }), status: null };
+    } else {
+      r = runCodexSync(bin, args, cwd ? { cwd } : {});
+    }
+    // The probe did not RUN. Not evidence about the sandbox — evidence about the
+    // spawn. Retry a bounded number of times; a real failure survives that.
+    if (r.error || (r.status === null && !r.stdout && !r.stderr)) {
+      const err = r.error || new Error('the process produced neither output nor an exit status');
+      transport = `${clean(err.code || err.errno || 'spawn failed')}: ${clean(err.message)}`;
+      if (attempt < SIGHT_PROBE_ATTEMPTS) { sleepSync(SIGHT_PROBE_RETRY_MS); continue; }
+      return {
+        state: 'probe-error',
+        detail:
+          `the sight probe could not be RUN (${transport}), ${SIGHT_PROBE_ATTEMPTS} attempts — ` +
+          'so nothing is known about this sandbox either way',
+      };
+    }
+    const stdout = r.stdout || '';
+    const text = `${stdout}${r.stderr || ''}`;
+    if (r.status === 0 && stdout.includes(token)) return { state: 'functional', detail: '' };
+    const firstLine = clean(text).split(/\r?\n/).map((s) => s.trim()).find(Boolean) || `exit ${r.status}`;
+    if (/unrecognized subcommand|unknown subcommand|invalid subcommand/i.test(text)) {
+      return { state: 'unavailable', detail: firstLine };
+    }
+    if (r.status === 0) {
+      return {
+        state: 'broken',
+        detail: text.includes(token)
+          ? `the command exited 0 and the bytes appeared only on stderr, not on stdout where a real read puts them (${firstLine})`
+          : `the command exited 0 but the file's bytes never came back (${firstLine})`,
+      };
+    }
+    // A nonzero exit WITH no output at all is the other shape a broken launch
+    // takes on Windows (the shell reports the failure and says nothing), so it is
+    // treated as transport rather than as a sandbox verdict.
+    if (r.signal || (!stdout && !(r.stderr || ''))) {
+      transport = r.signal ? `killed by ${clean(r.signal)}` : `exit ${r.status} with no output`;
+      if (attempt < SIGHT_PROBE_ATTEMPTS) { sleepSync(SIGHT_PROBE_RETRY_MS); continue; }
+      return {
+        state: 'probe-error',
+        detail:
+          `the sight probe produced no output to judge (${transport}), ${SIGHT_PROBE_ATTEMPTS} attempts — ` +
+          'so nothing is known about this sandbox either way',
+      };
+    }
+    return { state: 'broken', detail: firstLine };
   }
-  if (r.status === 0) {
-    return {
-      state: 'broken',
-      detail: text.includes(token)
-        ? `the command exited 0 and the bytes appeared only on stderr, not on stdout where a real read puts them (${firstLine})`
-        : `the command exited 0 but the file's bytes never came back (${firstLine})`,
-    };
-  }
-  return { state: 'broken', detail: firstLine };
+  /* c8 ignore next */
+  return { state: 'probe-error', detail: transport || 'the sight probe could not be run' };
 }
 
 // Install-level probe, from wherever the launcher happens to be: writes a nonce
@@ -805,6 +1230,18 @@ function preflight({ quiet } = {}) {
     if (WIN) fail(msg);
     process.stderr.write(msg + '\nNot fatal here: Windows is the platform this probe is verified on.\n');
   }
+  if (sandbox.state === 'probe-error') {
+    // NOT a blindness verdict: the probe never ran, so it found nothing. Saying
+    // "your sandbox is broken" here would blame the binary for a spawn failure.
+    process.stderr.write(
+      `preflight: WARNING — the sandbox probe could not be RUN, so nothing is known about it.\n` +
+      `bin: ${binLabel}\n` +
+      `probe: ${sandbox.detail}\n` +
+      `This is a transport failure (the process would not launch or produced nothing), not evidence\n` +
+      `that codex cannot see. Dispatches will be refused as "sight-probe-error" rather than as blind.\n` +
+      `Re-run preflight; if it persists, check that ${binLabel} runs by hand.\n`
+    );
+  }
   if (sandbox.state === 'unavailable') {
     process.stderr.write(
       `preflight: WARNING — this codex has no "sandbox" subcommand, so sight cannot be proven\n` +
@@ -932,20 +1369,55 @@ export function verifyClaim(lockDir, jobId) {
 // claim; and the moment it returns, the old lock is unreachable by name, which is
 // what makes a resumed claimer's verify fail. The tombstone is deleted afterwards
 // at leisure — that part never had to be atomic.
-function reclaimClaim(root, role) {
+//
+// IT IS ALSO CONDITIONAL ON THE OWNER, which is the ABA race this closes (Codex
+// arm, round three): inspect owner A, be descheduled, another dispatch installs
+// its own claim B and passes its own fence, resume, and rename B's claim away —
+// leaving B running with no claim and the role free for a third dispatch. Reading
+// the owner before the rename narrows the window but cannot close it, because the
+// read and the rename are two operations. So the check that decides is AFTER the
+// rename, on the thing actually moved: if it is not the claim that was inspected,
+// it is put straight back and the reclaim fails.
+//
+// `expected` is the owner the caller inspected; `undefined` means "whatever is
+// there" and is only used where no owner was ever read.
+function reclaimClaim(root, role, expected) {
   const lockDir = roleLockDir(root, role);
   const tomb = assertInsideRoot(
     root,
-    path.join(root, ROLE_LOCKS, `.reclaimed-${role}-${Date.now()}-${process.pid}`),
+    path.join(root, ROLE_LOCKS, `.reclaimed-${role}-${Date.now()}-${process.pid}-${Math.random().toString(36).slice(2, 8)}`),
     'stage a reclaimed role lock'
   );
+  if (expected !== undefined && readClaimOwner(lockDir).owner !== expected) {
+    return { ok: false, reason: 'the claim changed hands before it could be reclaimed' };
+  }
   try {
     fs.renameSync(lockDir, tomb);
   } catch (err) {
-    return err.code === 'ENOENT'; // already gone: somebody else got there first
+    // Already gone: somebody else got there first, which is the same outcome.
+    return err.code === 'ENOENT' ? { ok: true, gone: true } : { ok: false, reason: clean(err.message) };
+  }
+  if (expected !== undefined) {
+    const moved = readClaimOwner(tomb).owner;
+    if (moved !== expected) {
+      // We just took a claim that was not the one we judged. Put it back — one
+      // rename, the same atomic primitive — and refuse. A restore that itself
+      // fails is reported, because a claim left in a tombstone is a role nobody
+      // holds and everybody may take.
+      let restored = false;
+      try { fs.renameSync(tomb, lockDir); restored = true; } catch { /* reported below */ }
+      return {
+        ok: false,
+        aba: true,
+        restored,
+        reason:
+          `the claim changed hands during the reclaim (expected owner ${JSON.stringify(clean(String(expected)))}, ` +
+          `moved ${JSON.stringify(clean(String(moved)))})${restored ? ' — it has been put back' : ''}`,
+      };
+    }
   }
   try { fs.rmSync(tomb, { recursive: true, force: true }); } catch { /* best effort */ }
-  return true;
+  return { ok: true };
 }
 
 // Only ever releases OUR claim: a release that cannot name itself as the owner
@@ -973,7 +1445,17 @@ function releaseRole(root, role, jobId) {
   // hand the role away on a guess.
   if (invalid !== undefined) return;
   if (owner && jobId && owner !== jobId) return;
-  reclaimClaim(root, role);
+  // Conditional on the owner still being the one just read — the release side of
+  // the same ABA race as the reclaim side. `owner` may legitimately be null (a
+  // claim with no owner file), and that case cannot be fenced, so it passes
+  // through as before.
+  const done = reclaimClaim(root, role, owner ?? undefined);
+  if (!done.ok) {
+    process.stderr.write(
+      `WARNING: did not release the "${role}" role claim held by ${clean(String(jobId))}: ${done.reason}.\n` +
+      `Another dispatch owns it now; releasing it would have handed the role to a third.\n`
+    );
+  }
 }
 
 // live        — a dispatch is mid-claim right now; nobody may take it
@@ -1046,9 +1528,13 @@ function claimRole(root, role, jobId, { force } = {}) {
       if (!killed.ok) {
         return {
           ok: false,
-          message: killed.pending
-            ? killPendingMessage(claim.job, role)
-            : killFailedMessage(claim.job, killed),
+          message: killed.unrecorded
+            ? `dispatch: REFUSING to launch — the "${role}" role's previous job was killed, but that\n` +
+              `could not be written to its record (${clean(killed.why)}), so nothing may treat it as\n` +
+              `finished. job: ${claim.job.id}\nRe-run; the pids are spent, so a retry only records the death.`
+            : killed.pending
+              ? killPendingMessage(claim.job, role)
+              : killFailedMessage(claim.job, killed),
         };
       }
       console.log(`killed previous job: ${claim.job.id} (was ${claim.state})`);
@@ -1068,11 +1554,13 @@ function claimRole(root, role, jobId, { force } = {}) {
         );
       }
     }
-    // Re-read the owner immediately before taking the claim away: it may have
-    // changed hands while this dispatch was inspecting it, and a reclaim is a
-    // rename that does not care whose directory it moves.
-    if (readClaimOwner(lockDir).owner !== claim.owner) continue;
-    reclaimClaim(root, role);
+    // Take the claim away CONDITIONALLY: reclaimClaim re-reads the owner before
+    // the rename and re-checks what it actually moved afterwards, putting a
+    // stranger's claim straight back. A reclaim that loses that race is not an
+    // error — it means somebody else owns the role now — so the loop retries and
+    // re-inspects rather than launching.
+    const reclaimed = reclaimClaim(root, role, claim.owner ?? undefined);
+    if (!reclaimed.ok) continue;
   }
   return {
     ok: false,
@@ -1096,21 +1584,123 @@ function claimRole(root, role, jobId, { force } = {}) {
 // deliberately leave it. The bare pid follows as a fallback for the case where
 // the group no longer exists (leader gone, group empty) but the process does.
 export function killPlan(pid, win = WIN) {
+  // THE PID DOMAIN IS PART OF THE PLAN. `killPlan(-1)` used to answer
+  // `{ signals: [1, -1] }` off Windows: signal pid 1, then signal EVERY process
+  // this account may signal. One corrupt record with `supervisorPid: -1` is a
+  // machine-wide kill. Nothing outside the domain gets a plan at all.
+  if (!isPid(pid)) {
+    return { refuse: `${JSON.stringify(pid)} is not a pid (integers ${PID_MIN}..${PID_MAX})` };
+  }
   if (win) return { tool: 'taskkill', args: ['/PID', String(pid), '/T', '/F'] };
   return { signals: [-pid, pid] };
 }
 
 function killTree(pid) {
-  if (!pid) return;
+  const plan = killPlan(pid);
+  if (plan.refuse) {
+    if (pid !== null && pid !== undefined && pid !== 0) {
+      process.stderr.write(`WARNING: refusing to signal ${plan.refuse}. Nothing was killed.\n`);
+    }
+    return;
+  }
   // Test-only: simulate a kill that does not take effect, so the verified-kill
   // path has a regression test that does not depend on finding a genuinely
   // unkillable process. Never set outside the suite.
   if (process.env.CODEX_DISPATCH_TEST_NOKILL) return;
-  const plan = killPlan(pid);
-  if (plan.tool) { spawnSync(plan.tool, plan.args, { stdio: 'ignore' }); return; }
+  if (plan.tool) { spawnSync(plan.tool, plan.args, { stdio: 'ignore', windowsHide: true }); return; }
   for (const target of plan.signals) {
     try { process.kill(target, 'SIGKILL'); } catch { /* already gone, or never a group */ }
   }
+}
+
+// ------------------------------------------------------ the tree, for real
+//
+// A kill is only verified if the thing verified is the thing that bills. On
+// Windows the recorded `codexPid` is the CMD.EXE WRAPPER whenever codex is a
+// `.cmd` (which is the npm build, i.e. the supported one): `spawn` with
+// `shell: true` returns the shell's pid, and the real worker is its child.
+// Measured live during review: wrapper 43124, worker 40732, ppid 43124. Every
+// `killPids`/`waitGone` therefore verified a proxy — a surviving worker left the
+// job marked `killed`, the role released, and the next dispatch running beside a
+// codex that was still going. `kill-failed` could not fire.
+//
+// So the process table is read and the tree is walked: descendants are killed
+// alongside their recorded ancestors, and any that remain afterwards are
+// survivors. Returns a Map<pid, ppid>, or null when the table cannot be read —
+// which is reported, never silently treated as "the tree is empty".
+function processTable() {
+  const parse = (text) => {
+    const table = new Map();
+    for (const line of String(text).split(/\r?\n/)) {
+      const m = line.trim().match(/^(\d+)[\s,]+(\d+)$/);
+      if (m) table.set(Number(m[1]), Number(m[2]));
+    }
+    return table.size ? table : null;
+  };
+  const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 15000 };
+  if (!WIN) {
+    const r = spawnSync('ps', ['-eo', 'pid=,ppid='], opts);
+    return r.status === 0 ? parse(r.stdout) : null;
+  }
+  const script =
+    'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }';
+  for (const shell of ['powershell', 'pwsh']) {
+    const r = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], opts);
+    if (r.status === 0) {
+      const table = parse(r.stdout);
+      if (table) return table;
+    }
+  }
+  return null;
+}
+
+// Every live process descended from any of `roots`, excluding the roots.
+export function descendantsOf(roots, table) {
+  if (!table) return null;
+  const wanted = new Set(roots.filter(isPid));
+  const out = new Set();
+  // Bounded by the table size: a cycle in reported parentage (pid reuse can
+  // manufacture one) must not spin.
+  for (const [pid, ppid] of table) {
+    if (!isPid(pid)) continue;
+    let cursor = ppid;
+    for (let hops = 0; hops < table.size && isPid(cursor); hops++) {
+      if (wanted.has(cursor)) { if (!wanted.has(pid)) out.add(pid); break; }
+      const next = table.get(cursor);
+      if (next === undefined || next === cursor) break;
+      cursor = next;
+    }
+  }
+  return [...out];
+}
+
+// The real process(es) behind a shell wrapper. Polled rather than read once,
+// because cmd.exe takes a moment to start what it was asked to start, and an
+// empty answer here is the difference between verifying codex and verifying a
+// proxy. Bounded: a wrapper that never produces a child is reported, not waited
+// on forever.
+const WORKER_RESOLVE_MS = 5000;
+const WORKER_POLL_MS = 200;
+
+function resolveWorkerPids(wrapperPid, { timeoutMs = WORKER_RESOLVE_MS } = {}) {
+  if (!isPid(wrapperPid)) return [];
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const table = processTable();
+    const kin = descendantsOf([wrapperPid], table);
+    if (kin && kin.length) return kin;
+    if (!pidAlive(wrapperPid)) return kin || [];
+    if (Date.now() >= deadline) return kin || [];
+    sleepSync(WORKER_POLL_MS);
+  }
+}
+
+// POSIX: the process group codex leads is the tree there, so an empty group is
+// part of the proof. `kill(-pgid, 0)` raises ESRCH exactly when no process is
+// left in it; anything else (EPERM included) means something is.
+function groupAlive(pgid) {
+  if (WIN || !isPid(pgid)) return false;
+  try { process.kill(-pgid, 0); return true; } catch (err) { return livenessFromError(err); }
 }
 
 // taskkill's exit code lies often enough to be useless (it reports success for
@@ -1126,11 +1716,47 @@ function waitGone(pids, ms = KILL_VERIFY_MS) {
   return alive;
 }
 
-// Kills every pid and returns the ones that were STILL ALIVE afterwards.
-function killPids(pids) {
-  const unique = [...new Set(pids.filter(Boolean))];
-  for (const pid of unique) killTree(pid);
-  return waitGone(unique);
+// Kills every pid AND everything descended from it, and reports what is still
+// alive afterwards.
+//
+// Returns { survivors, targets, enumerated }. `enumerated: false` means the
+// process table could not be read, so the descendants were never known — the
+// callers treat that as "this kill could not be fully verified" rather than as
+// "there was nothing there", which is the whole point of the field.
+//
+// Two rounds, because a tree can grow between the enumeration and the kill: a
+// wrapper that has not yet started its worker, a codex still spawning its sandbox
+// helpers. Two is enough for that and bounded enough not to become a loop.
+function killPids(pids, { rounds = 2 } = {}) {
+  const targets = [...new Set(pids.filter(isPid))];
+  if (!targets.length) return { survivors: [], targets: [], enumerated: true };
+  const fired = new Set(targets);
+  let enumerated = true;
+
+  for (let round = 0; round < rounds; round++) {
+    const table = processTable();
+    if (!table) enumerated = false;
+    // Descendants are only meaningful for a parent that is alive: a dead pid's
+    // recorded parentage is stale on Windows and can name a REUSED number.
+    const live = targets.filter(pidAlive);
+    const kin = table ? (descendantsOf(live, table) || []) : [];
+    for (const pid of kin) fired.add(pid);
+    for (const pid of [...fired]) killTree(pid);
+    if (!waitGone([...fired]).length) break;
+  }
+
+  const alive = waitGone([...fired]);
+  // Anything still descended from what was targeted is a survivor too, even if
+  // it was never a recorded pid: that is precisely the codex worker behind a
+  // cmd.exe wrapper.
+  const after = processTable();
+  if (!after) enumerated = false;
+  const leftovers = after ? (descendantsOf([...fired], after) || []) : [];
+  return {
+    survivors: [...new Set([...alive, ...leftovers.filter(pidAlive)])],
+    targets: [...fired],
+    enumerated,
+  };
 }
 
 // Pids recorded as plain files in the job dir, one or more per file. The
@@ -1244,8 +1870,8 @@ function reapUnvouchedJob(root, dir) {
   assertInsideRoot(root, dir, 'reap a job directory');
   const pids = recordedPids(dir);
   if (!pids.length) return { ok: true, killed: [] };
-  const survivors = killPids(pids);
-  if (survivors.length) return { ok: false, survivors, targets: pids };
+  const killed = killPids(pids);
+  if (killed.survivors.length) return { ok: false, survivors: killed.survivors, targets: killed.targets };
   const spent = consumePidFiles(dir, pids);
   if (spent.failed.length) {
     process.stderr.write(
@@ -1278,12 +1904,42 @@ function reapUnvouchedJob(root, dir) {
 //                        This is the dangerous one; nothing may call it dead.
 // A record with no `launch` at all predates 0.4.0, so it gets the conservative
 // reading: time-boxed refusal.
-export function inRegistrationWindow(record, now = Date.now()) {
-  if (!record || isCorrupt(record)) return false;
-  if (record.supervisorPid) return false;
-  if (record.launch === 'pending') return false;
+// THERE ARE TWO SUCH WINDOWS, NOT ONE. 0.4.0 closed the first and left the
+// second open, in the same shape (Claude and Codex arms both, round three): the
+// supervisor spawns codex and records its pid a moment later, so a cancel landing
+// in between kills the supervisor, verifies the targets it knows about, marks the
+// job `killed` and releases the role — while the codex it never recorded runs on.
+//
+//   'supervisor' — dispatch spawned a supervisor that has not registered.
+//                  Time-boxed, because a supervisor that never arrives must not
+//                  block its role forever.
+//   'exec'       — the supervisor is about to spawn, or has just spawned, codex.
+//                  NOT time-boxed: sight-proving takes as long as it takes, and
+//                  the phase is left behind by the supervisor itself the moment
+//                  the pids are recorded.
+//   'none'       — everything that has a kill target, or provably never will.
+export function killWindow(record, now = Date.now(), { supervisorDead = false } = {}) {
+  if (!record || isCorrupt(record)) return 'none';
+  const phase = launchPhase(record);
+  if (phase === 'exec-spawning') {
+    // The supervisor is the ONLY process that knows what it just spawned, so it is
+    // the only one that can land a cancel here. If it is recorded and provably
+    // gone, nobody can, and holding the window would leave the job kill-pending
+    // for ever — so it closes and the ordinary verified kill takes over, with the
+    // orphan limitation that `stale` already carries.
+    if (record.supervisorPid && supervisorDead) return 'none';
+    return 'exec';
+  }
+  if (record.supervisorPid) return 'none';
+  if (phase === 'pending') return 'none';
+  // 'spawning', or a record with no phase at all (0.3 and earlier), or a phase
+  // this release does not recognise — the conservative reading, time-boxed.
   const started = Date.parse(record.started);
-  return Number.isFinite(started) && now - started < CLAIM_GRACE_MS;
+  return Number.isFinite(started) && now - started < CLAIM_GRACE_MS ? 'supervisor' : 'none';
+}
+
+export function inRegistrationWindow(record, now = Date.now()) {
+  return killWindow(record, now) !== 'none';
 }
 
 // Returns { ok, survivors, targets }. A kill that cannot be shown to have worked
@@ -1295,6 +1951,10 @@ function killJob(job) {
   if (!isCorrupt(r)) {
     if (r.supervisorPid) targets.push(r.supervisorPid);
     if (r.codexPid) targets.push(r.codexPid);
+    // The pids resolved AFTER the spawn — on Windows the real codex worker behind
+    // the cmd.exe wrapper that `codexPid` names. This is the field a kill
+    // verification has to reach; `codexPid` alone was a proxy.
+    if (Array.isArray(r.codexPids)) targets.push(...r.codexPids);
   }
   // When the supervisor is already dead — the stale case — codex has been
   // reparented out of its tree, so /T on the supervisor reaches nothing. Hit the
@@ -1302,17 +1962,37 @@ function killJob(job) {
   // thing that stops an orphan billing. (Non-Windows has no tree kill at all,
   // so it always needed this.)
   targets.push(...recordedPids(job.dir));
-  const unique = [...new Set(targets.filter(Boolean))];
+  const unique = [...new Set(targets.filter(isPid))];
+  const window = killWindow(r, Date.now(), {
+    supervisorDead: !isCorrupt(r) && Boolean(r.supervisorPid) && !pidAlive(r.supervisorPid),
+  });
+  // INSIDE THE CODEX-EXEC WINDOW, KILL NOTHING. codex exists and its pid is
+  // written down nowhere; the supervisor is the one process that has it, and
+  // killing the supervisor is exactly how that knowledge is lost — which is what
+  // 0.4.0 did before recording `killed` and releasing the role. So this reports
+  // instead of declaring: `kill-pending` keeps the role, keeps the job
+  // cancellable, and the supervisor lands the cancel the moment it has registered
+  // the pids (it re-reads the record there, kills codex itself, and verifies).
+  if (window === 'exec') {
+    updateRecord(job.dir, { state: 'kill-pending' });
+    return { ok: false, pending: true, survivors: [], targets: [], window };
+  }
   // Nothing to kill AND nothing has registered yet: report, do not declare. The
   // state stays live (`kill-pending` blocks the role and is cancellable), the
   // claim is NOT released, and the caller is told to retry — because the thing
   // this would otherwise have called dead is a supervisor that is still starting.
-  if (!unique.length && inRegistrationWindow(r)) {
+  if (!unique.length && window !== 'none') {
     updateRecord(job.dir, { state: 'kill-pending' });
-    return { ok: false, pending: true, survivors: [], targets: [] };
+    return { ok: false, pending: true, survivors: [], targets: [], window };
   }
-  const survivors = killPids(unique);
+  const killed = killPids(unique);
+  const survivors = killed.survivors;
   const finished = new Date().toISOString();
+  // POSIX: codex leads its own process group, and an empty group is part of the
+  // proof that the group kill reached everything in it.
+  if (!survivors.length && !isCorrupt(r) && groupAlive(r.codexPgid)) {
+    survivors.push(r.codexPgid);
+  }
   if (survivors.length) {
     // The pid files stay loaded on purpose: those processes are demonstrably still
     // alive, so the numbers are still theirs and still need firing at.
@@ -1328,12 +2008,21 @@ function killJob(job) {
   const renameWarning = spent.failed.length
     ? `pid file(s) could not be consumed: ${spent.failed.join('; ')}`
     : null;
-  updateRecord(job.dir, {
+  const recorded = updateRecordOutcome(job.dir, {
     state: 'killed',
     finished,
     killSurvivors: undefined,
     warning: [priorWarning, renameWarning].filter(Boolean).join('; ') || undefined,
   });
+  // A KILL THAT COULD NOT BE WRITTEN DOWN IS NOT A KILL THAT HAPPENED, as far as
+  // anything reading this job afterwards is concerned. Swallowing the failed write
+  // and returning ok is the same shape of defect as every other one here: the
+  // runtime reporting an action instead of a fact. The processes really are dead;
+  // the record still says otherwise, so it keeps blocking its role — the safe
+  // direction — and the caller is told to re-run.
+  if (!recorded.ok) {
+    return { ok: false, unrecorded: true, why: recorded.why, survivors: [], targets: unique };
+  }
   if (renameWarning) {
     process.stderr.write(
       `WARNING: job ${job.id} — ${renameWarning}\n` +
@@ -1371,7 +2060,16 @@ function corruptClaimMessage(role, lockDir, claim) {
     `A claim owner becomes a PATH: the job directory whose pid files a reclaim kills, whose spent\n` +
     `files it renames, and whose record it reads. So anything outside ${JOB_ID_RE} is refused before\n` +
     `it is joined — nothing has been read, killed, renamed or removed.\n` +
-    `Inspect that file. If it is junk, delete the lock directory (${lockDir}) and re-dispatch.`
+    `\n` +
+    `RECOVERY, in this order. Removing the lock is the LAST step, not the first: it is the guard\n` +
+    `standing between this role and a second codex, and this message used to open by telling you to\n` +
+    `delete it.\n` +
+    `  1. Read that owner file. Something wrote it, and what wrote it is the actual problem.\n` +
+    `  2. Find out whether a "${role}" job is still alive:  list  — and  status <job-id>  for any\n` +
+    `     that reads running, stale, kill-pending, kill-failed or unknown.\n` +
+    `  3. Kill anything that is (cancel <job-id>, or taskkill /PID <pid> /T /F) and confirm it died.\n` +
+    `  4. ONLY THEN remove the lock directory (${lockDir}) and re-dispatch.\n` +
+    `  Or skip all of it: dispatch under another --role, which is free and takes nothing away.`
   );
 }
 
@@ -1379,10 +2077,11 @@ function killPendingMessage(job, role) {
   return (
     `dispatch: REFUSING to launch — the previous "${role}" job could not be shown to have died.\n` +
     `job: ${job.id} (state: kill-pending)\n` +
-    `It was cancelled inside its supervisor's registration window: there was nothing recorded to\n` +
-    `kill, and "killed nothing" is not "is dead" — its supervisor may be starting codex right now.\n` +
-    `Wait a moment and re-run; once the supervisor has registered, the kill has a target and can be\n` +
-    `verified. Or dispatch under another --role.`
+    `It was cancelled inside one of the two registration windows — either before its supervisor had\n` +
+    `recorded anything to kill, or while that supervisor was launching codex and had not yet written\n` +
+    `down what it launched. Either way "killed nothing" is not "is dead".\n` +
+    `Wait a moment and re-run; the supervisor honours a pending cancel as soon as it has the pids,\n` +
+    `and then the kill has a target and can be verified. Or dispatch under another --role.`
   );
 }
 
@@ -1412,10 +2111,36 @@ function killFailedMessage(job, killed) {
 
 // ---------------------------------------------------------------------- verbs
 
+// Which role a job belongs to, WITHOUT trusting the record. The directory name is
+// the id, ids are `<role>-<epoch>-<pid>`, and the name has already been proved to
+// match that shape and to be inside the jobs root — so it is the one statement of
+// a job's role that survives its record being unreadable.
+export function roleOfJob(job) {
+  if (JOB_ID_RE.test(job.id)) return job.id.slice(0, job.id.indexOf('-'));
+  return isCorrupt(job.record) ? null : (job.record.role ?? null);
+}
+
+// The backstop scan, for jobs that predate role claims or whose claim was removed
+// by hand — which is exactly the situation this had to be fixed for.
+//
+// IT USED TO SKIP CORRUPT RECORDS BY DESIGN, on the reasoning that a record which
+// cannot be read cannot claim to be running. True, and it cannot claim not to be
+// either: with the claim directory deleted, two codexes ran under one role, and
+// the message the runtime printed at the operator told them to delete that
+// directory (Claude arm, round three, reproduced). Silence is not death anywhere
+// else in this runtime and it is not death here: a corrupt record blocks its role
+// unless its processes are PROVEN gone, and the proof is the same verified reap
+// the claim side already runs.
 function findRoleConflict(role) {
   for (const j of allJobs()) {
-    if (isCorrupt(j.record) || j.record.role !== role) continue;
+    if (roleOfJob(j) !== role) continue;
     const s = effectiveState(j);
+    if (s === 'corrupt') {
+      // Proven dead = it has no un-reaped pid file still naming a live process.
+      // Anything else and the role does not change hands on a guess.
+      if (!recordedPids(j.dir).some(pidAlive)) continue;
+      return { ...j, state: 'corrupt', unvouched: true };
+    }
     if (LIVE_STATES.includes(s)) return { ...j, state: s };
   }
   return null;
@@ -1441,16 +2166,41 @@ function cmdDispatch(opts) {
   // A stale job blocks exactly like a running one. Stale means the supervisor is
   // gone while the out file never appeared: codex was very likely reparented and
   // is still running — and still billing. Letting that through is the orphan
-  // failure this runtime exists to kill. Corrupt jobs cannot make that claim
-  // about themselves, so they never block.
+  // failure this runtime exists to kill. A corrupt job blocks too, now: it cannot
+  // claim to be running, and it cannot claim not to be either.
   const conflict = findRoleConflict(role);
   if (conflict) {
-    if (!opts.force) fail(conflictMessage(conflict, conflict.state, role));
-    const killed = killJob(conflict);
-    if (!killed.ok) {
-      fail(killed.pending ? killPendingMessage(conflict, role) : killFailedMessage(conflict, killed));
+    if (conflict.unvouched) {
+      // A corrupt record cannot be marked killed — it is evidence and stays
+      // byte-for-byte — so the discipline is the claim side's: reap its pid files,
+      // verify the deaths, and refuse the role if anything survives. No --force
+      // needed to try, and no --force sufficient to skip it.
+      const reaped = reapUnvouchedJob(root, conflict.dir);
+      if (!reaped.ok) {
+        fail(reapFailedMessage(role, { owner: conflict.id, detail: 'its job.json is corrupt' }, reaped));
+      }
+      if (reaped.killed.length) {
+        console.log(
+          `reaped unvouched-for job before taking role "${role}": ` +
+          `${conflict.id} (pids ${reaped.killed.join(', ')})`
+        );
+      }
+    } else {
+      if (!opts.force) fail(conflictMessage(conflict, conflict.state, role));
+      const killed = killJob(conflict);
+      if (!killed.ok) {
+        if (killed.unrecorded) {
+          fail(
+            `dispatch: REFUSING to launch — the previous "${role}" job was killed, but that could not\n` +
+            `be written to its record (${clean(killed.why)}), so nothing may treat it as finished.\n` +
+            `job: ${conflict.id}\n` +
+            `Re-run: the pids are already spent, so a retry fires at nothing and only records the death.`
+          );
+        }
+        fail(killed.pending ? killPendingMessage(conflict, role) : killFailedMessage(conflict, killed));
+      }
+      console.log(`killed previous job: ${conflict.id} (was ${conflict.state})`);
     }
-    console.log(`killed previous job: ${conflict.id} (was ${conflict.state})`);
   }
 
   // <role>-<epoch-seconds>-<pid>: unique by construction. The collision suffix
@@ -1466,6 +2216,9 @@ function cmdDispatch(opts) {
   const claim = claimRole(root, role, id, { force: opts.force });
   if (!claim.ok) fail(claim.message);
 
+  // Set the moment a supervisor exists. Past that point the catch-all below must
+  // NOT finalize the record or release the role: something is running.
+  let spawned = false;
   try {
     fs.mkdirSync(dir);
     fs.copyFileSync(briefPath, path.join(dir, 'prompt.md'));
@@ -1495,6 +2248,13 @@ function cmdDispatch(opts) {
       finished: null,
     });
 
+    // TEST HOOK: a throw from between writeRecord and the pid check below — a full
+    // disk, a log that will not open, a pid file that will not write. Any of them
+    // used to land in the catch-all, which released the role and left the record
+    // saying `running` with no supervisor. Never set outside the suite.
+    if (process.env.CODEX_DISPATCH_TEST_THROW_AFTER_RECORD) {
+      throw new Error('simulated failure after the record was written');
+    }
     // TEST HOOK: stands in for this dispatch being descheduled between winning the
     // claim and launching — the window a reclaimer can use. Never set outside the
     // suite; finding a real scheduler pause on demand is not portable.
@@ -1547,23 +2307,78 @@ function cmdDispatch(opts) {
         `out: ${outPath(dir)}`
       );
     }
+    spawned = true;
     // REGISTER THE KILL TARGET IN THE PARENT, before this dispatch returns and
     // before the job id is printed. The supervisor writing its own pid left a
     // window in which the record said `running` with nothing to kill: a cancel
     // landing there killed nothing, "verified" it, marked the job killed and
     // released the role while the supervisor went on to launch codex. The pid is
     // knowable here, at spawn time, so the window does not have to exist.
-    updateRecord(dir, { supervisorPid: child.pid, launch: 'spawned' });
+    //
+    // The write is a compare-and-swap now (see updateRecord): a cancel may be
+    // writing `kill-pending` or `killed` at this very moment, and the old
+    // read-modify-write could put `running` back over it — telling the operator
+    // the job was killed, releasing the role, and leaving codex to run.
     fs.writeFileSync(path.join(dir, 'supervisor.pid'), String(child.pid));
+    updateRecord(dir, { supervisorPid: child.pid, launch: 'spawned' });
     // Attached only so a late 'error' cannot throw out of an already-detached
     // child; the synchronous pid check above is what actually decides.
     child.on('error', (err) => {
       process.stderr.write(`dispatch: supervisor spawn reported an error: ${clean(err.message)}\n`);
     });
     child.unref();
+
+    // A cancel that landed while this dispatch was spawning has now been serialized
+    // behind that write, and it wrote a state this job must honour rather than
+    // overwrite. The supervisor re-checks the same thing before it spends anything;
+    // this is the parent's half, and it exists so the cancel's verdict wins the
+    // race it just lost.
+    const after = readRecord(dir);
+    if (!isCorrupt(after) && canonicalState(after) !== 'running') {
+      const killed = killPids([child.pid]);
+      updateRecord(dir, killed.survivors.length
+        ? { state: 'kill-failed', killSurvivors: killed.survivors.join(', '), finished: new Date().toISOString() }
+        : { state: 'killed', finished: new Date().toISOString() });
+      if (!killed.survivors.length) releaseRole(root, role, id);
+      fail(
+        `dispatch: job ${id} was cancelled while it was starting.\n` +
+        `state: ${clean(canonicalState(after))}\n` +
+        (killed.survivors.length
+          ? `Its supervisor SURVIVED the kill (${killed.survivors.join(', ')}); the role stays blocked.\n` +
+            `Kill it yourself: taskkill /PID <pid> /T /F\n`
+          : `Its supervisor has been killed and verified dead; nothing was billed.\n`) +
+        `out: ${outPath(dir)}`
+      );
+    }
   } catch (err) {
+    // GHOST CLOSURE. Anything that threw between writeRecord and the pid check —
+    // opening the supervisor log, writing the pid file, a full disk — used to
+    // release the role and leave the record saying `running` with no supervisor:
+    // a job that reads `stale` forever, blocks its own role, and whose refusal
+    // claims codex "may still be billing" for a process that never existed. That
+    // was closed once, on the spawn-failure path, and remained reachable here.
+    if (spawned) {
+      // A supervisor EXISTS. Finalizing the record or releasing the role would be
+      // the double-dispatch this runtime is built to prevent, so neither happens.
+      fail(
+        `dispatch: job ${id} was launched, but handing it over failed: ${clean(err.message)}\n` +
+        `The supervisor is running and the "${role}" role stays claimed — nothing here may assume\n` +
+        `otherwise. Check it: status ${id}   Stop it: cancel ${id}\n` +
+        `out: ${outPath(dir)}`
+      );
+    }
+    updateRecord(dir, {
+      state: 'failed',
+      reason: 'dispatch-failed',
+      exitCode: -1,
+      finished: new Date().toISOString(),
+    });
     releaseRole(root, role, id);
-    fail(`dispatch: could not start job ${id}: ${err.message}`);
+    fail(
+      `dispatch: could not start job ${id}: ${clean(err.message)}\n` +
+      `The job is recorded as failed (dispatch-failed) and the "${role}" role has been released;\n` +
+      `nothing was billed, because codex was never reached.`
+    );
   }
 
   console.log(`job: ${id}`);
@@ -1599,6 +2414,35 @@ function cmdSupervise(dir) {
   const root = path.dirname(dir);
   const id = path.basename(dir);
 
+  // ASSERT THE SCHEMA VERSION OF THE RECORD THIS SUPERVISOR PICKED UP. Two copies
+  // of this runtime can be installed at once — a plugin install and a clone, an
+  // old shell and a new one — and dispatch and `_supervise` are separate
+  // processes: the record can therefore have been written by a different release
+  // than the one now running it. An older supervisor picking up a newer record
+  // applies its own, weaker proof and then the run delivers as vouched, because
+  // the stamp the gate reads says the version the DISPATCH wrote. (Codex arm,
+  // round three.) The stamp has to mean "this whole run met this gate", so the
+  // half of the run that spends money checks it too.
+  if (record.recordVersion !== RECORD_VERSION) {
+    const msg =
+      `supervisor: RECORD VERSION MISMATCH — refusing to run.\n` +
+      `record: recordVersion ${JSON.stringify(record.recordVersion ?? null)}\n` +
+      `this supervisor writes and enforces recordVersion ${RECORD_VERSION}\n` +
+      `The dispatch that created this job and the supervisor running it are different releases of\n` +
+      `codex-dispatch. A record stamped by one gate is not evidence that another gate was met, and\n` +
+      `the stamp is what "result" reads, so this job would deliver on a proof it never ran.\n` +
+      `Fix: use one runtime. Re-dispatch with the same copy that will supervise it.`;
+    try { fs.appendFileSync(runLogPath(dir), msg + '\n'); } catch { /* best effort */ }
+    process.stderr.write(msg + '\n');
+    updateRecord(dir, {
+      state: 'failed',
+      reason: 'record-version-mismatch',
+      finished: new Date().toISOString(),
+    });
+    releaseRole(root, record.role, id);
+    process.exit(1);
+  }
+
   // ---- positive sight proof, in THIS job's cwd, before codex spends anything --
   // A probe that throws is a probe that did not prove anything, and a supervisor
   // that dies here would leave the job reading `running` forever. Same verdict as
@@ -1621,11 +2465,45 @@ function cmdSupervise(dir) {
     updateRecord(dir, {
       state: 'failed',
       reason: 'sandbox-blind-precheck',
-      sight: `${sight.mode} FAILED: ${sight.detail}`,
+      // NOT `${sight.mode} FAILED: ...`. That began with `cwd-file:`, which is the
+      // one prefix this runtime treats as proof — a DISPROVEN read wrote a string
+      // that looked like evidence of a proven one. The label leads with the
+      // verdict now, and `sightVerdict` will not accept a prefix either way.
+      sight: `FAILED ${sight.mode}: ${sight.detail}`,
       finished: new Date().toISOString(),
     });
     releaseRole(root, record.role, id);
     process.exit(1);
+  }
+  // THE PROBE NEVER RAN. Not blindness — an absence of evidence, which is the
+  // `unproven` class, not the `broken` one. Calling this `sandbox-blind-precheck`
+  // (which is what every transport failure used to become) blames the binary for a
+  // spawn failure and tells the operator to reinstall codex, which fixes nothing.
+  if (sight.state === 'probe-error') {
+    const msg =
+      `supervisor: SIGHT PROBE COULD NOT BE RUN (${sight.mode}) — refusing to dispatch.\n` +
+      `probe: ${sight.detail}\n` +
+      `cwd: ${record.cwd}\n` +
+      `bin: ${record.bin}\n` +
+      'This is NOT a verdict about the sandbox: the probe process would not launch or produced\n' +
+      'nothing to judge, so codex was never asked. It was retried and kept failing.\n' +
+      'Cures, best first:\n' +
+      '  - Run it by hand: the bin above, with `sandbox` and a read, from that cwd.\n' +
+      '  - Re-dispatch; a transport failure that does not repeat costs one retry.\n' +
+      '  - Accept it knowingly: --allow-unproven-sight runs the job and records that nothing\n' +
+      '    ever vouched for it.';
+    try { fs.appendFileSync(runLogPath(dir), msg + '\n'); } catch { /* best effort */ }
+    if (!record.allowUnprovenSight) {
+      process.stderr.write(msg + '\n');
+      updateRecord(dir, {
+        state: 'failed',
+        reason: 'sight-probe-error',
+        sight: `unproven: the probe could not be run (${sight.detail})`,
+        finished: new Date().toISOString(),
+      });
+      releaseRole(root, record.role, id);
+      process.exit(1);
+    }
   }
   // DELIVERABILITY REQUIRES PROVEN SIGHT, and exactly one thing proves it: a file
   // that already existed in this job's own --cd, read back through codex's sandbox
@@ -1637,15 +2515,25 @@ function cmdSupervise(dir) {
   // an answer nothing had vouched for, printed anyway, with a caveat nobody reads.
   // So an unproven job is REFUSED — unless the caller opted in, in writing, and
   // the record carries that acceptance from here to the delivery.
-  const proven = sight.state === 'functional' && sight.mode.startsWith(PROVEN_SIGHT_PREFIX);
+  //
+  // Routed through the validator, not through `startsWith`: the label about to be
+  // written has to be one `sightVerdict` will still call a proof when `result`
+  // reads it back, so a cwd file whose name cannot survive that round trip is
+  // refused here rather than delivered later on a label nothing can parse.
+  const proven = sight.state === 'functional' && sightVerdict({ sight: sight.mode }).kind === 'proven';
   let warning;
   if (!proven) {
     const detail = sight.state === 'unavailable'
       ? `this codex has no "sandbox" subcommand (${sight.detail})`
       : sight.state === 'unprovable'
         ? `the read could not be posed as a proof: ${sight.detail}`
-        : `nothing in the job cwd could prove a sandboxed read, and the ${sight.mode} fallback ` +
-          'proves only that sandboxed execution works from there';
+        : sight.state === 'probe-error'
+          ? `the probe could not be run at all: ${sight.detail}`
+          : sight.state === 'functional' && sight.mode.startsWith(PROVEN_SIGHT_PREFIX)
+            ? `the read succeeded but "${sight.mode}" is not a label the delivery gate can read back ` +
+              'as a proof, so it will not be recorded as one'
+            : `nothing in the job cwd could prove a sandboxed read, and the ${sight.mode} fallback ` +
+              'proves only that sandboxed execution works from there';
     if (!record.allowUnprovenSight) {
       const msg =
         `supervisor: SIGHT NOT PROVEN (${sight.mode}) — refusing to dispatch.\n` +
@@ -1681,7 +2569,7 @@ function cmdSupervise(dir) {
   if (isCorrupt(now)) {
     abortSupervisor(dir, `job.json became unreadable before launch (${now.corruptReason})`);
   }
-  if (now.state !== 'running') {
+  if (canonicalState(now) !== 'running') {
     if (now.state === 'kill-pending') {
       // The cancel could not reach us then; it can be honoured now, by us.
       updateRecord(dir, {
@@ -1718,10 +2606,24 @@ function cmdSupervise(dir) {
     '--output-last-message', outPath(dir),
     '--color', 'never',
   ];
+  // THE SECOND REGISTRATION WINDOW, recorded before it opens. Between this line
+  // and the pid write below, codex exists and nothing has written down how to kill
+  // it — the same shape as the supervisor's own window, one level down, and left
+  // open when that one was closed. A cancel landing here used to kill the
+  // supervisor, verify the targets it knew about, mark the job `killed` and
+  // release the role, while codex ran on and billed. `launch: 'exec-spawning'` is
+  // what lets `killJob` refuse to call that a death.
+  const marked = updateRecord(dir, { launch: 'exec-spawning' }, {
+    expect: (r) => canonicalState(r) === 'running',
+  });
+  if (!marked) {
+    abortSupervisor(dir, 'the record stopped saying "running" (or could not be locked) as codex was about to be launched');
+  }
+
   // Detached on POSIX so codex leads its own process group: that group IS the
   // tree a kill has to reach, since there is no `taskkill /T` off Windows and the
   // sandbox helpers codex spawns are its children, not ours.
-  const child = spawnCodex(record.bin, args, {
+  const { child, viaShell } = spawnCodex(record.bin, args, {
     stdio: [promptFd, logFd, logFd],
     windowsHide: true,
     detached: !WIN,
@@ -1734,11 +2636,68 @@ function cmdSupervise(dir) {
     releaseRole(root, record.role, id);
     process.exit(1);
   });
-  updateRecord(dir, { codexPid: child.pid });
-  if (child.pid) fs.writeFileSync(path.join(dir, 'codex.pid'), String(child.pid));
+
+  // TEST HOOK: holds this supervisor inside the codex-exec window — the gap
+  // between codex existing and its pids being written down. A real one of those
+  // lasts milliseconds and cannot be aimed at on demand; what is under test is the
+  // runtime's DECISION, that nothing landing in it may record a death.
+  if (process.env.CODEX_DISPATCH_TEST_EXEC_PAUSE_MS) {
+    sleepSync(Number(process.env.CODEX_DISPATCH_TEST_EXEC_PAUSE_MS));
+  }
+
+  // WHAT WAS ACTUALLY SPAWNED. `child.pid` is codex only when codex was spawned
+  // directly. Through the Windows shell — which is the path the supported npm
+  // build takes, because `codex.cmd` is a batch file — it is cmd.exe, and codex is
+  // its child. Recording only that proxy is why a surviving codex could leave a
+  // job marked `killed` with its role released.
+  const workers = viaShell ? resolveWorkerPids(child.pid) : [];
+  const codexPids = [...new Set([child.pid, ...workers].filter(isPid))];
+  if (codexPids.length) fs.writeFileSync(path.join(dir, 'codex.pid'), codexPids.join('\n'));
+  updateRecord(dir, {
+    codexPid: isPid(child.pid) ? child.pid : null,
+    codexPids,
+    // POSIX: codex is detached, so it leads a group whose emptiness is part of a
+    // verified kill. On Windows the tree is taskkill's business.
+    codexPgid: !WIN && isPid(child.pid) ? child.pid : null,
+    launch: 'exec',
+  });
+  if (viaShell && !workers.length) {
+    fs.appendFileSync(runLogPath(dir),
+      'supervisor: WARNING - codex was launched through a shell wrapper and no worker process could ' +
+      'be resolved, so a kill can only verify the wrapper.\n');
+    updateRecord(dir, { warning: 'codex worker pid could not be resolved behind the shell wrapper' });
+  }
+
+  // THE OTHER HALF OF THE WINDOW. A cancel that arrived while codex was being
+  // spawned could not kill it and therefore recorded `kill-pending` rather than a
+  // death. It has a target now — us — so the honest thing is to land it here
+  // rather than let a "pending" cancel and a running codex coexist.
+  const afterExec = readRecord(dir);
+  if (!isCorrupt(afterExec) && canonicalState(afterExec) !== 'running') {
+    const killed = killPids(codexPids);
+    updateRecord(dir, killed.survivors.length
+      ? {
+        state: 'kill-failed',
+        reason: 'cancelled-during-exec',
+        killSurvivors: killed.survivors.join(', '),
+        finished: new Date().toISOString(),
+      }
+      : {
+        state: 'killed',
+        reason: 'cancelled-during-exec',
+        finished: new Date().toISOString(),
+      });
+    if (!killed.survivors.length) releaseRole(root, record.role, id);
+    abortSupervisor(dir,
+      `the record says "${clean(canonicalState(afterExec))}" — this job was cancelled while codex was ` +
+      `being launched, so codex has been killed ` +
+      (killed.survivors.length ? `and pids ${killed.survivors.join(', ')} SURVIVED` : 'and verified dead'),
+      { launched: true });
+  }
+
   child.on('exit', (code) => {
     const current = readRecord(dir);
-    if (!isCorrupt(current) && current.state === 'running') {
+    if (!isCorrupt(current) && canonicalState(current) === 'running') {
       // The signature scan is a WARNING now, not a verdict: sight was established
       // positively before the run, so a signature here means "something in the
       // sandbox complained", which is worth saying and not worth overruling a
@@ -1763,8 +2722,10 @@ function cmdSupervise(dir) {
 // A supervisor that must not launch says so in the two places a human will look —
 // the job's own run.log and the supervisor's stderr — and exits nonzero. The
 // record has already been set by the caller; this only reports and stops.
-function abortSupervisor(dir, why) {
-  const msg = `supervisor: ABORTING before codex was launched — ${why}.\nNothing was billed.`;
+function abortSupervisor(dir, why, { launched = false } = {}) {
+  const msg = launched
+    ? `supervisor: ABORTING — ${why}.`
+    : `supervisor: ABORTING before codex was launched — ${why}.\nNothing was billed.`;
   try { fs.appendFileSync(runLogPath(dir), msg + '\n'); } catch { /* best effort */ }
   process.stderr.write(msg + '\n');
   process.exit(1);
@@ -1782,6 +2743,12 @@ function printStatus(job) {
     console.log(`reason: corrupt job.json (${clean(r.corruptReason)})`);
     console.log(`out: ${outPath(job.dir)}`);
     return;
+  }
+  if (state === 'unknown') {
+    console.log(
+      `reason: the record's state ${JSON.stringify(clean(String(r.state)).slice(0, 40))} is not one this ` +
+      `release knows (${KNOWN_STATES.join(', ')}), so this job is treated as live and unvouched`
+    );
   }
   if (r.reason) console.log(`reason: ${clean(r.reason)}${r.blindSignature ? ` (${clean(r.blindSignature)})` : ''}`);
   if (r.killSurvivors && state === 'kill-failed') console.log(`survivors: ${clean(r.killSurvivors)}`);
@@ -1825,6 +2792,17 @@ function cmdResult(id) {
       `so anything it produced would have been sourceless.\n` +
       `probe: ${clean(job.record.sight) || 'sight precheck failed'}\n` +
       BLIND_EXPLANATION + '\n' +
+      `out: ${out}`
+    );
+  }
+  if (job.record.reason === 'sight-probe-error') {
+    fail(
+      `PROBE ERROR: job ${id} never ran — the sight probe could not be RUN, so nothing is known\n` +
+      `about this sandbox either way. This is a transport failure, NOT a finding that codex is blind.\n` +
+      `probe: ${clean(job.record.sight) || 'the probe could not be run'}\n` +
+      `Re-dispatch: a transport failure that does not repeat costs one retry. If it repeats, run the\n` +
+      `probe by hand (the recorded bin, "sandbox", a read, from the job's --cd), or accept it\n` +
+      `knowingly with --allow-unproven-sight.\n` +
       `out: ${out}`
     );
   }
@@ -1929,8 +2907,16 @@ function cmdCancel(id) {
       console.log(`out: ${outPath(job.dir)}`);
       return;
     }
-    const survivors = killPids(pids);
+    const reaped = killPids(pids);
+    const survivors = reaped.survivors;
     console.log(`killed recorded pids: ${pids.join(', ')} (job.json left untouched for inspection)`);
+    if (!reaped.enumerated) {
+      process.stderr.write(
+        `WARNING: job ${id} — the process table could not be read, so only the recorded pids were\n` +
+        `verified. A descendant of theirs could have survived unseen. Check by hand if this job may\n` +
+        `have had a codex under it.\n`
+      );
+    }
     if (survivors.length) {
       // Survivors keep their pid files: those numbers are demonstrably still
       // theirs, so a later cancel must be able to fire at them again.
@@ -1969,6 +2955,17 @@ function cmdCancel(id) {
     return;
   }
   const killed = killJob(job);
+  if (killed.unrecorded) {
+    console.log(`out: ${outPath(job.dir)}`);
+    process.stderr.write(
+      `KILL NOT RECORDED: job ${id} — its processes were killed and verified dead, but the record\n` +
+      `could not be updated (${clean(killed.why)}), so it still does not say so.\n` +
+      `The job therefore keeps blocking its role, which is the safe direction: nothing here will\n` +
+      `claim a death the record cannot confirm. Re-run this cancel — the pids are already spent, so\n` +
+      `it will not fire at anything again.\n`
+    );
+    process.exit(1);
+  }
   if (killed.pending) {
     // Nothing was killed, and that is exactly why this is not a success. The job
     // keeps its role and stays cancellable; the retry is the whole cure.
@@ -2004,7 +3001,10 @@ function cmdList() {
     const r = job.record;
     let tag = state;
     if (!isCorrupt(r)) {
-      if (r.reason) tag = `${state}(${clean(r.reason)})`;
+      // The raw state rides along, because "unknown" without it tells nobody what
+      // to go and look at.
+      if (state === 'unknown') tag = `unknown(${clean(String(r.state)).slice(0, 40)})`;
+      else if (r.reason) tag = `${state}(${clean(r.reason)})`;
       // A done job whose record does not vouch for the run is listed as such:
       // `result` is going to refuse it, and a listing that says plain `done`
       // would be the last place anyone learns that.
@@ -2166,8 +3166,27 @@ function cmdWatchInline(id) {
     console.log('This window is yours to close.');
   };
 
+  // A live state is not an end. `kill-pending`, `kill-failed`, `stale` and
+  // `unknown` are all states in which this runtime says processes may still be
+  // alive — and the watcher used to print `JOB ENDED` for every one of them and
+  // exit, which is the same defect as the old cheerful banner in the other
+  // direction: a claim made rather than a fact checked, in the one line meant to
+  // be believed from across the room. It keeps watching now, says what is
+  // happening, and ends only when the job really has. (Codex arm, round three.)
+  const live = (state) => LIVE_STATES.includes(state);
+  const notice = (state, r) => {
+    console.log('');
+    console.log(bar);
+    console.log(`  JOB NOT FINISHED - state: ${state}`);
+    console.log(bar);
+    console.log(`  ${watchLiveNote(state, r, id)}`);
+    console.log('  still watching - this state can still change, and nothing here will call it an end.');
+    console.log(bar);
+  };
+
   let pos = tailInitial(log);
   let corruptReads = 0;
+  let announced = null;
   const tick = () => {
     pos = tailMore(log, pos);
     const record = readRecord(job.dir);
@@ -2181,11 +3200,43 @@ function cmdWatchInline(id) {
       return;
     }
     if (state !== 'corrupt') corruptReads = 0;
-    if (state === 'running') { setTimeout(tick, 500); return; }
+    if (live(state)) {
+      if (state !== 'running' && state !== announced) { announced = state; notice(state, record); }
+      setTimeout(tick, 500);
+      return;
+    }
     pos = tailMore(log, pos);
     finish(state, record);
   };
   tick();
+}
+
+// What a live-but-not-running state means, for the window that keeps watching it.
+function watchLiveNote(state, r, id) {
+  switch (state) {
+    case 'kill-pending':
+      return (
+        'a cancel landed before this job had registered anything to kill, so nothing died and nothing ' +
+        `may assume it did - re-run: node "${SELF}" cancel ${id}`
+      );
+    case 'kill-failed':
+      return (
+        `pids ${clean((!isCorrupt(r) && r.killSurvivors) || '?')} SURVIVED the kill and may still be ` +
+        'billing - kill them yourself: taskkill /PID <pid> /T /F'
+      );
+    case 'stale':
+      return (
+        'the supervisor is gone and this job was never finalized; codex may have been reparented and ' +
+        `may still be running - reap it: node "${SELF}" cancel ${id}`
+      );
+    case 'unknown':
+      return (
+        `the record's state is not one this release knows (${clean((!isCorrupt(r) && r.state) || '?')}), ` +
+        'so nothing may be concluded about what it owns'
+      );
+    default:
+      return `node "${SELF}" status ${id}`;
+  }
 }
 
 // What to do next, per terminal state — because for every state but `done` the
@@ -2202,21 +3253,9 @@ function watchNextStep(state, r, id) {
     }
     case 'killed':
       return `this job was cancelled; result will REFUSE it. ${statusCmd}`;
-    case 'kill-pending':
-      return (
-        'a cancel landed before this job had registered anything to kill, so nothing died and ' +
-        `nothing may assume it did - re-run: node "${SELF}" cancel ${id}`
-      );
-    case 'kill-failed':
-      return (
-        `pids ${clean((!isCorrupt(r) && r.killSurvivors) || '?')} SURVIVED the kill and may still be ` +
-        `billing - kill them yourself: taskkill /PID <pid> /T /F`
-      );
-    case 'stale':
-      return (
-        'the supervisor died without finalizing, so nothing vouched for how this ended; ' +
-        `result will REFUSE it. Reap any survivors: node "${SELF}" cancel ${id}`
-      );
+    // kill-pending, kill-failed, stale and unknown never reach here: they are live
+    // states, and the watcher keeps watching them rather than declaring an end.
+    // See watchLiveNote for what it says about each instead.
     case 'corrupt':
       return (
         'job.json stayed unreadable across re-reads; result will REFUSE it. The bytes, if any, ' +

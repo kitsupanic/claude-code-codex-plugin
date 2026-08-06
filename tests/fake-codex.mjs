@@ -67,7 +67,14 @@ if (args[0] === 'sandbox') {
     );
     process.exit(1);
   }
-  const r = spawnSync(cmd[0], cmd.slice(1), { encoding: 'utf8' });
+  // stdin is NUL and the window is hidden, for the same reason the runtime's own
+  // probe spawn does both: spawnSync's default stdio hands the child a pipe whose
+  // write end is closed immediately, and `cmd /c type` inheriting that can fail
+  // the launch with ERROR_NO_DATA (0x800700E8) — which surfaced as a console error
+  // box during a probe against a perfectly healthy binary.
+  const r = spawnSync(cmd[0], cmd.slice(1), {
+    encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+  });
   if (r.stdout) process.stdout.write(r.stdout);
   if (r.stderr) process.stderr.write(r.stderr);
   process.exit(r.status === null ? 1 : r.status);
@@ -79,7 +86,9 @@ if (!out) { process.stderr.write('fake-codex: no --output-last-message\n'); proc
 const jobDir = path.dirname(out);
 const sleepMs = Number(process.env.FAKE_CODEX_SLEEP_MS || 300);
 
-const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)'], { stdio: 'ignore' });
+const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)'], {
+  stdio: 'ignore', windowsHide: true,
+});
 fs.writeFileSync(path.join(jobDir, 'child.pid'), String(child.pid));
 
 const brief = fs.readFileSync(0);

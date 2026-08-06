@@ -43,6 +43,11 @@ Runtime: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" <verb>`
      anything is spent, also refused. This is NOT a defect to route around; it
      names its cure (usually `npm install -g @openai/codex`, or a `--cd` pointed at
      the directory the model actually has to read). Fix it and re-dispatch.
+   - **Never asked** — the probe process would not launch, or produced nothing to
+     judge, after a bounded retry: `failed / sight-probe-error`. This is a transport
+     failure, **not** a finding that codex is blind, and it must not be relayed as
+     one. Re-dispatch first; a transport failure that does not repeat costs one
+     retry.
    - **Unprovable, accepted** — `--allow-unproven-sight` on the dispatch. Only then
      does an unprovable job run; the record carries
      `sight: unproven (accepted by caller)`, and `result` delivers the bytes with
@@ -56,9 +61,11 @@ Runtime: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" <verb>`
    arrive carrying `UNPROVEN SIGHT` or a `warning:`, relay the answer AND the
    caveat — both, every time.
 6. **A record has to vouch for its run before its bytes go out.** `result` prints
-   only when the record carries this release's schema stamp, a zero exit, and either
-   proven sight or the recorded `--allow-unproven-sight` opt-in. A job dispatched by
-   an older release (0.1–0.3) is **`unvouched`** — `status` says
+   only when the record carries this release's schema stamp, a zero exit, a state
+   this release knows, and either proven sight or the recorded
+   `--allow-unproven-sight` opt-in. Proof is *validated*, not pattern-matched: a
+   `sight` that merely starts with `cwd-file:` is corruption, not evidence. A job
+   dispatched by an older release (0.1–0.4) is **`unvouched`** — `status` says
    `deliverable: NO - unvouched: …`, `list` tags it `done(unvouched)`, and `result`
    refuses it naming why and pointing at the `out:` path. That is not a bug to route
    around: re-dispatch under this release, or tell the user the bytes are there and
@@ -77,9 +84,11 @@ Runtime: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" <verb>`
   `--allow-unproven-sight` is invariant 5's opt-in; it is never a default and never
   a way around a refusal you have not read.
 - `status [<job-id>]` — state (running / done / failed / killed / kill-pending /
-  kill-failed / stale / corrupt), a `reason:` line when there is one, `sight:`,
-  `deliverable:`, `warning:` and `survivors:` lines when they apply, runtime, log
-  size, `out:` path.
+  kill-failed / stale / corrupt / **unknown**), a `reason:` line when there is one,
+  `sight:`, `deliverable:`, `warning:` and `survivors:` lines when they apply,
+  runtime, log size, `out:` path. `unknown` means the record's state is not one this
+  release writes: treat it as live and unvouched — it blocks its role, it is
+  cancellable, and it never delivers.
 - `result <job-id>` — the answer, verbatim, stdout only. **The record decides**:
   it prints only when the record says `done` *and* vouches for the run (stamp, zero
   exit, proven sight or the recorded opt-in). Every other case exits nonzero naming

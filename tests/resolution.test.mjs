@@ -14,24 +14,37 @@ import {
   ACCEPTED_SIGHT,
   BLIND_SIGNATURES,
   JOB_ID_RE,
+  JOB_REASONS,
+  KNOWN_LAUNCH_PHASES,
+  KNOWN_STATES,
   LIVE_STATES,
+  PID_MAX,
   PROVEN_SIGHT_PREFIX,
   RECORD_VERSION,
   ROLE_RE,
   binCandidates,
+  canonicalState,
   deliverability,
+  descendantsOf,
   inRegistrationWindow,
   isDesktopApp,
   isInsideRoot,
+  isInsideRootReal,
+  isPid,
+  isProbeFileName,
   jobDirFor,
   killPlan,
+  killWindow,
+  launchPhase,
   livenessFromError,
   parseArgs,
   parseClaimOwner,
   pickProbeTarget,
   pickProbeToken,
+  roleOfJob,
   scanBlindLog,
   scanBlindText,
+  sightVerdict,
   stripControlBytes,
   validateRecord,
   verifyClaim,
@@ -232,12 +245,227 @@ test('--allow-unproven-sight parses as a flag, not as a value-taking option', ()
 });
 
 test('the states that may still own processes are the ones that block a role', () => {
-  assert.deepEqual(LIVE_STATES, ['running', 'kill-pending', 'stale', 'kill-failed']);
+  assert.deepEqual(LIVE_STATES, ['running', 'kill-pending', 'stale', 'kill-failed', 'unknown']);
   for (const terminal of ['done', 'failed', 'killed']) {
     assert.equal(LIVE_STATES.includes(terminal), false, `${terminal} must not block its role`);
   }
   assert.ok(LIVE_STATES.includes('kill-pending'),
     'a cancel that killed nothing leaves a job that may still own processes');
+  assert.ok(LIVE_STATES.includes('unknown'),
+    'a state this release cannot reason about is a job it cannot call finished');
+});
+
+// ---------------------------------------------------------------------------
+// The validator: one gate, version-aware, fail-closed.
+// ---------------------------------------------------------------------------
+
+test('an unrecognised state resolves to unknown, which is live — never to itself', () => {
+  // It used to pass through: `state !== 'running'` returned it verbatim, so a
+  // typo'd "runnng" or a future "cancelling" was neither running nor a member of
+  // LIVE_STATES. The job lost its role claim while codex ran.
+  for (const state of KNOWN_STATES) {
+    assert.equal(canonicalState({ state }), state, `${state} is a state this release writes`);
+  }
+  for (const state of ['runnng', 'cancelling', 'Done', 'done ', '', 'RUNNING', 'stale', 'corrupt']) {
+    assert.equal(canonicalState({ state }), 'unknown',
+      `${JSON.stringify(state)} must not be taken at face value`);
+  }
+  assert.equal(canonicalState({ __corrupt: true }), 'corrupt');
+  assert.equal(canonicalState(null), 'corrupt');
+  // `stale` and `corrupt` are DERIVED readings, never written — a record claiming
+  // one of them is claiming something only this runtime may conclude.
+  assert.equal(KNOWN_STATES.includes('stale'), false);
+  assert.equal(KNOWN_STATES.includes('corrupt'), false);
+});
+
+test('an unrecognised launch phase resolves to the most dangerous one', () => {
+  for (const phase of KNOWN_LAUNCH_PHASES) {
+    assert.equal(launchPhase({ launch: phase }), phase);
+  }
+  assert.equal(launchPhase({}), 'legacy', 'absent means the record predates the field');
+  for (const phase of ['spawnin', 'launching', 'EXEC', '']) {
+    assert.equal(launchPhase({ launch: phase }), 'exec-spawning',
+      `${JSON.stringify(phase)} must resolve to the phase in which codex may be alive and unrecorded`);
+  }
+  assert.equal(launchPhase({ __corrupt: true }), 'exec-spawning');
+});
+
+test('there are two kill windows, and the codex one is not time-boxed', () => {
+  const now = Date.parse('2026-08-06T00:00:10.000Z');
+  const started = '2026-08-06T00:00:00.000Z';
+  const old = '2026-08-06T00:00:00.000Z';
+  assert.equal(killWindow({ state: 'running', started, launch: 'spawning' }, now), 'supervisor');
+  assert.equal(killWindow({ state: 'running', started, launch: 'spawning', supervisorPid: 42 }, now), 'none');
+  assert.equal(killWindow({ state: 'running', started, launch: 'pending' }, now), 'none');
+  assert.equal(killWindow({ state: 'running', started, launch: 'spawning' }, now + 60000), 'none',
+    'a supervisor that never registered provably never arrived');
+
+  // The codex window: the supervisor IS registered, and codex has been spawned
+  // without being recorded. Waiting does not resolve that — only the supervisor
+  // leaving the phase does — so it is not time-boxed.
+  assert.equal(killWindow({ state: 'running', started: old, launch: 'exec-spawning', supervisorPid: 42 },
+    now + 3600000), 'exec');
+  assert.equal(killWindow({ state: 'running', started: old, launch: 'exec', supervisorPid: 42 }, now), 'none');
+  // A record with no supervisor pid cannot show the supervisor is gone, so the
+  // window holds — fail-closed, as everywhere else.
+  assert.equal(killWindow({ state: 'running', started: old, launch: 'exec-spawning' }, now,
+    { supervisorDead: true }), 'exec');
+  // But a supervisor that IS recorded and provably dead can never land the cancel,
+  // so the window closes rather than wedging the job at kill-pending for ever.
+  assert.equal(killWindow({ state: 'running', started: old, launch: 'exec-spawning', supervisorPid: 42 }, now,
+    { supervisorDead: true }), 'none');
+  assert.equal(inRegistrationWindow({ state: 'running', started: old, launch: 'exec-spawning' }, now + 1e9),
+    true, 'and it still reads as a registration window');
+});
+
+test('a pid is a positive integer in a domain an OS could have issued', () => {
+  for (const good of [1, 4, 4242, 999999999, PID_MAX]) assert.equal(isPid(good), true, `${good}`);
+  for (const bad of [0, -1, -4242, 1.5, NaN, Infinity, PID_MAX + 1, '4242', null, undefined, {}]) {
+    assert.equal(isPid(bad), false, `${JSON.stringify(bad)} is not a pid`);
+  }
+  // The consequence, which is the reason for the domain: killPlan(-1) off Windows
+  // used to expand to kill(-1) — every process this account may signal.
+  assert.match(killPlan(-1, false).refuse, /not a pid/);
+  assert.equal(killPlan(-1, false).signals, undefined, 'no signals, at all');
+  assert.match(killPlan(0, true).refuse, /not a pid/);
+  assert.equal(killPlan(0, true).tool, undefined);
+  assert.match(killPlan(1.5, false).refuse, /not a pid/);
+});
+
+test('a record whose pid fields leave the pid domain is corrupt', () => {
+  const base = { state: 'running', started: '2026-08-06T00:00:00.000Z' };
+  assert.equal(validateRecord({ ...base, supervisorPid: 4242, codexPid: 4243 }), null);
+  assert.equal(validateRecord({ ...base, supervisorPid: null, codexPid: null }), null);
+  assert.match(validateRecord({ ...base, supervisorPid: -1 }), /field "supervisorPid" is not a pid/);
+  assert.match(validateRecord({ ...base, supervisorPid: 0 }), /field "supervisorPid" is not a pid/);
+  assert.match(validateRecord({ ...base, codexPid: 1.5 }), /field "codexPid" is not a pid/);
+  assert.match(validateRecord({ ...base, codexPgid: -99 }), /field "codexPgid" is not a pid/);
+  assert.equal(validateRecord({ ...base, codexPids: [10, 11] }), null);
+  assert.match(validateRecord({ ...base, codexPids: [10, -11] }), /field "codexPids" holds something that is not a pid/);
+  assert.match(validateRecord({ ...base, reapedPids: [0] }), /field "reapedPids" holds something that is not a pid/);
+  // Counters may be zero; they may not be negative or fractional.
+  assert.equal(validateRecord({ ...base, recordVersion: 0, generation: 0 }), null);
+  assert.match(validateRecord({ ...base, generation: -1 }), /field "generation" is not a non-negative integer/);
+  assert.match(validateRecord({ ...base, recordVersion: 1.5 }), /field "recordVersion" is not a non-negative integer/);
+  // exitCode is the one number that is legitimately negative (-1 = never ran).
+  assert.equal(validateRecord({ ...base, exitCode: -1 }), null);
+  assert.match(validateRecord({ ...base, exitCode: 0.5 }), /field "exitCode" is not an integer/);
+});
+
+test('a sight is a proof or it is not — a prefix is never one', () => {
+  assert.equal(isProbeFileName('LICENSE'), true);
+  assert.equal(isProbeFileName('a file with spaces.txt'), true);
+  for (const bad of ['', '   ', '.', '..', 'a/b', 'a\\b', 'a:b', ' lead', 'trail ', 'x'.repeat(256)]) {
+    assert.equal(isProbeFileName(bad), false, `${JSON.stringify(bad)} is not a probe file name`);
+  }
+
+  assert.equal(sightVerdict({ sight: 'cwd-file:LICENSE' }).kind, 'proven');
+  assert.equal(sightVerdict({ sight: 'cwd-file:LICENSE' }).file, 'LICENSE');
+  assert.equal(sightVerdict({ sight: ACCEPTED_SIGHT }).kind, 'accepted');
+  assert.equal(sightVerdict({ sight: 'job-nonce' }).kind, 'unproven');
+  assert.equal(sightVerdict({ sight: 'unproven' }).kind, 'unproven');
+  assert.equal(sightVerdict({}).kind, 'unproven');
+  // The shapes that used to satisfy `startsWith(PROVEN_SIGHT_PREFIX)`.
+  for (const forged of [
+    'cwd-file:',
+    'cwd-file:   ',
+    'cwd-file:../../etc/passwd',
+    "cwd-file:a.txt FAILED: the file's bytes never came back",
+  ]) {
+    assert.equal(sightVerdict({ sight: forged }).kind, 'malformed',
+      `${JSON.stringify(forged)} claims the prefix and is not a proof`);
+    assert.match(validateRecord({ state: 'done', started: 'x', sight: forged }),
+      /field "sight" claims the proof prefix/,
+      'and a record carrying it is corrupt, not merely undeliverable');
+  }
+});
+
+test('deliverability reads the state through the validator too', () => {
+  const done = {
+    state: 'done', started: '2026-08-06T00:00:00.000Z', exitCode: 0,
+    recordVersion: RECORD_VERSION, sight: `${PROVEN_SIGHT_PREFIX}LICENSE`,
+  };
+  assert.equal(deliverability(done).ok, true);
+  for (const state of ['running', 'failed', 'killed', 'kill-pending', 'kill-failed']) {
+    assert.equal(deliverability({ ...done, state }).ok, false, `${state} must not deliver`);
+  }
+  const weird = deliverability({ ...done, state: 'cancelling' });
+  assert.equal(weird.ok, false, 'and an unknown state least of all');
+  assert.match(weird.reason, /not one this release knows/);
+  assert.equal(deliverability({ ...done, sight: 'cwd-file:' }).ok, false, 'a prefix is not a proof');
+  assert.match(deliverability({ ...done, sight: 'cwd-file:' }).reason, /prefix is not a proof/);
+});
+
+test('a job belongs to the role its DIRECTORY names, so a corrupt record still has one', () => {
+  // The record's `role` is unreadable exactly when it matters most. The directory
+  // name is the id, and the id has already been proved to match the whitelist.
+  assert.equal(roleOfJob({ id: 'review-1786022862-31668', record: {} }), 'review');
+  assert.equal(roleOfJob({ id: 'review-1-2', record: { __corrupt: true } }), 'review',
+    'a corrupt record must still be attributable to its role');
+  assert.equal(roleOfJob({ id: 'not-an-id', record: { role: 'review' } }), 'review');
+  assert.equal(roleOfJob({ id: 'not-an-id', record: { __corrupt: true } }), null);
+});
+
+test('the process tree is walked from a table, without following a cycle', () => {
+  // Windows keeps a dead parent's pid on its orphans, and pids get reused, so a
+  // reported parentage can loop. It must terminate, and it must not claim a root
+  // as its own descendant.
+  const table = new Map([[100, 1], [200, 100], [300, 200], [400, 1], [500, 500]]);
+  assert.deepEqual(descendantsOf([100], table).sort(), [200, 300]);
+  assert.deepEqual(descendantsOf([200], table), [300]);
+  assert.deepEqual(descendantsOf([400], table), []);
+  assert.deepEqual(descendantsOf([100, 200], table), [300], 'a targeted pid is not its own descendant');
+  assert.deepEqual(descendantsOf([500], table), [], 'a self-parented pid must not spin');
+  assert.equal(descendantsOf([100], null), null, 'an unreadable table is null, never an empty tree');
+  const loop = new Map([[10, 11], [11, 10]]);
+  assert.deepEqual(descendantsOf([10], loop), [11]);
+  assert.deepEqual(descendantsOf([99], loop), []);
+});
+
+test('containment is proved against the real path, not just a lexical one', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-real-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-outside-'));
+  try {
+    const inside = path.join(root, 'review-1-2');
+    fs.mkdirSync(inside);
+    assert.equal(isInsideRootReal(root, inside), true);
+    assert.equal(isInsideRootReal(root, path.join(root, 'not-created-yet')), true,
+      'a path about to be created is judged on its deepest existing ancestor');
+    assert.equal(isInsideRootReal(root, outside), false);
+
+    const link = path.join(root, 'review-9-9');
+    let linked = false;
+    try { fs.symlinkSync(outside, link, 'junction'); linked = true; } catch { /* not available */ }
+    if (linked) {
+      assert.equal(isInsideRoot(root, link), true,
+        'lexically it is inside — which is exactly why lexical containment is not containment');
+      assert.equal(isInsideRootReal(root, link), false, 'and really it is not');
+      assert.equal(jobDirFor(root, 'review-9-9'), null, 'so it never becomes a job directory');
+      assert.equal(isInsideRootReal(root, path.join(link, 'child.pid')), false,
+        'nor does anything under it');
+    }
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
+
+test('every reason the runtime writes is declared, and documented in commands/list.md', () => {
+  // `cmdList` prints `state(reason)` for ANY reason, so the emittable set is a
+  // contract with the operator. Generated from the source of truth rather than
+  // remembered: a new reason that is not declared, or not documented, fails here.
+  const source = fs.readFileSync(new URL('../scripts/codex-dispatch.mjs', import.meta.url), 'utf8');
+  const written = new Set();
+  for (const m of source.matchAll(/\breason:\s*'([a-z][a-z0-9-]*)'/g)) written.add(m[1]);
+  assert.ok(written.size >= 8, `expected the runtime to write several reasons, found ${written.size}`);
+  for (const reason of written) {
+    assert.ok(JOB_REASONS.includes(reason),
+      `the runtime writes reason "${reason}" but JOB_REASONS does not declare it`);
+  }
+  const doc = fs.readFileSync(new URL('../commands/list.md', import.meta.url), 'utf8');
+  for (const reason of JOB_REASONS) {
+    assert.ok(doc.includes(reason), `commands/list.md does not document the reason "${reason}"`);
+  }
 });
 
 test('deliverability needs the stamp, a clean exit, and proof or a recorded opt-in', () => {
