@@ -30,7 +30,10 @@ function frontmatter(file) {
 }
 
 test('marketplace names this plugin and points at the repo root', () => {
-  assert.equal(marketplace.name, 'codex-dispatch');
+  // The catalog is named for its owner, not for the one plugin it holds today:
+  // the install string is `<plugin>@<marketplace>` = `codex-dispatch@kitsupanic`.
+  assert.equal(marketplace.name, 'kitsupanic');
+  assert.notEqual(marketplace.name, plugin.name);
   assert.equal(entry.name, plugin.name);
   // Root layout: the plugin IS the repo, so source is './' and plugin.json
   // must sit under .claude-plugin/ at that same root.

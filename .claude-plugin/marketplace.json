@@ -1,13 +1,13 @@
 {
   "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
-  "name": "codex-dispatch",
-  "description": "Codex dispatch runtime plugin for long-running background second opinions.",
+  "name": "kitsupanic",
+  "description": "kitsupanic's Claude Code plugins.",
   "owner": {
     "name": "kitsupanic",
     "url": "https://github.com/kitsupanic"
   },
   "metadata": {
-    "description": "Codex dispatch runtime plugin for long-running background second opinions.",
+    "description": "kitsupanic's Claude Code plugins.",
     "version": "0.1.0"
   },
   "plugins": [

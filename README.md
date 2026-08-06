@@ -130,27 +130,30 @@ in what you hand to `marketplace add`.
 
 ```
 /plugin marketplace add kitsupanic/claude-code-codex-plugin
-/plugin install codex-dispatch@codex-dispatch
+/plugin install codex-dispatch@kitsupanic
 ```
 
 **From a local clone:**
 
 ```
 /plugin marketplace add C:\path\to\claude-code-codex-plugin
-/plugin install codex-dispatch@codex-dispatch
+/plugin install codex-dispatch@kitsupanic
 ```
 
-`marketplace add` takes the repo (a GitHub `owner/repo` slug or a local path);
-the marketplace then registers under the `name` in its manifest, which is
-`codex-dispatch` regardless of what the repo is called. So the install string is
-`codex-dispatch@codex-dispatch` — `<plugin>@<marketplace>`, both named
-`codex-dispatch` here, which is normal for a single-plugin repo.
+Three names, three jobs, and they are deliberately different:
+
+- **`claude-code-codex-plugin`** is the repo — a GitHub `owner/repo` slug or a
+  local path. That is what `marketplace add` takes, and the only place it is used.
+- **`kitsupanic`** is the marketplace — the `name` in `marketplace.json`. It is
+  the catalog, not a plugin: it happens to hold one today and can hold more later.
+- **`codex-dispatch`** is the plugin. So the install string is
+  `codex-dispatch@kitsupanic` — `<plugin>@<marketplace>`.
 
 Commands appear as `/codex-dispatch:dispatch`, `:status`, `:result`, `:cancel`,
 `:list`. There are **no hooks** — this plugin never inserts itself into a
 session's lifecycle.
 
-Update after a push with `/plugin marketplace update codex-dispatch`.
+Update after a push with `/plugin marketplace update kitsupanic`.
 
 **As a bare runtime (no plugin system needed):**
 
