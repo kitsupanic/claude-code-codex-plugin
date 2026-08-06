@@ -1,0 +1,10 @@
+{
+  "name": "codex-dispatch",
+  "version": "0.1.0",
+  "description": "Long-running, background, verbatim-transport dispatches to the OpenAI Codex CLI.",
+  "author": {
+    "name": "kitsupanic",
+    "url": "https://github.com/kitsupanic"
+  },
+  "homepage": "https://github.com/kitsupanic/claude-code-codex-plugin"
+}

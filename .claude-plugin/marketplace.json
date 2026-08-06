@@ -1,0 +1,27 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "codex-dispatch",
+  "description": "Codex dispatch runtime plugin for long-running background second opinions.",
+  "owner": {
+    "name": "kitsupanic",
+    "url": "https://github.com/kitsupanic"
+  },
+  "metadata": {
+    "description": "Codex dispatch runtime plugin for long-running background second opinions.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "codex-dispatch",
+      "description": "Long-running, background, verbatim-transport dispatches to the OpenAI Codex CLI.",
+      "version": "0.1.0",
+      "author": {
+        "name": "kitsupanic",
+        "url": "https://github.com/kitsupanic"
+      },
+      "category": "development",
+      "homepage": "https://github.com/kitsupanic/claude-code-codex-plugin",
+      "source": "./"
+    }
+  ]
+}
