@@ -30,24 +30,43 @@ Runtime: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" <verb>`
    Review/architecture/design dispatches stay read-only, always.
 4. **Verbatim answer out.** `result` prints the model's answer byte-for-byte.
    Never summarize, truncate, filter, re-rank, or reformat it — deliver it whole.
-5. **No blind answers.** A codex whose sandbox cannot run commands sees no files
-   and answers anyway, exiting 0. Preflight proves the sandbox works before
-   dispatching and the runtime flags such a run `failed / sandbox-blind`
-   afterwards. Never work around that flag by reading the out file yourself: a
-   sourceless second opinion is worse than none.
+5. **No blind answers — sight is PROVEN, per job, before the run.** A codex whose
+   sandbox cannot run commands sees no files and answers anyway, exiting 0. So
+   before each job's codex is launched, the supervisor reads a file inside that
+   job's own `--cd` through codex's sandbox and requires the bytes back. No proof,
+   no job: it fails as `failed / sandbox-blind-precheck` before anything is spent,
+   and `result` refuses it. A finished job records how sight was established
+   (`sight: cwd-file:<name>`, the strong form; `job-nonce`, weaker; `unproven` on a
+   codex with no `sandbox` subcommand). Never work around a blind verdict by
+   reading the out file yourself: a sourceless second opinion is worse than none.
+   A `warning:` on a delivered job (sandbox signatures in the log, or unproven
+   sight) is not a blind verdict — relay the answer, and relay the warning with it.
 
 ## Verbs
 
-- `dispatch --brief <file> [--role <stem>] [--cd <dir>] [--model <m>] [--effort <e>] [--write] [--force]`
+- `dispatch --brief <file> [--role <stem>] [--cd <dir>] [--model <m>] [--effort <e>] [--write] [--force] [--watch]`
   — returns immediately with `job: <id>`, `bin: <codex binary>` and `out: <path>`.
-  Refuses if a job with the same role is still running; `--force` kills that
-  job's tree first. `--role` must be lowercase letters only (`^[a-z]+$`).
-- `status [<job-id>]` — state (running / done / failed / killed / stale /
-  corrupt), a `reason:` line when there is one, runtime, log size, `out:` path.
-- `result <job-id>` — the answer, verbatim, stdout only. Exits nonzero with the
-  `out:` path if not done, and refuses a job flagged `sandbox-blind`.
-- `cancel <job-id>` — taskkills the whole job tree, marks it killed.
+  Refuses if a job with the same role may still have live processes (running,
+  stale, or kill-failed); `--force` kills that job's tree first **and verifies it
+  died** — if anything survived, the new job is refused rather than launched
+  beside it. `--role` must be lowercase letters only (`^[a-z]+$`), and the role is
+  claimed atomically, so of two dispatches racing for one role exactly one wins.
+- `status [<job-id>]` — state (running / done / failed / killed / kill-failed /
+  stale / corrupt), a `reason:` line when there is one, `sight:`, `warning:` and
+  `survivors:` lines when they apply, runtime, log size, `out:` path.
+- `result <job-id>` — the answer, verbatim, stdout only. **The record decides**:
+  it prints only when the record says `done`. Every other state exits nonzero
+  naming the state and the `out:` path — including a job whose answer file exists
+  but whose run was never vouched for. An existing `out.txt` is bytes, not a
+  verdict.
+- `cancel <job-id>` — kills the whole job tree and checks it died. Survivors mean
+  `kill-failed` (not `killed`), a nonzero exit, and the role stays blocked. On a
+  job whose `job.json` is corrupt it reaps the pid files instead, preserves the
+  record as evidence, and renames the spent pid files so a second cancel replays
+  nothing — that second cancel reports `already reaped` and changes nothing.
 - `list` — all jobs, newest first, one line each.
+- `watch <job-id>` — opens a console window that follows the job and shouts when
+  it finishes. **For humans only** (see below).
 - `preflight` — checks codex is installed, authenticated, and that its sandbox
   can actually read a file; names which binary it chose.
 
@@ -55,10 +74,14 @@ Runtime: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" <verb>`
 
 Every dispatch/status output prints the literal absolute output-file path on its
 own line as `out: <path>`. If a wake-up or notification is missed, that path is
-the delivery channel: the file exists if and only if the run finished. Poll its
-existence; read it directly if the runtime is somehow unavailable. Always
-propagate the `out:` line when reporting job state to the user or to another
-agent.
+the last-resort delivery channel: read it directly if the runtime is somehow
+unavailable. Always propagate the `out:` line when reporting job state to the user
+or to another agent.
+
+**Poll `result` (or `status`), not the file.** The out file appears the moment
+codex writes it — before the exit code is recorded and before the sight verdict —
+so its existence is not completion and never was a verdict. `result` exits nonzero
+until the record says done, which is exactly the signal to wait on.
 
 ## Rules of engagement
 
@@ -70,5 +93,11 @@ agent.
   installed, or installed only as the desktop app, whose build cannot sandbox)
   or `codex login` (not authenticated — interactive browser OAuth, the human's
   to run; never script around it).
-- A job that comes back `failed / sandbox-blind` was not a bad answer, it was no
-  answer. Re-dispatch it once the preflight passes; do not relay it.
+- **Watching is for humans; agents never watch.** `watch` exists for the operator
+  who has been burned by dropped notifications. An agent gains nothing from a
+  console window it cannot see and must never block on one — poll `result`, which
+  exits nonzero until the record says done.
+- A job that comes back `failed / sandbox-blind-precheck` was not a bad answer, it
+  was no answer — codex never ran, and nothing was billed. Fix the install
+  (`preflight` names how) and re-dispatch; do not relay it, and do not read the
+  out file in its place (there is none).

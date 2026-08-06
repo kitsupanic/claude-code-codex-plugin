@@ -13,11 +13,14 @@ import path from 'node:path';
 import {
   BLIND_SIGNATURES,
   JOB_ID_RE,
+  LIVE_STATES,
   ROLE_RE,
   binCandidates,
   isDesktopApp,
+  pickProbeTarget,
   scanBlindLog,
   scanBlindText,
+  validateRecord,
 } from '../scripts/codex-dispatch.mjs';
 
 const NPM = path.join('C:\\Users\\me\\AppData\\Roaming', 'npm', 'codex.cmd');
@@ -110,6 +113,47 @@ test('a signature on the very last line, with no trailing newline, is found', ()
     assert.equal(scanBlindLog(file), 'helper copy failed');
   } finally {
     fs.unlinkSync(file);
+  }
+});
+
+test('the sight probe reads the cwd and never writes to it', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-probe-'));
+  try {
+    assert.equal(pickProbeTarget(dir), null, 'an empty directory has nothing to read');
+    fs.mkdirSync(path.join(dir, 'sub'));
+    assert.equal(pickProbeTarget(dir), null, 'a directory is not a file');
+
+    // Sorted, so the order below is the order examined: the %-name is skipped
+    // (cmd.exe would expand it), the binary yields no ASCII token, the text file
+    // wins — and nothing new appears in the directory.
+    fs.writeFileSync(path.join(dir, 'a%pct.txt'), 'percent names are skipped\n');
+    fs.writeFileSync(path.join(dir, 'a.bin'), Buffer.from([0, 1, 2, 3, 4, 5]));
+    fs.writeFileSync(path.join(dir, 'b.txt'), '\n  \nhello from b\nmore\n');
+    const picked = pickProbeTarget(dir);
+    assert.equal(picked.name, 'b.txt');
+    assert.equal(picked.token, 'hello from b', 'the token is a short ASCII line to verify the read by');
+    assert.deepEqual(fs.readdirSync(dir).sort(), ['a%pct.txt', 'a.bin', 'b.txt', 'sub'],
+      'a job cwd is somebody\'s repo: the probe must leave nothing in it');
+
+    fs.writeFileSync(path.join(dir, 'b.txt'), '');
+    assert.equal(pickProbeTarget(dir), null, 'an empty file proves nothing, so it is not a target');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('the record fields the new states carry are type-checked like the rest', () => {
+  const base = { state: 'done', started: '2026-08-06T00:00:00.000Z' };
+  assert.equal(validateRecord({ ...base, warning: 'w', sight: 'cwd-file:x', killSurvivors: '1, 2' }), null);
+  assert.match(validateRecord({ ...base, warning: 5 }), /field "warning" is not a string \(number\)/);
+  assert.match(validateRecord({ ...base, sight: {} }), /field "sight" is not a string \(object\)/);
+  assert.match(validateRecord({ ...base, killSurvivors: [1, 2] }), /field "killSurvivors" is not a string \(array\)/);
+});
+
+test('the states that may still own processes are the ones that block a role', () => {
+  assert.deepEqual(LIVE_STATES, ['running', 'stale', 'kill-failed']);
+  for (const terminal of ['done', 'failed', 'killed']) {
+    assert.equal(LIVE_STATES.includes(terminal), false, `${terminal} must not block its role`);
   }
 });
 

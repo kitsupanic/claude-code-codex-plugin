@@ -1,18 +1,53 @@
-// Fake codex CLI for tests: mimics `codex exec -` far enough to exercise the
-// dispatch lifecycle. Reads the brief from stdin, spawns a long-lived child
-// (so tree-kill can be asserted), sleeps, then writes the out file.
+// Fake codex CLI for tests: mimics `codex exec -` and `codex sandbox <cmd>` far
+// enough to exercise the dispatch lifecycle. `exec` reads the brief from stdin,
+// spawns a long-lived child (so tree-kill can be asserted), sleeps, then writes
+// the out file. `sandbox` really runs the command it is handed, so the sight
+// precheck is exercised end to end rather than stubbed.
 //
-// Env knobs: FAKE_CODEX_SLEEP_MS (default 300), FAKE_CODEX_OUT (out file content),
-// FAKE_CODEX_BLIND (emit the Windows-sandbox failure signatures on stderr, still
-// write an out file, still exit 0 — the silent blind success seen in production),
-// FAKE_CODEX_ECHO (print the same strings on stdout, as a job reading this repo's
-// source does — that must NOT count as blind).
+// Env knobs:
+//   FAKE_CODEX_SLEEP_MS   (default 300)
+//   FAKE_CODEX_OUT        out file content
+//   FAKE_CODEX_BLIND      emit the Windows-sandbox failure signatures on stderr
+//                         during exec, still write an out file, still exit 0 —
+//                         the silent blind success seen in production. The
+//                         sandbox probe still passes, so this now exercises the
+//                         DEMOTED scan: a warning, not a verdict.
+//   FAKE_CODEX_ECHO       print the same strings the way a sighted job reading
+//                         this repo's source does — must not even warn
+//   FAKE_CODEX_SANDBOX_BROKEN       `codex sandbox` fails with an error string no
+//                         signature matches: only a positive proof catches it
+//   FAKE_CODEX_SANDBOX_UNAVAILABLE  a codex too old to have the subcommand
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 
 const args = process.argv.slice(2);
+
+// ------------------------------------------------------------ codex sandbox
+if (args[0] === 'sandbox') {
+  const cmd = args.slice(1);
+  if (process.env.FAKE_CODEX_SANDBOX_UNAVAILABLE) {
+    process.stderr.write("error: unrecognized subcommand 'sandbox'\n\nUsage: codex [OPTIONS] [PROMPT]\n");
+    process.exit(2);
+  }
+  if (process.env.FAKE_CODEX_SANDBOX_BROKEN) {
+    // Deliberately a failure shape NO entry in BLIND_SIGNATURES matches. The
+    // whole point of a positive proof is that it does not need to have met the
+    // failure before.
+    process.stderr.write(
+      '2026-08-06T21:02:11.001122Z ERROR codex_core::exec: exec error: sandbox: ' +
+      'jail_bootstrap_unavailable: could not enter the isolation namespace (0x8007000d)\n'
+    );
+    process.exit(1);
+  }
+  const r = spawnSync(cmd[0], cmd.slice(1), { encoding: 'utf8' });
+  if (r.stdout) process.stdout.write(r.stdout);
+  if (r.stderr) process.stderr.write(r.stderr);
+  process.exit(r.status === null ? 1 : r.status);
+}
+
+// ---------------------------------------------------------------- codex exec
 const out = args[args.indexOf('--output-last-message') + 1];
 if (!out) { process.stderr.write('fake-codex: no --output-last-message\n'); process.exit(2); }
 const jobDir = path.dirname(out);

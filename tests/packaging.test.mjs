@@ -51,7 +51,8 @@ test('version is identical in all three places that carry it', () => {
 test('every command file carries the frontmatter the loader and UI read', () => {
   const dir = path.join(ROOT, 'commands');
   const files = fs.readdirSync(dir).filter((f) => f.endsWith('.md'));
-  assert.deepEqual(files.sort(), ['cancel.md', 'dispatch.md', 'list.md', 'result.md', 'status.md']);
+  assert.deepEqual(files.sort(),
+    ['cancel.md', 'dispatch.md', 'list.md', 'result.md', 'status.md', 'watch.md']);
   for (const f of files) {
     const { fields, body } = frontmatter(path.join(dir, f));
     assert.ok(fields.description, `${f}: description is required`);

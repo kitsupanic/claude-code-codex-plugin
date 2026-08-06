@@ -31,7 +31,7 @@ function pidAlive(pid) {
   try { process.kill(pid, 0); return true; } catch { return false; }
 }
 
-async function poll(fn, ms = 10000, every = 100) {
+async function poll(fn, ms = 15000, every = 100) {
   const deadline = Date.now() + ms;
   while (Date.now() < deadline) {
     if (fn()) return true;
@@ -46,7 +46,19 @@ function writeBrief(name, content) {
   return p;
 }
 
-const record = (id) => JSON.parse(fs.readFileSync(path.join(JOBS, id, 'job.json'), 'utf8'));
+// job.json is rewritten by rename while these polls read it; on Windows a reader
+// can transiently lose that race, which is a flaky test, not a defect.
+function record(id) {
+  const p = path.join(JOBS, id, 'job.json');
+  for (let attempt = 0; ; attempt++) {
+    try { return JSON.parse(fs.readFileSync(p, 'utf8')); } catch (err) {
+      if (attempt >= 20) throw err;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
+    }
+  }
+}
+
+const done = (id) => record(id).state === 'done';
 
 test('dispatch returns immediately, job dir is complete, result is verbatim', async () => {
   const briefContent = 'brief with CRLF\r\nand unicode é中\nno trailing newline';
@@ -66,11 +78,13 @@ test('dispatch returns immediately, job dir is complete, result is verbatim', as
   );
   assert.ok(fs.existsSync(path.join(dir, 'job.json')));
 
-  assert.ok(await poll(() => fs.existsSync(path.join(dir, 'out.txt'))), 'job should finish');
+  assert.ok(await poll(() => done(id)), 'job should finish and the RECORD should say so');
+  assert.ok(fs.existsSync(path.join(dir, 'out.txt')), 'and the answer file should be there');
   assert.ok(fs.existsSync(path.join(dir, 'run.log')), 'run.log should exist');
 
   const st = run(['status', id]);
   assert.match(st.stdout, /^state: done$/m);
+  assert.match(st.stdout, /^sight: (cwd-file:|job-nonce)/m, 'sight must be proven and recorded, per job');
   assert.match(st.stdout, /^out: /m, 'status must contain the out: line');
 
   const res = run(['result', id]);
@@ -103,9 +117,7 @@ test('the shipped defaults are the budget pair, and explicit flags override them
   assert.equal(overridden.model, 'gpt-5.6-sol', 'frontier is two flags away');
   assert.equal(overridden.effort, 'xhigh');
 
-  for (const id of [jobIdFrom(d.stdout), jobIdFrom(o.stdout)]) {
-    await poll(() => fs.existsSync(path.join(JOBS, id, 'out.txt')));
-  }
+  for (const id of [jobIdFrom(d.stdout), jobIdFrom(o.stdout)]) await poll(() => done(id));
 });
 
 test('rapid successive dispatches get unique job dirs', async () => {
@@ -117,7 +129,7 @@ test('rapid successive dispatches get unique job dirs', async () => {
     return jobIdFrom(r.stdout);
   });
   assert.equal(new Set(ids).size, 3, 'all job dirs distinct');
-  for (const id of ids) await poll(() => fs.existsSync(path.join(JOBS, id, 'out.txt')));
+  for (const id of ids) await poll(() => done(id));
 });
 
 test('same-role double dispatch refuses; --force kills the old tree first', async () => {
@@ -144,6 +156,33 @@ test('same-role double dispatch refuses; --force kills the old tree first', asyn
   assert.ok(await poll(() => !pidAlive(old.codexPid)), 'old codex must be dead');
 
   run(['cancel', forcedId]);
+});
+
+test('concurrent same-role dispatches: exactly one wins the claim', async () => {
+  // The scan-then-create guard could be beaten by two dispatches reading the same
+  // empty world; the role is claimed with mkdir, where exactly one racer wins.
+  const brief = writeBrief('briefrace.md', 'slow');
+  const env = { ...baseEnv, FAKE_CODEX_SLEEP_MS: '60000' };
+  const launch = () => new Promise((resolve) => {
+    const child = spawn(process.execPath, [RUNTIME, 'dispatch', '--brief', brief, '--role', 'race'], { env });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
+  });
+
+  const results = await Promise.all([launch(), launch()]);
+  const winners = results.filter((r) => r.code === 0);
+  const losers = results.filter((r) => r.code !== 0);
+  assert.equal(winners.length, 1, `exactly one dispatch may win the role: ${JSON.stringify(results)}`);
+  assert.equal(losers.length, 1);
+  assert.match(losers[0].stderr, /race/, 'the loser must say which role it lost');
+  assert.equal(losers[0].stdout.includes('job: '), false, 'the loser must not hand out a job handle');
+
+  const dirs = fs.readdirSync(JOBS).filter((n) => n.startsWith('race-'));
+  assert.equal(dirs.length, 1, 'and must leave no job dir behind');
+
+  run(['cancel', jobIdFrom(winners[0].stdout)]);
 });
 
 test('a stale same-role job blocks dispatch and is named as stale', async () => {
@@ -194,6 +233,53 @@ test('--force reaps a codex orphaned by a dead supervisor', async () => {
   run(['cancel', jobIdFrom(forced.stdout)]);
 });
 
+test('a kill that does not take is kill-failed, not killed, and blocks --force', async () => {
+  // The survivor is simulated: CODEX_DISPATCH_TEST_NOKILL makes killTree a no-op,
+  // standing in for a taskkill that returns success and changes nothing (access
+  // denied, an elevated child, a process wedged in a driver). The approximation
+  // is deliberate — what is under test is what the runtime does once the pids are
+  // still alive afterwards, not the mechanism by which they survived.
+  const brief = writeBrief('briefnokill.md', 'slow');
+  const env = { FAKE_CODEX_SLEEP_MS: '60000' };
+  const r = run(['dispatch', '--brief', brief, '--role', 'nokill'], env);
+  assert.equal(r.status, 0, r.stderr);
+  const id = jobIdFrom(r.stdout);
+  assert.ok(await poll(() => record(id).codexPid), 'fake codex should start');
+  const { supervisorPid, codexPid } = record(id);
+
+  const c = run(['cancel', id], { CODEX_DISPATCH_TEST_NOKILL: '1' });
+  assert.notEqual(c.status, 0, 'a kill that did not take must exit nonzero');
+  assert.match(c.stderr, /KILL FAILED/, 'and say so loudly');
+  assert.ok(c.stderr.includes(String(supervisorPid)), 'naming the survivors');
+
+  const rec = record(id);
+  assert.equal(rec.state, 'kill-failed', 'the state is kill-failed, NOT killed');
+  assert.ok(rec.killSurvivors.includes(String(codexPid)), 'survivors are recorded');
+  assert.ok(pidAlive(supervisorPid), 'and the survivor really is still alive');
+
+  const st = run(['status', id]);
+  assert.match(st.stdout, /^state: kill-failed$/m);
+  assert.match(st.stdout, /^survivors: /m);
+
+  const stillRefused = run(['dispatch', '--brief', brief, '--role', 'nokill'], env);
+  assert.notEqual(stillRefused.status, 0, 'a kill-failed job keeps blocking its role');
+  assert.match(stillRefused.stderr, /already kill-failed/);
+
+  const forcedFail = run(['dispatch', '--brief', brief, '--role', 'nokill', '--force'],
+    { ...env, CODEX_DISPATCH_TEST_NOKILL: '1' });
+  assert.notEqual(forcedFail.status, 0, '--force must refuse to launch alongside a survivor');
+  assert.match(forcedFail.stderr, /REFUSING to launch/);
+  assert.match(forcedFail.stderr, /^survivors: /m);
+  assert.equal(forcedFail.stdout.includes('job: '), false, 'and hand out no new job');
+
+  // With kills working again, --force reaps it and proceeds.
+  const forcedOk = run(['dispatch', '--brief', brief, '--role', 'nokill', '--force'], env);
+  assert.equal(forcedOk.status, 0, forcedOk.stderr);
+  assert.equal(record(id).state, 'killed', 'the verified kill finally lands');
+  assert.ok(await poll(() => !pidAlive(supervisorPid)), 'and the survivor is gone');
+  run(['cancel', jobIdFrom(forcedOk.stdout)]);
+});
+
 test('result before done exits nonzero and prints the out: line', async () => {
   const brief = writeBrief('brief4.md', 'slow');
   const r = run(['dispatch', '--brief', brief, '--role', 'notready'], { FAKE_CODEX_SLEEP_MS: '60000' });
@@ -204,6 +290,47 @@ test('result before done exits nonzero and prints the out: line', async () => {
   assert.match(res.stderr, /^out: .+out\.txt$/m);
   assert.match(res.stderr, /running/);
   run(['cancel', id]);
+});
+
+test('the record is authoritative: an answer file is not a verdict', async () => {
+  // Revoked here: out.txt existence used to promote a job to done. It appears the
+  // instant codex writes it — before the exit code is recorded and before any
+  // sight verdict — so the promotion published answers nothing had vouched for.
+  const failed = path.join(JOBS, 'refused-1-99994');
+  fs.mkdirSync(failed, { recursive: true });
+  fs.writeFileSync(path.join(failed, 'job.json'), JSON.stringify({
+    id: 'refused-1-99994', role: 'refused', state: 'failed',
+    started: new Date().toISOString(), finished: new Date().toISOString(),
+    exitCode: 1, supervisorPid: null, codexPid: null,
+  }));
+  fs.writeFileSync(path.join(failed, 'out.txt'), 'a confident answer nobody vouched for\n');
+
+  const res = run(['result', 'refused-1-99994']);
+  assert.notEqual(res.status, 0, 'a failed job must refuse even with an answer file on disk');
+  assert.equal(res.stdout, '', 'the unvouched-for answer must never reach stdout');
+  assert.match(res.stderr, /NOT DELIVERED/);
+  assert.match(res.stderr, /is failed/, 'the refusal names the state');
+  assert.match(res.stderr, /An answer file DOES exist/, 'and admits the file is there');
+  assert.match(res.stderr, /^out: .+out\.txt$/m);
+
+  // The same rule for a job whose supervisor died after codex wrote the answer:
+  // stale, not done.
+  const orphaned = path.join(JOBS, 'unfinalized-1-99992');
+  fs.mkdirSync(orphaned, { recursive: true });
+  fs.writeFileSync(path.join(orphaned, 'job.json'), JSON.stringify({
+    id: 'unfinalized-1-99992', role: 'unfinalized', state: 'running',
+    started: new Date(Date.now() - 3600000).toISOString(),
+    supervisorPid: 999999997, codexPid: null,
+  }));
+  fs.writeFileSync(path.join(orphaned, 'out.txt'), 'finished but never finalized\n');
+
+  const st = run(['status', 'unfinalized-1-99992']);
+  assert.match(st.stdout, /^state: stale$/m, 'an out file no longer promotes a job to done');
+  const res2 = run(['result', 'unfinalized-1-99992']);
+  assert.notEqual(res2.status, 0);
+  assert.equal(res2.stdout, '');
+  assert.match(res2.stderr, /is stale/);
+  assert.match(run(['list']).stdout, /^unfinalized-1-99992  stale  out: /m);
 });
 
 test('cancel kills the whole tree (supervisor, codex, and its child)', async () => {
@@ -227,38 +354,85 @@ test('cancel kills the whole tree (supervisor, codex, and its child)', async () 
   assert.match(st.stdout, /^state: killed$/m);
 });
 
-test('a sandbox-blind job is failed even though codex exited 0, and result refuses it', async () => {
+test('a sandbox failure with an UNRECOGNIZED error is caught before codex spends anything', async () => {
+  // The keystone. The fake's sandbox failure matches no entry in BLIND_SIGNATURES
+  // on purpose: a positive proof does not need to have met the failure before,
+  // which is exactly what the old post-hoc signature scan could not say.
+  const brief = writeBrief('briefprecheck.md', 'review something');
+  const r = run(['dispatch', '--brief', brief, '--role', 'precheck'], { FAKE_CODEX_SANDBOX_BROKEN: '1' });
+  assert.equal(r.status, 0, r.stderr);
+  const id = jobIdFrom(r.stdout);
+  assert.ok(await poll(() => record(id).state !== 'running'), 'the supervisor must finalize');
+
+  const rec = record(id);
+  assert.equal(rec.state, 'failed');
+  assert.equal(rec.reason, 'sandbox-blind-precheck');
+  assert.match(rec.sight, /FAILED/, 'the failed proof is recorded');
+  assert.match(rec.sight, /jail_bootstrap_unavailable/, 'quoting the novel error verbatim');
+  for (const sig of ['orchestrator_helper_launch_failed', 'helper=codex-windows-sandbox-setup.exe',
+    'CreateProcessWithLogonW failed', 'helper copy failed']) {
+    assert.equal(rec.sight.includes(sig), false, 'no known signature is present — only the proof caught it');
+  }
+  assert.equal(rec.exitCode, null, 'codex exec never ran');
+  assert.equal(fs.existsSync(path.join(JOBS, id, 'out.txt')), false, 'so there is no answer, and nothing was spent');
+  assert.equal(
+    fs.readFileSync(path.join(JOBS, id, 'run.log'), 'utf8').includes('brief bytes'),
+    false,
+    'and the brief never reached a model'
+  );
+
+  const st = run(['status', id]);
+  assert.match(st.stdout, /^state: failed$/m);
+  assert.match(st.stdout, /^reason: sandbox-blind-precheck$/m);
+
+  const res = run(['result', id]);
+  assert.notEqual(res.status, 0, 'result on a precheck-failed job must exit nonzero');
+  assert.equal(res.stdout, '', 'nothing may reach stdout');
+  assert.match(res.stderr, /BLIND/);
+  assert.match(res.stderr, /npm install -g @openai\/codex/, 'with the fix');
+  assert.match(res.stderr, /^out: /m);
+  assert.match(run(['list']).stdout, new RegExp(`^${id}  failed\\(sandbox-blind-precheck\\)`, 'm'));
+
+  // A failed precheck is terminal, so it must hand the role back.
+  const again = run(['dispatch', '--brief', brief, '--role', 'precheck']);
+  assert.equal(again.status, 0, `a failed precheck must release its role claim: ${again.stderr}`);
+  await poll(() => done(jobIdFrom(again.stdout)));
+});
+
+test('sandbox signatures in the log are a warning now, not a verdict', async () => {
+  // Demoted: sight is established positively before the run, so a signature in
+  // run.log afterwards is something to say out loud, not something that overrules
+  // a proof. (New error shapes false-negative this scan; recovered failures
+  // false-positive it. Neither can flip a job any more.)
   const brief = writeBrief('brief8.md', 'review something');
   const r = run(['dispatch', '--brief', brief, '--role', 'blind'], { FAKE_CODEX_BLIND: '1' });
   assert.equal(r.status, 0, r.stderr);
   const id = jobIdFrom(r.stdout);
-
   assert.ok(await poll(() => record(id).state !== 'running'), 'job should finalize');
+
   const rec = record(id);
   assert.equal(rec.exitCode, 0, 'the blind failure is invisible to the exit code — that is the point');
-  assert.ok(
-    fs.existsSync(path.join(JOBS, id, 'out.txt')),
-    'and it still wrote a confident answer file'
-  );
-  assert.equal(rec.state, 'failed', 'run.log signatures must override the exit code');
-  assert.equal(rec.reason, 'sandbox-blind');
+  assert.equal(rec.state, 'done', 'the proven precheck decides the state, not the scan');
+  assert.match(rec.warning, /sandbox-failure signatures in log/);
   assert.match(rec.blindSignature, /orchestrator_helper_launch_failed|CreateProcessWithLogonW/);
+  assert.match(rec.sight, /^(cwd-file:|job-nonce)/, 'and sight was proven for this job, in its cwd');
 
   const st = run(['status', id]);
-  assert.match(st.stdout, /^state: failed$/m);
-  assert.match(st.stdout, /^reason: sandbox-blind/m);
+  assert.match(st.stdout, /^state: done$/m);
+  assert.match(st.stdout, /^warning: sandbox-failure signatures in log/m);
 
   const res = run(['result', id]);
-  assert.notEqual(res.status, 0, 'result on a blind job must exit nonzero');
-  assert.equal(res.stdout, '', 'the sourceless answer must never reach stdout');
-  assert.match(res.stderr, /BLIND/, 'and the reason must be named');
-  assert.match(res.stderr, /npm install -g @openai\/codex/, 'with the fix');
-  assert.match(res.stderr, /^out: /m);
-
-  assert.match(run(['list']).stdout, new RegExp(`^${id}  failed\\(sandbox-blind\\)`, 'm'));
+  assert.equal(res.status, 0, 'a warning does not withhold the answer');
+  assert.match(res.stderr, /WARNING/, 'but it is shouted on stderr');
+  assert.deepEqual(
+    Buffer.from(res.stdout),
+    fs.readFileSync(path.join(JOBS, id, 'out.txt')),
+    'and stdout stays byte-verbatim'
+  );
+  assert.match(run(['list']).stdout, new RegExp(`^${id}  done  out: .+warning: sandbox-failure`, 'm'));
 });
 
-test('a job that merely reads source containing the signatures is not called blind', async () => {
+test('a job that merely reads source containing the signatures is not even warned about', async () => {
   // Found live: the first true end-to-end review echoed this runtime's own source
   // — signature string literals and all — and a merged-log scan failed the one
   // job that had actually worked.
@@ -269,13 +443,31 @@ test('a job that merely reads source containing the signatures is not called bli
   assert.ok(await poll(() => record(id).state !== 'running'), 'job should finalize');
 
   const rec = record(id);
-  assert.equal(rec.state, 'done', 'signatures on stdout are content, not diagnosis');
+  assert.equal(rec.state, 'done', 'signatures as content are content, not diagnosis');
   assert.equal(rec.reason, undefined);
+  assert.equal(rec.warning, undefined, 'and not even a warning');
   assert.ok(
     fs.readFileSync(path.join(JOBS, id, 'run.log'), 'utf8').includes('orchestrator_helper_launch_failed'),
     'the run log really does contain the signature'
   );
   assert.equal(run(['result', id]).status, 0, 'and the answer is delivered');
+});
+
+test('a codex with no sandbox subcommand runs, warned, rather than being refused', async () => {
+  // An unprovable sandbox is not the same claim as a broken one: failing every
+  // job on a CLI too old to have the subcommand would be inventing a defect.
+  const brief = writeBrief('briefnosub.md', 'quick');
+  const r = run(['dispatch', '--brief', brief, '--role', 'nosub'], { FAKE_CODEX_SANDBOX_UNAVAILABLE: '1' });
+  assert.equal(r.status, 0, r.stderr);
+  const id = jobIdFrom(r.stdout);
+  assert.ok(await poll(() => done(id)), 'the job still runs');
+  const rec = record(id);
+  assert.equal(rec.sight, 'unproven');
+  assert.match(rec.warning, /sight not proven/);
+  assert.match(run(['status', id]).stdout, /^warning: sight not proven/m);
+  const res = run(['result', id]);
+  assert.equal(res.status, 0, 'the answer is delivered');
+  assert.match(res.stderr, /WARNING/, 'with the caveat on stderr');
 });
 
 test('a corrupt job.json is contained: other verbs keep working and name it', async () => {
@@ -302,10 +494,10 @@ test('a corrupt job.json is contained: other verbs keep working and name it', as
   const brief = writeBrief('brief9.md', 'quick');
   const d = run(['dispatch', '--brief', brief, '--role', 'aftercorrupt']);
   assert.equal(d.status, 0, `dispatch must not be bricked by a corrupt job: ${d.stderr}`);
-  await poll(() => fs.existsSync(path.join(JOBS, jobIdFrom(d.stdout), 'out.txt')));
+  await poll(() => done(jobIdFrom(d.stdout)));
 });
 
-test('cancel on a corrupt job still reaps its recorded pids and preserves job.json', async () => {
+test('cancel on a corrupt job reaps its pids, preserves job.json, and consumes the pid files', async () => {
   const dir = path.join(JOBS, 'corruptkill-1-99996');
   fs.mkdirSync(dir, { recursive: true });
   const raw = 'not json at all';
@@ -320,11 +512,46 @@ test('cancel on a corrupt job still reaps its recorded pids and preserves job.js
   assert.equal(c.status, 0, c.stderr);
   assert.match(c.stdout, /corrupt job\.json/);
   assert.match(c.stdout, new RegExp(`killed recorded pids: ${victim.pid}`));
+  assert.match(c.stdout, /consumed pid files: child\.pid\.reaped-/);
   assert.ok(await poll(() => !pidAlive(victim.pid)), 'the recorded pid must be killed');
   assert.equal(
     fs.readFileSync(path.join(dir, 'job.json'), 'utf8'), raw,
     'the corrupt record is evidence — cancel must not overwrite it'
   );
+  assert.equal(fs.existsSync(path.join(dir, 'child.pid')), false, 'the spent pid file is gone');
+});
+
+test('a second cancel on a corrupt job replays nothing and touches nothing', async () => {
+  // Pid numbers are reused. A cancel that could be replayed is a cancel that can
+  // kill an innocent process that inherited the number, so consumed pid files are
+  // renamed out of the way and a second cancel has nothing to fire.
+  const dir = path.join(JOBS, 'doublecancel-1-99993');
+  fs.mkdirSync(dir, { recursive: true });
+  const raw = '{"state":"running", TRUNCATED';
+  fs.writeFileSync(path.join(dir, 'job.json'), raw);
+  const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)'], {
+    stdio: 'ignore', detached: true,
+  });
+  victim.unref();
+  fs.writeFileSync(path.join(dir, 'child.pid'), String(victim.pid));
+
+  const first = run(['cancel', 'doublecancel-1-99993']);
+  assert.equal(first.status, 0, first.stderr);
+  assert.match(first.stdout, new RegExp(`killed recorded pids: ${victim.pid}`));
+  assert.ok(await poll(() => !pidAlive(victim.pid)));
+
+  const snapshot = () => fs.readdirSync(dir).sort().map((n) => {
+    const p = path.join(dir, n);
+    return `${n}:${fs.statSync(p).size}:${fs.readFileSync(p, 'utf8')}`;
+  });
+  const before = snapshot();
+  assert.ok(before.some((e) => e.startsWith('child.pid.reaped-')), 'the pid file was renamed, not deleted');
+
+  const second = run(['cancel', 'doublecancel-1-99993']);
+  assert.equal(second.status, 0, second.stderr);
+  assert.match(second.stdout, /already reaped: child\.pid\.reaped-/);
+  assert.equal(second.stdout.includes('killed recorded pids'), false, 'nothing may be killed twice');
+  assert.deepEqual(snapshot(), before, 'and the job dir must be byte-for-byte as it was');
 });
 
 test('a wrong-typed field is contained like any other corruption', async () => {
@@ -354,13 +581,31 @@ test('a wrong-typed field is contained like any other corruption', async () => {
   const brief = writeBrief('brief12.md', 'quick');
   const d = run(['dispatch', '--brief', brief, '--role', 'badtype']);
   assert.equal(d.status, 0, `a wrong-typed record must not block dispatch: ${d.stderr}`);
-  await poll(() => fs.existsSync(path.join(JOBS, jobIdFrom(d.stdout), 'out.txt')));
+  await poll(() => done(jobIdFrom(d.stdout)));
+});
+
+test('the watcher prints a loud finished banner and exits', async () => {
+  // `_watch` is the body of the detached console window; running it inline is how
+  // it gets asserted without opening one.
+  const brief = writeBrief('briefwatch.md', 'quick');
+  const r = run(['dispatch', '--brief', brief, '--role', 'watched']);
+  assert.equal(r.status, 0, r.stderr);
+  const id = jobIdFrom(r.stdout);
+  assert.ok(await poll(() => done(id)), 'job should finish');
+
+  const w = run(['_watch', id]);
+  assert.equal(w.status, 0, w.stderr);
+  assert.match(w.stdout, /JOB FINISHED - result is ready/, 'the banner, not a silent tail');
+  assert.match(w.stdout, new RegExp(`job:\\s+${id}`));
+  assert.match(w.stdout, /state:\s+done/);
+  assert.match(w.stdout, /out:\s+.+out\.txt/);
+  assert.match(w.stdout, /collect: node .+ result /, 'and how to collect it');
 });
 
 test('job ids outside the whitelist are refused before any path use', () => {
   const bad = ['../../etc/passwd', '..\\..\\windows\\system32', 'Review-1-2', 'foo-1', 'foo/1-2'];
   for (const id of bad) {
-    for (const verb of ['status', 'result', 'cancel']) {
+    for (const verb of ['status', 'result', 'cancel', 'watch']) {
       const r = run([verb, id]);
       assert.notEqual(r.status, 0, `${verb} ${id} must be refused`);
       assert.match(r.stderr, /invalid job id/, `${verb} ${id} must say why`);
