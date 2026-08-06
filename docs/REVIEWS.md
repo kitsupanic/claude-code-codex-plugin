@@ -26,7 +26,7 @@ frontier reviews of 0.3.0 and 0.4.0, whose findings became 0.4.0 and 0.5.0.
   the opposite, which contradicted the record-authority rule two sections down;
   caught by the 0.3.0 dual review.)
 - `codex` missing from PATH in shells started before install. → Preflight resolves
-  `%APPDATA%\npm\codex.cmd` itself (see README → "Which codex binary").
+  `%APPDATA%\npm\codex.cmd` itself (see [DESIGN.md → "Which codex binary"](DESIGN.md#which-codex-binary--and-proving-it-can-see)).
 - Auth lapses silently. → Preflight runs `codex --version` and
   `codex login status` and names the exact fix for each failure.
 - **A review dispatch came back as a real-looking answer that had read nothing.**

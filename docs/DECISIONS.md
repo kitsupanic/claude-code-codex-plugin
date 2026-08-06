@@ -119,7 +119,7 @@ Things the brief left open, decided here:
   not a platform-specific conclusion.
 - **Blind detection matches line shape, not substrings.** The signatures alone
   appear in this repo's own source, in the model's prose when it is blind, and in
-  this README — the first end-to-end run was failed by its own success. Requiring
+  this repo's docs — the first end-to-end run was failed by its own success. Requiring
   codex's tracing prefix (`<rfc3339>Z ERROR codex_core::…:`) is what separates a
   diagnostic from a quotation. A job that reviews a file containing real codex
   error logs can still fool it; now that this is a warning rather than a verdict,
@@ -233,7 +233,7 @@ Things the brief left open, decided here:
   banner is the reason: it is the one line here meant to be believed from across
   the room, and an escape sequence in a `sight:` field could redraw it.
 - **The sight token is content from inside the file, matched on stdout.** See
-  "Proving sight" in the README for the rules. The principle behind them: a proof must require
+  [DESIGN.md → "Proving sight, per job"](DESIGN.md#proving-sight-per-job) for the rules. The principle behind them: a proof must require
   something the prover could not have been *handed*. The first line of a file, and
   its name, are both things a tool that never opened it can produce — so neither can
   be the evidence.
