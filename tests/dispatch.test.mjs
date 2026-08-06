@@ -886,8 +886,12 @@ test('a transiently corrupt record does not end the watch; a persistent one does
   const id = 'bannerflap-1-99985';
   const dir = path.join(JOBS, id);
   fs.mkdirSync(dir, { recursive: true });
+  // Stamped and sighted: the banner promises a ready result only for a record
+  // that vouches for its run, so a fixture that wants the cheerful headline has
+  // to carry what a real 0.4.0 record carries.
   const good = JSON.stringify({
-    id, role: 'bannerflap', state: 'done', started: new Date().toISOString(), exitCode: 0,
+    recordVersion: 1, id, role: 'bannerflap', state: 'done', sight: 'cwd-file:LICENSE',
+    started: new Date().toISOString(), exitCode: 0,
   });
   fs.writeFileSync(path.join(dir, 'job.json'), '{"state": TRUNCATED MID-REPLACE');
   // Repaired while the watcher is re-reading, the way an atomic rename repairs it.
@@ -922,7 +926,8 @@ test('terminal control bytes in the log never reach the console', () => {
   const dir = path.join(JOBS, id);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
-    id, role: 'bannerctl', state: 'done', started: new Date().toISOString(), exitCode: 0,
+    recordVersion: 1, id, role: 'bannerctl', state: 'done', sight: 'cwd-file:LICENSE',
+    started: new Date().toISOString(), exitCode: 0,
   }));
   fs.writeFileSync(path.join(dir, 'run.log'),
     '\x1b]0;PWNED WINDOW TITLE\x07visible-one\n\x1b[2J\x1b[1;1Hvisible-two\n\x00\x08nul-and-bs\n');
@@ -976,6 +981,378 @@ test('roles that could not produce a whitelisted id are refused at dispatch', ()
     assert.notEqual(r.status, 0, `--role ${role} must be refused`);
     assert.match(r.stderr, /invalid --role/);
   }
+});
+
+// ---------------------------------------------------------------------------
+// The deliverability gate: what a record has to SAY before its bytes go out.
+// ---------------------------------------------------------------------------
+
+test('the deliverability matrix: only a stamped record with proof or a recorded opt-in delivers', () => {
+  // The hole this pins: `result` used to gate on state === 'done' alone, so a
+  // record written by 0.1/0.2 — no `sight` at all, or the old `unproven` label —
+  // delivered silently on upgrade, and the `unproven` one collected a caveat
+  // claiming the caller had opted in, which nobody had.
+  const ANSWER = 'the answer bytes\n';
+  const fixture = (id, record) => {
+    const dir = path.join(JOBS, id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+      id, role: id.split('-')[0], state: 'done', exitCode: 0,
+      started: new Date().toISOString(), finished: new Date().toISOString(), ...record,
+    }));
+    fs.writeFileSync(path.join(dir, 'out.txt'), ANSWER);
+    return id;
+  };
+
+  const cases = [
+    // [id, record, delivers?, what the refusal must name]
+    ['legacynosight-1-99971', {}, false, /no current schema stamp/],
+    ['legacyunproven-1-99972', { sight: 'unproven' }, false, /no current schema stamp/],
+    ['legacynonce-1-99973', { sight: 'job-nonce' }, false, /no current schema stamp/],
+    ['stampednosight-1-99974', { recordVersion: 1 }, false, /sight is not recorded/],
+    ['stampednonce-1-99975', { recordVersion: 1, sight: 'job-nonce' }, false, /not proof/],
+    ['stampedproven-1-99976', { recordVersion: 1, sight: 'cwd-file:LICENSE' }, true, null],
+    ['stampedoptin-1-99977',
+      { recordVersion: 1, sight: 'unproven (accepted by caller)', allowUnprovenSight: true }, true, null],
+    // The forged one: the label without the boolean the dispatch would have written.
+    ['forgedoptin-1-99978',
+      { recordVersion: 1, sight: 'unproven (accepted by caller)' }, false, /no recorded opt-in/],
+    ['badexit-1-99979', { recordVersion: 1, sight: 'cwd-file:LICENSE', exitCode: 3 }, false, /exitCode is 3/],
+  ];
+
+  for (const [id, record, delivers, names] of cases) {
+    fixture(id, record);
+    const res = run(['result', id]);
+    if (delivers) {
+      assert.equal(res.status, 0, `${id} must deliver: ${res.stderr}`);
+      assert.equal(res.stdout, ANSWER, `${id} must deliver the bytes verbatim`);
+      continue;
+    }
+    assert.notEqual(res.status, 0, `${id} must be refused`);
+    assert.equal(res.stdout, '', `${id}: an unvouched-for answer must produce ZERO stdout`);
+    assert.match(res.stderr, /UNVOUCHED/, `${id}: the refusal names the class`);
+    assert.match(res.stderr, names, `${id}: the refusal names the specific reason`);
+    assert.match(res.stderr, /^out: .+out\.txt$/m, `${id}: and still points at the bytes`);
+    assert.equal(/It is being delivered only because/.test(res.stderr), false,
+      `${id}: a refusal must never claim a caller consented`);
+  }
+
+  // The opt-in that IS recorded still shouts, and only that one.
+  const optedIn = run(['result', 'stampedoptin-1-99977']);
+  assert.match(optedIn.stderr, /UNPROVEN SIGHT/);
+  assert.match(optedIn.stderr, /recorded --allow-unproven-sight/);
+  assert.equal(run(['result', 'stampedproven-1-99976']).stderr.includes('UNPROVEN SIGHT'), false,
+    'a proven job says nothing about unproven sight');
+
+  // status and list say `unvouched` rather than a bare, misleading `done`.
+  const st = run(['status', 'legacynosight-1-99971']);
+  assert.match(st.stdout, /^state: done$/m, 'the state is still reported honestly');
+  assert.match(st.stdout, /^deliverable: NO - unvouched: /m, 'and so is what it buys');
+  assert.match(run(['status', 'stampedproven-1-99976']).stdout, /^deliverable: yes \(sight proven/m);
+  const list = run(['list']).stdout;
+  assert.match(list, /^legacynosight-1-99971  done\(unvouched\)  out: /m);
+  assert.match(list, /^stampedproven-1-99976  done  out: /m);
+});
+
+test('--allow-unproven-sight does NOT rescue a sandbox that was DISPROVEN', async () => {
+  // Ordering is the property: the opt-in is for sight that could not be proven
+  // EITHER WAY, never for a sandbox that was shown to be broken. Hoisting the
+  // allowUnprovenSight check above the `broken` branch would deliver a
+  // demonstrably blind answer, so the check order is pinned here.
+  const brief = writeBrief('briefbrokenoptin.md', 'quick');
+  for (const [role, env] of [
+    ['brokenoptin', { FAKE_CODEX_SANDBOX_BROKEN: '1' }],
+    ['echooptin', { FAKE_CODEX_SANDBOX_ARGV_ECHO: '1' }],
+  ]) {
+    const r = run(['dispatch', '--brief', brief, '--role', role, '--allow-unproven-sight'], env);
+    assert.equal(r.status, 0, r.stderr);
+    const id = jobIdFrom(r.stdout);
+    assert.ok(await poll(() => record(id).state !== 'running'), `${role}: the supervisor must finalize`);
+
+    const rec = record(id);
+    assert.equal(rec.state, 'failed', `${role}: a disproven sandbox is refused even with the opt-in`);
+    assert.equal(rec.reason, 'sandbox-blind-precheck', `${role}: and refused as blind, not as unproven`);
+    assert.equal(rec.allowUnprovenSight, true, `${role}: the opt-in really was passed`);
+    assert.equal(rec.exitCode, null, `${role}: codex never ran`);
+    assert.equal(fs.existsSync(path.join(JOBS, id, 'out.txt')), false, `${role}: nothing to be tempted by`);
+
+    const res = run(['result', id]);
+    assert.notEqual(res.status, 0, `${role}: result must refuse`);
+    assert.equal(res.stdout, '', `${role}: zero stdout`);
+    assert.match(res.stderr, /BLIND/);
+  }
+});
+
+test('a stand-in that echoes its argv and reads nothing fails the sight proof', async () => {
+  // Reproduced in review: the token was the probe file's FIRST line, matched
+  // against stdout and stderr merged, so a codex that opened nothing and merely
+  // echoed the command it was handed could earn `sight: cwd-file:...`.
+  //
+  // This cwd is built to be that trap: the only file's first line is its own
+  // NAME, and the name is on the command line. Under the old rule the token was
+  // "a.txt", the echo returned it, and the proof passed on a stand-in that never
+  // opened anything. The token now comes from below the first line and must be
+  // unrelated to the name, and the match is stdout-only.
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-echocwd-'));
+  try {
+    fs.writeFileSync(path.join(cwd, 'a.txt'), 'a.txt\nonly a reader can see this line\n');
+    const brief = writeBrief('briefargvecho.md', 'quick');
+    const r = run(['dispatch', '--brief', brief, '--role', 'argvecho', '--cd', cwd],
+      { FAKE_CODEX_SANDBOX_ARGV_ECHO: '1' });
+    assert.equal(r.status, 0, r.stderr);
+    const id = jobIdFrom(r.stdout);
+    assert.ok(await poll(() => record(id).state !== 'running'), 'the supervisor must finalize');
+
+    const rec = record(id);
+    assert.equal(rec.state, 'failed', 'an echo is not a read');
+    assert.equal(rec.reason, 'sandbox-blind-precheck');
+    assert.match(rec.sight, /^cwd-file:a\.txt/, 'the probe really did target the file in the job cwd');
+    assert.match(rec.sight, /the file's bytes never came back/,
+      'and the refusal names what was missing: the content');
+    // The evidence that this is the old hole and not a different one: the thing
+    // the old rule accepted as proof IS in the output, and it still fails.
+    assert.match(rec.sight, /sandbox invoked with: .*a\.txt/,
+      'the echo did return the old first-line token, and it bought nothing');
+    assert.equal(rec.exitCode, null, 'nothing was billed');
+    assert.equal(fs.existsSync(path.join(JOBS, id, 'out.txt')), false);
+    assert.notEqual(run(['result', id]).status, 0, 'and no answer is delivered');
+  } finally {
+    fs.rmSync(cwd, { recursive: true, force: true });
+  }
+});
+
+test('control bytes from codex reach neither the record nor a banner', async () => {
+  // Codex's own error text lands in job.json's `sight:`/`warning:` and is printed
+  // by status, list, result and the watcher's banner. An OSC/CSI sequence in
+  // there could retitle the window, clear the screen, and redraw the banner —
+  // the one line in this runtime that has to be true. Stripped at the write
+  // boundary AND at every print boundary.
+  const brief = writeBrief('briefansi.md', 'quick');
+  const r = run(['dispatch', '--brief', brief, '--role', 'ansi'], { FAKE_CODEX_SANDBOX_ANSI: '1' });
+  assert.equal(r.status, 0, r.stderr);
+  const id = jobIdFrom(r.stdout);
+  assert.ok(await poll(() => record(id).state !== 'running'), 'the supervisor must finalize');
+
+  const ESC = String.fromCharCode(27);
+  const raw = fs.readFileSync(path.join(JOBS, id, 'job.json'), 'utf8');
+  assert.equal(raw.includes(ESC), false, 'no ESC may be PERSISTED into the record');
+  for (const code of [0, 7, 8, 27, 0x9b]) {
+    assert.equal(raw.includes(String.fromCharCode(code)), false, `control byte ${code} must not be persisted`);
+  }
+  const rec = record(id);
+  assert.match(rec.sight, /forged-banner-attempt/, 'the text survives, defanged rather than dropped');
+  assert.match(rec.sight, /PWNED-BY-SIGHT-DETAIL/, 'including what the sequence was trying to say');
+
+  for (const [what, out] of [
+    ['status', run(['status', id]).stdout],
+    ['list', run(['list']).stdout],
+    ['result', run(['result', id]).stderr],
+  ]) {
+    assert.equal(out.includes(ESC), false, `${what} must not print an ESC`);
+  }
+
+  const w = run(['_watch', id]);
+  assert.equal(w.status, 0, w.stderr);
+  assert.equal(w.stdout.includes(ESC), false, 'the watcher must not print an ESC');
+  assert.match(w.stdout, /^ {2}JOB ENDED - state: failed$/m, 'the banner states the real state');
+  assert.equal(/^ {2}JOB FINISHED - result is ready$/m.test(w.stdout), false,
+    'and a forged banner inside a record field must never become the banner');
+});
+
+// ---------------------------------------------------------------------------
+// Untrusted strings that used to become paths.
+// ---------------------------------------------------------------------------
+
+test('a role claim whose owner is not a job id is refused, and nothing outside the jobs root is touched', async () => {
+  // Reproduced in review: an `owner` file containing `../not-a-job-dir` was
+  // path-joined to the jobs root, so a dispatch read pid files there, killed an
+  // unrelated process, wrote reaped.pids and renamed files outside the root —
+  // and exited 0 saying "reaped unvouched-for job".
+  const canary = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-canary-'));
+  const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)'], {
+    stdio: 'ignore', detached: true,
+  });
+  victim.unref();
+  try {
+    fs.writeFileSync(path.join(canary, 'child.pid'), String(victim.pid));
+    fs.writeFileSync(path.join(canary, 'precious.txt'), 'do not touch\n');
+
+    const lockDir = path.join(JOBS, '.role-locks', 'escape');
+    fs.mkdirSync(lockDir, { recursive: true });
+    fs.writeFileSync(path.join(lockDir, 'owner'), path.relative(JOBS, canary) + '\n');
+    // Older than the mid-claim grace, so the old code would have treated it as
+    // reclaimable and reaped it rather than waiting.
+    const old = new Date(Date.now() - 120000);
+    fs.utimesSync(lockDir, old, old);
+
+    const brief = writeBrief('briefescape.md', 'quick');
+    const refused = run(['dispatch', '--brief', brief, '--role', 'escape']);
+    assert.notEqual(refused.status, 0, 'a claim owner that is not a job id must refuse the dispatch');
+    assert.match(refused.stderr, /REFUSING to launch/);
+    assert.match(refused.stderr, /does not name a job this runtime could\r?\nhave created/);
+    assert.equal(refused.stdout.includes('job: '), false, 'and hand out no job');
+    assert.equal(refused.stdout.includes('reaped unvouched-for job'), false,
+      'and above all must not claim to have reaped anything');
+
+    assert.ok(pidAlive(victim.pid), 'the process outside the jobs root must be untouched');
+    assert.deepEqual(fs.readdirSync(canary).sort(), ['child.pid', 'precious.txt'],
+      'nothing outside the jobs root may be created, renamed or removed');
+    assert.equal(fs.readFileSync(path.join(canary, 'child.pid'), 'utf8'), String(victim.pid));
+  } finally {
+    try { process.kill(victim.pid); } catch { /* already gone */ }
+    fs.rmSync(canary, { recursive: true, force: true });
+    fs.rmSync(path.join(JOBS, '.role-locks', 'escape'), { recursive: true, force: true });
+  }
+});
+
+test('a corrupt record whose role escapes the jobs root cannot rename or delete anything', () => {
+  // The other door onto the same class: validateRecord type-checked `role` as a
+  // string but never applied ROLE_RE, so `role: "../../victim"` flowed through
+  // killJob into releaseRole, which joins it, RENAMES that directory into the
+  // jobs root and then removes it recursively.
+  const canary = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-rolecanary-'));
+  // A live pid, so the record reads as a running job that cancel will act on —
+  // and a process nothing in this test is entitled to kill.
+  const bystander = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)'], {
+    stdio: 'ignore', detached: true,
+  });
+  bystander.unref();
+  try {
+    fs.writeFileSync(path.join(canary, 'precious.txt'), 'do not touch\n');
+    const escapingRole = path.join('..', '..', path.basename(canary));
+
+    const id = 'roleescape-1-99961';
+    const dir = path.join(JOBS, id);
+    fs.mkdirSync(dir, { recursive: true });
+    const raw = JSON.stringify({
+      recordVersion: 1, id, role: escapingRole, state: 'running',
+      started: new Date().toISOString(), supervisorPid: bystander.pid, codexPid: null,
+    });
+    fs.writeFileSync(path.join(dir, 'job.json'), raw);
+
+    // A role that is not a role makes the record corrupt — the classification
+    // every verb already knows how to contain — so no verb ever joins it.
+    const st = run(['status', id]);
+    assert.equal(st.status, 0, st.stderr);
+    assert.match(st.stdout, /^state: corrupt$/m);
+    assert.match(st.stdout, /field "role" is not a role/, 'and the corruption is named precisely');
+
+    const c = run(['cancel', id]);
+    assert.equal(c.status, 0, c.stderr);
+    assert.match(c.stdout, /corrupt job\.json/, 'cancel takes the corrupt path, not the kill path');
+
+    assert.ok(fs.existsSync(canary), 'the directory the role pointed at must still exist');
+    assert.deepEqual(fs.readdirSync(canary), ['precious.txt'], 'with its contents intact');
+    assert.equal(fs.readFileSync(path.join(dir, 'job.json'), 'utf8'), raw, 'and the evidence untouched');
+    assert.ok(pidAlive(bystander.pid), 'and a corrupt record\'s pids are not kill targets');
+    // Nothing may have been moved INTO the jobs root either — that is how the
+    // recursive removal used to get its target.
+    assert.equal(
+      fs.readdirSync(path.join(JOBS, '.role-locks')).some((n) => n.includes(path.basename(canary))),
+      false,
+      'no tombstone naming the victim may exist'
+    );
+  } finally {
+    try { process.kill(bystander.pid); } catch { /* already gone */ }
+    fs.rmSync(canary, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// The supervisor registration window.
+// ---------------------------------------------------------------------------
+
+test('a dispatch registers its kill target before it returns', async () => {
+  // The window: dispatch spawned the supervisor and the supervisor recorded its
+  // own pid a moment later, so a cancel in between killed nothing, "verified" it,
+  // marked the job killed and released the role — while the supervisor went on to
+  // launch codex. The pid is knowable in the parent, so it is written there.
+  const brief = writeBrief('briefregister.md', 'slow');
+  const r = run(['dispatch', '--brief', brief, '--role', 'register'], { FAKE_CODEX_SLEEP_MS: '60000' });
+  assert.equal(r.status, 0, r.stderr);
+  const id = jobIdFrom(r.stdout);
+
+  // Read the instant dispatch returns — no polling, because the guarantee is
+  // that there is no instant at which this is unset.
+  const rec = record(id);
+  assert.equal(typeof rec.supervisorPid, 'number', 'the kill target is recorded before dispatch returns');
+  assert.equal(rec.launch, 'spawned', 'and the phase says a supervisor exists');
+  assert.ok(fs.existsSync(path.join(JOBS, id, 'supervisor.pid')), 'the pid file mirrors it immediately');
+  assert.ok(pidAlive(rec.supervisorPid), 'and it names a real process');
+
+  const c = run(['cancel', id]);
+  assert.equal(c.status, 0, c.stderr);
+  assert.equal(record(id).state, 'killed');
+});
+
+test('a cancel inside the registration window kills nothing and refuses to call it a death', async () => {
+  const started = new Date().toISOString();
+  const mk = (id, patch) => {
+    const dir = path.join(JOBS, id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+      recordVersion: 1, id, role: id.split('-')[0], state: 'running',
+      started, supervisorPid: null, codexPid: null, ...patch,
+    }));
+    return id;
+  };
+
+  // A supervisor was spawned and has not registered: there is nothing to kill and
+  // that is exactly why this may not be recorded as killed.
+  const spawning = mk('regwindow-1-99951', { launch: 'spawning' });
+  const c = run(['cancel', spawning]);
+  assert.notEqual(c.status, 0, 'a cancel that killed nothing must not exit 0');
+  assert.match(c.stderr, /KILL PENDING/);
+  assert.match(c.stderr, /Killing nothing is not killing it/);
+  assert.equal(record(spawning).state, 'kill-pending', 'the state says pending, NOT killed');
+
+  const st = run(['status', spawning]);
+  assert.match(st.stdout, /^state: kill-pending$/m);
+
+  // The role stays blocked while that is unresolved.
+  const brief = writeBrief('briefregwindow.md', 'quick');
+  const blocked = run(['dispatch', '--brief', brief, '--role', 'regwindow']);
+  assert.notEqual(blocked.status, 0, 'a kill-pending job keeps blocking its role');
+  assert.match(blocked.stderr, /already kill-pending/);
+  const forced = run(['dispatch', '--brief', brief, '--role', 'regwindow', '--force']);
+  assert.notEqual(forced.status, 0, '--force must not launch beside a job it could not kill');
+  assert.match(forced.stderr, /could not be shown to have died/);
+
+  // Past the window with still nothing registered, the supervisor provably never
+  // arrived, so a retry resolves it rather than blocking forever.
+  const stale = mk('regstale-1-99952', {
+    launch: 'spawning', started: new Date(Date.now() - 3600000).toISOString(),
+  });
+  const c2 = run(['cancel', stale]);
+  assert.equal(c2.status, 0, c2.stderr);
+  assert.equal(record(stale).state, 'killed', 'outside the window, nothing-to-kill IS the whole kill');
+
+  // And a dispatch that has not spawned anything at all is not in the window: its
+  // claim fence stops it launching, so the role can be taken from it safely.
+  const pending = mk('regpending-1-99953', { launch: 'pending' });
+  const c3 = run(['cancel', pending]);
+  assert.equal(c3.status, 0, c3.stderr);
+  assert.equal(record(pending).state, 'killed', 'a job that never spawned is killed by killing nothing');
+});
+
+test('a cancel reaches codex descendants through the process group', { skip: process.platform === 'win32' ? 'POSIX-only: Windows uses taskkill /T' : false }, async () => {
+  // Off Windows there was no tree kill at all — killTree signalled the two
+  // recorded pids and nothing else, so codex's own children survived. The
+  // supervisor and codex are now process-group leaders and the group is killed.
+  // Asserted WITHOUT the fake's child.pid file, which would otherwise make the
+  // grandchild a recorded target and hide whether the group kill worked.
+  const brief = writeBrief('briefgroup.md', 'slow');
+  const r = run(['dispatch', '--brief', brief, '--role', 'group'], { FAKE_CODEX_SLEEP_MS: '60000' });
+  assert.equal(r.status, 0, r.stderr);
+  const id = jobIdFrom(r.stdout);
+  const childPidFile = path.join(JOBS, id, 'child.pid');
+  assert.ok(await poll(() => record(id).codexPid && fs.existsSync(childPidFile)), 'fake codex should start');
+  const grandchild = Number(fs.readFileSync(childPidFile, 'utf8'));
+  fs.rmSync(childPidFile); // the grandchild is now reachable only through the group
+
+  const c = run(['cancel', id]);
+  assert.equal(c.status, 0, c.stderr);
+  assert.ok(await poll(() => !pidAlive(grandchild)), 'the descendant must die with the group');
 });
 
 test('list classifies states including stale pids', async () => {

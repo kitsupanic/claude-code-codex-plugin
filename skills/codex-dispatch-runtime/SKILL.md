@@ -13,7 +13,7 @@ quick interactive questions; that is what the official codex plugin is for.
 
 Runtime: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" <verb>`
 
-## The five invariants — never work around them
+## The six invariants — never work around them
 
 1. **Verbatim brief in.** The brief is a markdown FILE fed to `codex exec -` on
    stdin, byte-for-byte. Never inline a brief on a command line (Windows quoting
@@ -55,6 +55,15 @@ Runtime: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" <verb>`
    yourself: a sourceless second opinion is worse than none. When an answer does
    arrive carrying `UNPROVEN SIGHT` or a `warning:`, relay the answer AND the
    caveat — both, every time.
+6. **A record has to vouch for its run before its bytes go out.** `result` prints
+   only when the record carries this release's schema stamp, a zero exit, and either
+   proven sight or the recorded `--allow-unproven-sight` opt-in. A job dispatched by
+   an older release (0.1–0.3) is **`unvouched`** — `status` says
+   `deliverable: NO - unvouched: …`, `list` tags it `done(unvouched)`, and `result`
+   refuses it naming why and pointing at the `out:` path. That is not a bug to route
+   around: re-dispatch under this release, or tell the user the bytes are there and
+   let them decide. Consent and proof are things the record says, never things
+   inferred from a label.
 
 ## Verbs
 
@@ -67,17 +76,20 @@ Runtime: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" <verb>`
   claimed atomically, so of two dispatches racing for one role exactly one wins.
   `--allow-unproven-sight` is invariant 5's opt-in; it is never a default and never
   a way around a refusal you have not read.
-- `status [<job-id>]` — state (running / done / failed / killed / kill-failed /
-  stale / corrupt), a `reason:` line when there is one, `sight:`, `warning:` and
-  `survivors:` lines when they apply, runtime, log size, `out:` path.
+- `status [<job-id>]` — state (running / done / failed / killed / kill-pending /
+  kill-failed / stale / corrupt), a `reason:` line when there is one, `sight:`,
+  `deliverable:`, `warning:` and `survivors:` lines when they apply, runtime, log
+  size, `out:` path.
 - `result <job-id>` — the answer, verbatim, stdout only. **The record decides**:
-  it prints only when the record says `done`. Every other state exits nonzero
-  naming the state and the `out:` path — including a job whose answer file exists
-  but whose run was never vouched for. An existing `out.txt` is bytes, not a
-  verdict.
+  it prints only when the record says `done` *and* vouches for the run (stamp, zero
+  exit, proven sight or the recorded opt-in). Every other case exits nonzero naming
+  the state or the missing vouch, plus the `out:` path — including a job whose
+  answer file is sitting right there. An existing `out.txt` is bytes, not a verdict.
 - `cancel <job-id>` — kills the whole job tree and checks it died. Survivors mean
   `kill-failed` (not `killed`), a nonzero exit, and the role stays blocked; a pid
-  the OS refuses to answer about counts as a survivor, not as a death. On a job
+  the OS refuses to answer about counts as a survivor, not as a death. A cancel that
+  arrives before the job has registered anything to kill is `kill-pending`, not
+  `killed` — nothing died, so nothing says it did; re-run it in a moment. On a job
   whose `job.json` is corrupt it reaps the pid files instead, preserves the record
   as evidence, and marks the spent pids so a second cancel replays nothing — that
   second cancel reports `already reaped` and changes nothing.
@@ -87,18 +99,30 @@ Runtime: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" <verb>`
 - `preflight` — checks codex is installed, authenticated, and that its sandbox
   can actually read a file; names which binary it chose.
 
-## The out: fallback rule
+## The out: fallback rule — and what it is NOT
 
 Every dispatch/status output prints the literal absolute output-file path on its
-own line as `out: <path>`. If a wake-up or notification is missed, that path is
-the last-resort delivery channel: read it directly if the runtime is somehow
-unavailable. Always propagate the `out:` line when reporting job state to the user
-or to another agent.
+own line as `out: <path>`. Always propagate that line when reporting job state to
+the user or to another agent.
+
+**The fallback is for LOCATING and REPORTING the path, never for delivering an
+answer the runtime refused.** This rule used to read "read it directly if the
+runtime is somehow unavailable", which licensed exactly the workaround invariants
+5 and 6 exist to forbid: the refusals are the product. If `result` refuses — blind,
+unproven, unvouched, corrupt, not-done — the correct move is to relay the refusal
+and the `out:` path and stop. Reading the file yourself and presenting what it says
+turns a refused, sourceless answer into a delivered one, which is the original
+failure with an extra step. If the user asks for the bytes by name, that is their
+call to make, and it is made knowingly.
+
+If the runtime itself will not run at all (node missing, script gone), say that —
+do not substitute the file for it.
 
 **Poll `result` (or `status`), not the file.** The out file appears the moment
 codex writes it — before the exit code is recorded and before the sight verdict —
 so its existence is not completion and never was a verdict. `result` exits nonzero
-until the record says done, which is exactly the signal to wait on.
+until the record says done AND vouches for the run, which is exactly the signal to
+wait on.
 
 ## Rules of engagement
 

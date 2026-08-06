@@ -37,7 +37,9 @@ const deadline = Date.now() + 10 * 60 * 1000;
 let state = 'running';
 while (Date.now() < deadline) {
   await new Promise((r) => setTimeout(r, 5000));
-  state = run(['status', id]).stdout.match(/^state: (\w+)$/m)[1];
+  // [\w-] because two terminal states carry a hyphen (kill-pending, kill-failed);
+  // \w+ alone reported either of them as "kill".
+  state = run(['status', id]).stdout.match(/^state: ([\w-]+)$/m)[1];
   if (state !== 'running') break;
   process.stdout.write('.');
 }

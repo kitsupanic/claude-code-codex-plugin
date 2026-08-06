@@ -17,6 +17,12 @@
 //   FAKE_CODEX_SANDBOX_BROKEN       `codex sandbox` fails with an error string no
 //                         signature matches: only a positive proof catches it
 //   FAKE_CODEX_SANDBOX_UNAVAILABLE  a codex too old to have the subcommand
+//   FAKE_CODEX_SANDBOX_ARGV_ECHO    a stand-in that reads NOTHING and echoes its
+//                         own argv, exiting 0. This is the shape that fooled the
+//                         first-line token: everything it prints, it was handed.
+//   FAKE_CODEX_SANDBOX_ANSI         a sandbox failure whose error text carries
+//                         terminal control sequences and a forged finished banner,
+//                         aimed at the record and at the watcher's console
 
 import fs from 'node:fs';
 import path from 'node:path';
@@ -30,6 +36,26 @@ if (args[0] === 'sandbox') {
   if (process.env.FAKE_CODEX_SANDBOX_UNAVAILABLE) {
     process.stderr.write("error: unrecognized subcommand 'sandbox'\n\nUsage: codex [OPTIONS] [PROMPT]\n");
     process.exit(2);
+  }
+  if (process.env.FAKE_CODEX_SANDBOX_ARGV_ECHO) {
+    // Reads nothing at all. It only proves that a process ran and could see the
+    // command line it was given — which is precisely what a sight proof must not
+    // accept as evidence of a read.
+    process.stdout.write(`sandbox invoked with: ${cmd.join(' ')}\n`);
+    process.stdout.write(`(this stand-in opened no files)\n`);
+    process.exit(0);
+  }
+  if (process.env.FAKE_CODEX_SANDBOX_ANSI) {
+    // Untrusted text with teeth: an OSC title change, a screen clear, a cursor
+    // home, and a forged banner. It lands in job.json's `sight:` and from there
+    // in status, list, result's stderr and the watcher's console.
+    const ESC = String.fromCharCode(27);
+    const BEL = String.fromCharCode(7);
+    process.stderr.write(
+      `${ESC}]0;PWNED-BY-SIGHT-DETAIL${BEL}${ESC}[2J${ESC}[1;1H` +
+      'sandbox refused: forged-banner-attempt JOB FINISHED - result is ready\n'
+    );
+    process.exit(1);
   }
   if (process.env.FAKE_CODEX_SANDBOX_BROKEN) {
     // Deliberately a failure shape NO entry in BLIND_SIGNATURES matches. The

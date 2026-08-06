@@ -8,10 +8,10 @@ untouched, minutes to half an hour later, reliably, on Windows.
 The runtime (`scripts/codex-dispatch.mjs`) is the product; the plugin is a thin
 shell over it. Zero npm dependencies, Node 18+.
 
-## Why it exists — the five invariants
+## Why it exists — the six invariants
 
 The official `codex` plugin serves casual interactive reviews. This one serves
-orchestrated second-opinion dispatches, which need five guarantees the official
+orchestrated second-opinion dispatches, which need six guarantees the official
 plugin does not make:
 
 1. **Verbatim brief in.** The brief is a markdown file fed to `codex exec -` on
@@ -32,15 +32,24 @@ plugin does not make:
 5. **No unproven answer without an explicit, recorded opt-in.** A dispatch whose
    sandbox cannot read files produces a confident, sourceless answer and exits 0.
    So before each job's codex is launched, the supervisor runs a sandboxed read
-   **in that job's own `--cd`** and requires the file's bytes to come back. That
-   proof is the deliverability gate, not a label: no proof, no job. A sandbox that
-   fails fails as `sandbox-blind-precheck`; a sandbox that *cannot be proven either
-   way* — a CLI too old to have the subcommand, a cwd with nothing readable in it —
-   is refused as `sight-unproven`, both before a single token is spent. The one way
-   past it is `--allow-unproven-sight`, which runs the job, stamps
-   `sight: unproven (accepted by caller)` on the record, and makes every `status`
-   and every `result` say so. The after-the-fact log scan still runs, but it is a
-   warning now, not a verdict — see "Proving sight" below.
+   **in that job's own `--cd`** and requires bytes from *inside* the file to come
+   back on stdout. That proof is the deliverability gate, not a label: no proof, no
+   job. A sandbox that fails fails as `sandbox-blind-precheck`; a sandbox that
+   *cannot be proven either way* — a CLI too old to have the subcommand, a cwd with
+   nothing readable in it — is refused as `sight-unproven`, both before a single
+   token is spent. The one way past it is `--allow-unproven-sight`, which runs the
+   job, stamps `sight: unproven (accepted by caller)` **and `allowUnprovenSight:
+   true`** on the record, and makes every `status` and every `result` say so. The
+   after-the-fact log scan still runs, but it is a warning now, not a verdict —
+   see "Proving sight" below.
+6. **Deliverability is a versioned property of the record, and it is positive.**
+   `result` does not ask "is there a reason to withhold this?" — it asks "does this
+   record vouch for its run?", and refuses unless the answer is yes: this release's
+   schema stamp (`recordVersion`), a zero exit, and either sight proven in the job's
+   own cwd or the `--allow-unproven-sight` boolean written down by the dispatch that
+   ran it. Records that predate the stamp are `unvouched`, named as such by `status`
+   and `list`, and refused — because a record written under an older gate is not
+   evidence that this gate was met. Consent is never inferred from a string.
 
 ## How this differs from `openai/codex-plugin-cc`
 
@@ -58,10 +67,10 @@ something.
 | **Brief transport** | codex's own reviewer (no brief), prompt templates with interpolated variables, optional focus text | a markdown file on `codex exec -` stdin, byte-for-byte; never inlined on a command line |
 | **Model & effort** | deliberately unset — Codex's defaults, or your `config.toml` | explicit defaults, recorded in `job.json`; ships budget (`gpt-5.6-luna`, `medium`), frontier per call (`--model gpt-5.6-sol --effort xhigh`) |
 | **Sandbox** | `read-only` for reviews; the rescue agent defaults to write-capable | `read-only` unless `--write`, plus a per-job positive sight proof in the job's own cwd before codex is launched |
-| **Job model** | background jobs polled from the session via a companion app-server broker | detached supervisor, on-disk records, unique job dirs, atomic role claims, verified kill-before-retry, stale reaping, atomic type-checked records, whitelisted ids |
+| **Job model** | background jobs polled from the session via a companion app-server broker | detached supervisor, on-disk records, unique job dirs, atomic role claims, verified kill-before-retry, stale reaping, atomic type-checked records, whitelisted ids and roles proved inside the jobs root |
 | **Hooks** | `SessionStart`/`SessionEnd` lifecycle, plus an opt-in stop-time review gate | none, ever — enforced by a test |
 | **Footprint** | companion app-server, agents, skills, prompt templates, output schemas, 8 commands | one zero-dependency script, 6 commands, 1 skill |
-| **Tests** | 8 test files, CI on every pull request | 54 tests — fake-codex lifecycle drills, sight-gate and kill-verification drills, a concurrency race and a fenced-claim takeover, plus an opt-in live smoke |
+| **Tests** | 8 test files, CI on every pull request | 70 tests — fake-codex lifecycle drills, the deliverability matrix, sight-gate and kill-verification drills, path-escape canaries, a concurrency race and a fenced-claim takeover, plus an opt-in live smoke |
 
 Things the official plugin has that this one deliberately does not: the
 `codex-rescue` subagent, `/codex:review`'s zero-brief native reviewer, the
@@ -97,8 +106,12 @@ per job and in that job's own working directory, that the sandbox can read a fil
 - Wake-up notifications dropped four times in one day, and status output that
   didn't name the output file forced filesystem hunts. → **Every dispatch/status
   output prints the literal absolute out-file path as `out: <path>`.** The
-  deterministic path is the fallback delivery channel; the out file appears only
-  when the run finishes, so its existence is the done signal.
+  deterministic path is the fallback delivery channel for *locating* an answer —
+  never a done signal. The out file appears the instant codex writes it, which is
+  before the exit code is recorded and before any sight verdict, so **the record is
+  the done signal** and the file's existence says nothing. (That line used to say
+  the opposite, which contradicted the record-authority rule two sections down;
+  caught by the 0.3.0 dual review.)
 - `codex` missing from PATH in shells started before install. → Preflight resolves
   `%APPDATA%\npm\codex.cmd` itself (see the resolution order below).
 - Auth lapses silently. → Preflight runs `codex --version` and
@@ -142,7 +155,78 @@ per job and in that job's own working directory, that the sandbox can read a fil
   `/plugin marketplace update kitsupanic` had nothing to install: every installed
   copy stayed on the first push while the repo moved four commits ahead, and
   nothing anywhere said so. → A push that changes behavior bumps the version. See
-  "Releases and versioning" below; this release is `0.3.0`.
+  "Releases and versioning" below; this release is `0.4.0`.
+
+### The 0.3.0 dual review (2026-08-06) — two frontier arms, both "not ready"
+
+`0.3.0` was reviewed by two frontier models working from the same standalone
+brief, independently, neither seeing the other's answer: Claude Fable 5 at xhigh
+and GPT-5.6-sol at xhigh. Both returned the same verdict — *not ready for public
+use* — and both reproduced or traced what they found. What they disagreed about is
+what makes the exercise worth recording: **they arrived at the same defect class
+through different doors, and each found a critical one the other missed.**
+
+- **Converged: untrusted strings became paths.** The Claude arm reproduced it from
+  the claim side — a role lock's `owner` file containing `../not-a-job-dir` was
+  joined to the jobs root, so a dispatch read pid files there, killed an unrelated
+  process, wrote `reaped.pids` and renamed files outside the jobs root, and exited
+  0 announcing *"reaped unvouched-for job"*. The Codex arm traced it from the
+  record side — `validateRecord` type-checked `role` as a string but never applied
+  `ROLE_RE`, so a corrupt record carrying `role: "..\\..\\victim"` flowed through
+  `killJob` into `releaseRole`, which joins it, **renames that directory into the
+  jobs root and then removes it recursively.** Same class, two entry points,
+  neither visible from the other. → Both are now closed structurally: every value
+  that becomes a path segment is whitelisted **by the function that reads it**, and
+  every absolute path derived from one is proved to be inside the jobs root before
+  anything is read, renamed, removed or killed. A violation is a refusal and a
+  corrupt classification, never a best-effort guess.
+- **Codex arm only: legacy records delivered silently.** `result` gated on
+  `state === 'done'` and nothing else, so records written by 0.1/0.2 — which carry
+  no `sight` at all, or the old `unproven`/`job-nonce` labels — were delivered the
+  moment this runtime was installed over them. Worse, a 0.2 `unproven` record
+  collected the *"the caller opted in with `--allow-unproven-sight`"* caveat, a
+  claim of consent nobody had given, inferred from a word in a string. → Invariant
+  6: deliverability is versioned and positive, and consent is a boolean the
+  dispatch wrote, not a phrase in a label.
+- **Codex arm only: cancel during supervisor registration.** Dispatch spawned the
+  supervisor; the supervisor recorded its own pid a moment later. A `cancel` in
+  that window found nothing to kill, "verified" the empty kill, marked the job
+  `killed` and released the role — while the supervisor it never touched went on to
+  launch codex, leaving a second same-role dispatch free to start beside it. Two
+  billing codexes, from the one code path built to prevent exactly that. → The pid
+  is knowable in the parent at spawn time, so dispatch records it before it
+  returns; `launch` records the phase, so "nothing to kill" can be told apart from
+  "nothing has been launched"; a kill inside the window becomes `kill-pending`
+  rather than `killed`; and the supervisor re-checks its record and its claim
+  immediately before exec.
+- **Claude arm only: ANSI banner forgery (reproduced).** Codex's own error text
+  lands in `job.json`'s `sight`/`warning`, and every verb printed those fields raw
+  — `stripControlBytes` was applied only to tailed log bytes. A sandbox failure
+  whose message carried an OSC title change, a screen clear and a cursor-home could
+  therefore redraw the watcher's finished banner, which is the one line in this
+  runtime meant to be believed from across the room. → Control bytes are stripped
+  at the **write** boundary (they never enter a record) *and* at every print
+  boundary (records written by older releases never went through the first one).
+- **Claude arm only: the sight token was accepted from anywhere (reproduced).** The
+  proof required the probe file's **first line** to appear anywhere in stdout *or*
+  stderr — and the first line is exactly what a tool that never opened the file can
+  produce: a header, or the file's own name echoed back off the command line. A
+  stand-in that read nothing and echoed its argv earned `sight: cwd-file:…` and a
+  `done` job. → The token now comes from **below** the first line, must be 12+
+  printable ASCII characters, must be unrelated to the file's name, is asserted not
+  to appear in the command being sent, and must come back **on stdout** — verified
+  live against codex-cli 0.146.0, where `codex sandbox cmd /c type <file>` puts the
+  sandboxed command's output on stdout and leaves stderr empty.
+- Also from the Claude arm: POSIX kills never reached codex's descendants (no tree
+  walk off Windows), a failed supervisor spawn left a job reading `running` forever
+  with a refusal message claiming codex "may be billing" for a process that never
+  existed, `SKILL.md`'s `out:` fallback licensed the workaround invariant 5 forbids,
+  and `commands/list.md` documented a `failed(sandbox-blind)` reason 0.3.0 could not
+  emit. All fixed in 0.4.0.
+
+The lesson banked: **a single frontier reviewer is not a review of this class of
+code.** Each arm's blind spot was invisible from inside that arm, and three of the
+five findings above were found by exactly one of them.
 
 ## Install
 
@@ -194,14 +278,25 @@ every install was pinned to the first of them — the fix landed in the repo and
 nowhere else, silently, which is the same shape of failure as a blind answer:
 confident, and wrong in a way nothing surfaces.
 
-Current release: **0.3.0** — sight becomes a deliverability gate (unprovable is
-refused; `--allow-unproven-sight` is the recorded opt-in), access-denied counts as
-alive, role claims are fenced against a descheduled claimer, a reclaim from an
-unvouched-for owner kills first, failed pid-file renames are surfaced, and the
-watcher's banner tells the truth. Behavioral: a dispatch that used to be delivered
-with a warning is now refused unless the caller opts in.
+Current release: **0.4.0** — the 0.3.0 dual review, fixed. Untrusted strings can no
+longer become paths (claim owners and record roles are whitelisted where they are
+read, and every derived path is proved inside the jobs root); deliverability is
+versioned, so records from before the gate are `unvouched` and refused rather than
+delivered; a cancel inside the supervisor's registration window is `kill-pending`,
+not `killed`; control bytes never enter a record or a banner; the sight token comes
+from inside the file and must return on stdout; POSIX kills reach the process
+group. Behavioral, and deliberately so: **jobs dispatched by 0.1–0.3 will not be
+delivered by `result` on this release** — their records cannot vouch for how they
+ran. `result` names the reason and prints the `out:` path; read them by hand if you
+trust them, or re-dispatch.
 
-Previous: **0.2.0** — positive per-job sight proof, verified kills, atomic role
+Previous: **0.3.0** — sight becomes a deliverability gate (unprovable is refused;
+`--allow-unproven-sight` is the recorded opt-in), access-denied counts as alive,
+role claims are fenced against a descheduled claimer, a reclaim from an
+unvouched-for owner kills first, failed pid-file renames are surfaced, and the
+watcher's banner tells the truth.
+
+Before that: **0.2.0** — positive per-job sight proof, verified kills, atomic role
 claims, record-authoritative delivery, consumed pid files, and the `watch` verb.
 
 **As a bare runtime (no plugin system needed):**
@@ -233,12 +328,14 @@ node scripts/codex-dispatch.mjs dispatch --brief b.md --role review --allow-unpr
   #   Without it such a job is refused; with it the record says so forever.
 
 node scripts/codex-dispatch.mjs status            # all jobs
-node scripts/codex-dispatch.mjs status <job-id>   # one job: state, sight, warnings, runtime, log size, out path
+node scripts/codex-dispatch.mjs status <job-id>   # one job: state, sight, deliverability, warnings, runtime, log size, out path
   # sight: cwd-file:<name>            proven — a real file in the job's cwd was read back
   # sight: unproven (accepted by ...) ran only because --allow-unproven-sight was passed
   # (a job whose sight could be neither proven nor disproven, without that flag,
   #  never ran: state failed, reason sight-unproven)
-node scripts/codex-dispatch.mjs result <job-id>   # the answer, verbatim, stdout only; nonzero + out: path unless the record says done
+  # deliverable: yes (...)            printed for finished jobs — what earned the delivery
+  # deliverable: NO - unvouched: ...  the record cannot vouch for the run; result will refuse
+node scripts/codex-dispatch.mjs result <job-id>   # the answer, verbatim, stdout only; nonzero + out: path unless the record says done AND vouches for it
 node scripts/codex-dispatch.mjs cancel <job-id>   # kill the whole tree, verify it died, mark killed
 node scripts/codex-dispatch.mjs list              # one line per job, newest first
 node scripts/codex-dispatch.mjs watch <job-id>    # detached console window: tails run.log, then a JOB FINISHED banner
@@ -253,11 +350,13 @@ node scripts/codex-dispatch.mjs preflight         # install / auth / functional-
 - `--role` must match `^[a-z]+$` and job ids are therefore `^[a-z]+-\d+-\d+$`;
   anything else is refused before it can become a path (see below).
 - `dispatch` refuses if a job with the same `--role` is still `running`,
-  `stale`, or `kill-failed` — the three states in which processes may still be
-  alive. Stale means the supervisor died before an out file appeared, so codex was
-  probably reparented and is still running and still billing; `kill-failed` means
-  an earlier kill was attempted and *verified not to have worked*. The refusal
-  names which of the three it is. `--force` kills that job's tree first —
+  `kill-pending`, `stale`, or `kill-failed` — the four states in which processes
+  may still be alive. Stale means the supervisor died before an out file appeared,
+  so codex was probably reparented and is still running and still billing;
+  `kill-failed` means an earlier kill was attempted and *verified not to have
+  worked*; `kill-pending` means a cancel arrived before there was anything to kill,
+  so nothing died and nothing may assume it did. The refusal names which of the
+  four it is. `--force` kills that job's tree first —
   including the recorded codex pid and any pids in the job dir's `child.pid` — and
   then **checks**: if anything survived, the new job is refused rather than
   launched alongside it.
@@ -285,10 +384,13 @@ The desktop app is last rather than excluded: it is a working CLI for everything
 except the sandbox, and if it is all a machine has, the preflight failure below
 says so precisely instead of the runtime pretending nothing is installed.
 
-**Install-level check (`preflight`).** Preflight writes a nonce into a temp file
+**Install-level check (`preflight`).** Preflight writes a secret into a temp file
 and runs `codex sandbox <cat that file>` — codex's own sandbox, no model, no
 tokens, no billing, ~300 ms. It is `functional` only if the command exits 0 *and*
-the nonce comes back. A `broken` sandbox is a preflight **failure** (on Windows —
+the secret comes back **on stdout**. The secret is deliberately not the file's name:
+when it was (the nonce named the file and *was* its content), the name travelled on
+the command line, so a binary that echoed its argv and opened nothing could return
+it. A `broken` sandbox is a preflight **failure** (on Windows —
 elsewhere a warning, since Windows is the platform this probe is verified on)
 whose message names the resolved binary, the probe error, and the npm-vs-desktop
 fix. If the CLI is too old to have a `sandbox` subcommand the probe reports
@@ -311,12 +413,37 @@ So the verdict is now a **positive proof, run per job, in that job's own `--cd`*
 by the supervisor, immediately before codex is launched:
 
 1. Pick a file that **already exists** in the job's cwd — first regular file by
-   name, non-empty, under 1 MiB, yielding a short printable-ASCII line to use as a
-   verification token. Names carrying `%`, `^`, `&`, `!` or `"` are skipped rather
-   than trusted to Windows quoting.
+   name, non-empty, under 1 MiB, yielding a verification token. Names carrying
+   `%`, `^`, `&`, `!` or `"` are skipped rather than trusted to Windows quoting.
 2. Run `codex sandbox cmd /c type <that file>` with the probe's own working
    directory set to the job's cwd.
-3. The proof holds only if the command exits 0 **and the token comes back**.
+3. The proof holds only if the command exits 0 **and the token comes back on
+   stdout**.
+
+**What the token is, is the whole proof.** It used to be the file's *first* line,
+matched against stdout and stderr merged — and the first line is precisely what a
+tool that never opened the file can produce: a header, a shebang, or the file's own
+name echoed back off the command line it was handed. A stand-in that read nothing
+and printed its argv earned `sight: cwd-file:…` and a `done` job (reproduced in
+review, 2026-08-06). So the token now has to be content nobody can produce without
+having read the file:
+
+- it comes from **below the first line** — line 0 is never eligible;
+- it is **12+ printable-ASCII characters** after trimming, capped at 60, so it is
+  content rather than boilerplate;
+- it must be **unrelated to the file's name** in either direction, since the name is
+  the one part of this that travels on the command line;
+- the runtime **asserts the token does not appear in the command it is about to
+  send** — a property the picker already guarantees, checked again where the argv
+  actually exists, because a property enforced only somewhere else is one refactor
+  away from being enforced nowhere;
+- and the match is on **stdout only**. Verified live against codex-cli 0.146.0:
+  `codex sandbox cmd /c type <file>` puts the sandboxed command's output on stdout
+  and leaves stderr empty. If the bytes turn up on stderr instead, that is reported
+  as a broken probe naming exactly that, not quietly accepted.
+
+A file that yields no such token is skipped and the next one is tried (up to 20);
+a cwd where none does falls through to the job-nonce path below, which is not proof.
 
 Nothing is ever written into the job's cwd — it is somebody's repository, possibly
 read-only, possibly precious. If the cwd has no readable file at all (empty, or
@@ -391,6 +518,26 @@ get to overrule a proof.
   the collision suffix extends the pid digits (`…-4844` → `…-48441`) rather than
   adding a segment, so a generated id always satisfies the whitelist it will later
   be checked against.
+- **And the whitelist is applied where the value is READ, not where it is used.**
+  That sentence above was true of the id a *user types* and false of every other
+  string that becomes a path — which is how both review arms found the same defect
+  class from opposite ends (see the catalog above). Three strings become path
+  segments, and each is now whitelisted by the function that reads it:
+  - a role claim's `owner` file → `parseClaimOwner`, against `JOB_ID_RE`. An owner
+    that is not a job id comes back classified `invalid`, never as a usable string,
+    so `inspectClaim` reports a **corrupt claim** and the dispatch refuses, naming
+    the owner file and leaving everything untouched.
+  - a record's `role` and `id` → `validateRecord`, against `ROLE_RE`/`JOB_ID_RE`.
+    A record carrying `role: "..\\..\\victim"` is **corrupt**, which is the
+    containment every verb already implements, so it never reaches `releaseRole`.
+  - a user-typed job id → `assertJobId`, as before.
+- **Every derived absolute path is then proved to be inside the jobs root.**
+  `isInsideRoot` resolves both sides and requires the relative path to be non-empty
+  and not to start with `..`; `jobDirFor` combines it with the id whitelist, and
+  `roleLockDir` with the role whitelist. Reads, renames, removals and kills all go
+  through one of them. The two checks are deliberately separate rather than one
+  clever one: the whitelist is what the paragraph above promises, and the
+  containment assert is what still holds if a whitelist is ever loosened.
 
 ## The supervisor / job model
 
@@ -401,8 +548,9 @@ dispatch (returns immediately)
   │    └─ owner            the job id holding the claim
   ├─ creates <jobs-root>/<role>-<epoch>-<pid>/
   │    ├─ prompt.md        byte-copy of the brief
-  │    ├─ job.json         role, model, effort, sandbox, cwd, pids, state, sight,
-  │    │                    allowUnprovenSight, reapedPids, timestamps
+  │    ├─ job.json         recordVersion, role, model, effort, sandbox, cwd, pids,
+  │    │                    state, launch phase, sight, allowUnprovenSight,
+  │    │                    reapedPids, timestamps
   │    ├─ run.log          codex stdout+stderr — grows during the run (liveness signal);
   │    │                    the transcript, and what the signature scan warns from
   │    ├─ supervisor.log   supervisor diagnostics
@@ -413,10 +561,12 @@ dispatch (returns immediately)
   │    ├─ sight-probe.txt  only in job-nonce mode: the nonce the sandbox had to read back
   │    └─ out.txt          the verbatim answer — bytes, not a verdict (see below)
   ├─ re-reads the claim's owner  ← taken over while we were starting up? abort, remove the dir
-  └─ spawns (detached, unref'd)
+  ├─ records launch: spawning   ← from here on a supervisor may exist
+  └─ spawns (detached), THEN records its pid before returning
        supervisor  ← the kill target; taskkill /T /F here takes codex with it
          ├─ proves sight: codex sandbox cmd /c type <a file in the job's cwd>
          │    └─ not proven, and no --allow-unproven-sight? failed / sight-unproven, nothing spent
+         ├─ re-checks: record still running? claim still ours?  ← else abort, nothing spent
          └─ codex exec - --cd <cwd> --sandbox <mode> --skip-git-repo-check
               --model <m> -c model_reasoning_effort=<e>
               --output-last-message out.txt --color never  < prompt.md > run.log 2>&1
@@ -427,17 +577,37 @@ proves sight, runs codex to completion, then writes exit code, final state, and
 finished timestamp into `job.json`. After dispatch returns, the supervisor is the
 only writer of `job.json` (cancel excepted), so there are no write races.
 
-**States**: `running` → `done` | `failed` | `killed` | `kill-failed`, plus two
-derived readings — `stale` (record says running, supervisor pid is gone) and
-`corrupt` (the record cannot be trusted). `running`, `stale` and `kill-failed`
-are the states in which processes may still be alive, so those three block their
-role, are cancellable, and are what `--force` must kill.
+**Dispatch records the supervisor's pid itself, at spawn time, before it returns.**
+The supervisor used to write its own, which left a window — record says `running`,
+nothing recorded to kill — in which a `cancel` killed nothing, called it verified,
+marked the job `killed` and released the role while that supervisor went on to
+launch codex. `child.pid` is knowable in the parent, so the window does not have to
+exist. The `launch` field records the phase alongside it (`pending` → `spawning` →
+`spawned`), which is what lets a kill tell "nothing has been launched yet" apart
+from "something was launched and has not registered": the first is safe to take the
+role from (that dispatch re-verifies its claim before spawning anything), the second
+is not.
 
-**The record is authoritative.** `result` prints only when the record says
-`done`; every other state — including a `stale` job whose `out.txt` is sitting
-right there — exits nonzero, names the state, and names the `out:` path so the
-bytes remain reachable by hand. See the decisions section for what this revoked
-and why.
+**States**: `running` → `done` | `failed` | `killed` | `kill-pending` |
+`kill-failed`, plus two derived readings — `stale` (record says running, supervisor
+pid is gone) and `corrupt` (the record cannot be trusted). `running`,
+`kill-pending`, `stale` and `kill-failed` are the states in which processes may
+still be alive, so those four block their role, are cancellable, and are what
+`--force` must kill. `kill-pending` is what a cancel inside the registration window
+produces: nothing was killed, so nothing may record a death — the job keeps its
+role, `cancel` exits nonzero saying so, and a retry (once the supervisor has
+registered, or once the window has passed and it provably never will) resolves it.
+
+**The record is authoritative, and it has to vouch.** `result` prints only when the
+record says `done` **and** `deliverability()` holds: this release's `recordVersion`
+stamp, `exitCode: 0`, and either `sight: cwd-file:<name>` or the
+`allowUnprovenSight: true` the dispatch wrote down. Every other case — a `stale` job
+whose `out.txt` is sitting right there, a 0.2 record with no sight at all, a record
+whose sight *says* it was accepted but that carries no recorded opt-in — exits
+nonzero, names the reason, and names the `out:` path so the bytes remain reachable
+by hand. `status` prints a `deliverable:` line for finished jobs and `list` tags
+them `done(unvouched)`, so the refusal is never the first anyone hears of it. See
+the decisions section for what this revoked and why.
 
 **The role claim is atomic, and it is fenced.** The claim is a directory,
 `<jobs-root>/.role-locks/<role>/`, but it is never built in place: a dispatch
@@ -484,6 +654,14 @@ survives, the job becomes `kill-failed` (**not** `killed`), keeps its role claim
 lists the survivors in `status`, and makes `--force` refuse to launch a new job
 beside it. A kill that cannot be shown to have worked is not a kill: the survivor
 may be codex, and codex that is alive is codex that is billing.
+
+**Off Windows, the tree is the process group.** `taskkill /T` walks the tree
+itself and is the tested, first-class path; elsewhere there was no tree at all —
+`killTree` signalled the two recorded pids and nothing else, so codex's own
+sandbox children outlived a cancel. The supervisor and codex are now both spawned
+detached on POSIX, which makes each of them a process-group leader, and the kill
+signals the **group** (`kill(-pgid)`) before the bare pid. The group is what a
+`/T` buys on Windows; signalling two numbers was never it.
 
 **And "still alive" includes "the OS would not say".** The liveness test is
 `process.kill(pid, 0)`, which raises `EPERM` — and the same code for Windows'
@@ -566,12 +744,17 @@ than opening nothing and claiming otherwise.
 ## Tests
 
 ```
-node --test                            # everything: 54 tests (bare form — see below)
+node --test                            # everything: 70 tests (bare form — see below)
 node --test tests/dispatch.test.mjs    # lifecycle, against a fake codex
 node --test tests/packaging.test.mjs   # manifests, command frontmatter, no-hooks invariant
-node --test tests/resolution.test.mjs  # binary resolution, sight-probe targeting, blind scan, id whitelist (imported, not spawned)
+node --test tests/resolution.test.mjs  # binary resolution, sight-probe targeting, blind scan, whitelists, deliverability (imported, not spawned)
 node tests/live-smoke.mjs              # one real cheap dispatch; skips loudly if codex absent/logged out
 ```
+
+One of the 70 is skipped on Windows and runs on POSIX: the process-group kill has
+no Windows analogue to assert (`taskkill /T` is the path there), so the *choice* of
+targets is unit-tested on both platforms via `killPlan` and the kill itself is
+integration-tested only where it applies.
 
 **Invocation quirk:** `node --test tests/` fails on Node 24 — the directory
 path is resolved as a module (`Cannot find module ...\tests`). Use the bare
@@ -589,7 +772,11 @@ that read this repo's source does — same stream, different line shape — so t
 false positive that cost the first end-to-end run has a regression test;
 `FAKE_CODEX_SANDBOX_BROKEN=1` fails the sandbox probe with an error string that
 **matches no known signature**; `FAKE_CODEX_SANDBOX_UNAVAILABLE=1` is a codex too
-old to have the subcommand.
+old to have the subcommand; `FAKE_CODEX_SANDBOX_ARGV_ECHO=1` is the stand-in that
+**reads nothing and echoes its own argv**, exiting 0 — the shape that beat the
+first-line token; `FAKE_CODEX_SANDBOX_ANSI=1` fails with an error carrying terminal
+control sequences and a forged `JOB FINISHED` banner, aimed at the record and at
+the watcher's console.
 
 The suite covers: job-dir uniqueness, refuse-then-force on same-role double
 dispatch, two concurrent same-role dispatches where exactly one wins the claim and
@@ -619,6 +806,38 @@ reporting a window that failed to open, traversal-shaped ids and roles being
 refused, and the shipped defaults landing in `job.json` as the budget pair while
 `--model`/`--effort` still override them — the last of those is a cost guard, not
 a preference, so it is asserted rather than assumed.
+
+The 0.4.0 additions are the review's findings turned into assertions, and seven of
+the eight lifecycle ones were confirmed to **fail against 0.3.0** before the fixes
+landed (the eighth pins an ordering that was already right):
+
+- **the deliverability matrix** — one record per shape (unstamped with no sight,
+  unstamped `unproven`, unstamped `job-nonce`, stamped with no sight, stamped
+  `job-nonce`, stamped and proven, stamped with a recorded opt-in, the *forged*
+  opt-in whose label says accepted but whose record carries no boolean, and a
+  stamped record with a nonzero exit). Each asserts which deliver, that every
+  refusal produces **zero stdout**, that the refusal names its reason, and that no
+  refusal ever claims a caller consented;
+- **`--allow-unproven-sight` does not rescue a DISPROVEN sandbox** — the opt-in is
+  for sight that could not be established either way, never for one shown broken,
+  so the check ordering is pinned: hoisting it fails the suite;
+- **the two path-escape canaries** — a claim owner of `../<canary>` and a corrupt
+  record whose `role` is `..\..\<canary>`, each with a live bystander process and a
+  file outside the jobs root, asserting the refusal *and* that the process, the
+  directory and its contents are untouched;
+- **cancel inside the registration window** — `kill-pending` rather than `killed`,
+  the role still blocked, `--force` still refused, and both resolutions (past the
+  window, and a job that never spawned) landing on `killed`. Plus the structural
+  half: a real dispatch's record names its supervisor pid the instant dispatch
+  returns, with no polling, because there is no instant at which it does not;
+- **control bytes reach neither a record nor a banner** — a sandbox failure carrying
+  OSC/CSI sequences and a forged `JOB FINISHED`, asserting no ESC in `job.json`
+  itself, none in `status`/`list`/`result`, and that the forged line never becomes
+  the watcher's headline while its text still survives, defanged;
+- **the sight proof rejects an argv-echo stand-in** — in a cwd built as the trap
+  (the only file's first line is its own name, and the name is on the command
+  line), asserting the job fails `sandbox-blind-precheck` *and* that the echo did
+  return the old token, which bought it nothing.
 
 **Five test-only knobs live in the runtime**, each standing in for a condition
 that cannot be produced on demand in CI, on both platforms, from both shells. What
@@ -685,6 +904,16 @@ cheaper, by the precheck, and reads `failed / sandbox-blind-precheck`.)
   reachable today goes near it (job paths are generated, and the brief is never
   inlined — invariant 1), but a `--cd`, `--model` or `--effort` value containing
   `%` or `^` could still be mangled or expanded.
+- **The POSIX process-group kill is unit-tested everywhere and integration-tested
+  only on POSIX.** `killPlan` pins the targets (`[-pid, pid]` off Windows,
+  `taskkill /T /F` on it) as data, so the decision is asserted on both platforms;
+  the drill that actually kills a grandchild through the group is skipped on
+  Windows, which is where this repo's suite is run. Nothing here is verified on a
+  real POSIX box yet — say so rather than imply otherwise.
+- **A job whose supervisor is killed between `launch: 'spawning'` and its pid being
+  recorded stays `kill-pending` until the 15-second window passes.** That is the
+  safe direction — the role stays blocked, a retry resolves it — but it does mean a
+  crashed dispatch can hold a role for 15 seconds longer than it used to.
 
 ## Decisions made during the build
 
@@ -863,10 +1092,68 @@ Things the brief left open, decided here:
   differently-cased path must never silently turn the CLI into a no-op.
 - **`dispatch` prints a `bin:` line.** Which codex a job runs on is exactly the
   thing that went wrong in production; it belongs in the handle, not in a log.
-- **The supervisor records its own pid** (plus codex's) into `job.json` after
-  spawn, rather than dispatch writing the child pid — this keeps a single
-  writer after dispatch returns. Stale detection has a 15-second grace period
-  for the moment before the supervisor has registered itself.
+- **REVOKED: the supervisor used to record its own pid.** The reasoning was single
+  writership — dispatch writes, then the supervisor owns the record — and it was
+  right about writers and wrong about time. Between the spawn and that write the
+  record said `running` with nothing recorded to kill, and a `cancel` landing there
+  killed nothing, called the empty kill verified, marked the job `killed` and
+  released the role, while the supervisor went on to launch codex and a second
+  same-role dispatch became legal beside it. Two billing codexes, out of the code
+  path built to prevent exactly that. The child's pid is knowable in the parent the
+  moment `spawn` returns, so **dispatch records it before it returns**, and the
+  supervisor writes it only if it finds a record that does not already name it —
+  single writership preserved, window gone. The 15-second grace survives for
+  records this release did not write.
+- **The launch phase is written down rather than inferred.** "No supervisor pid"
+  meant two opposite things: a dispatch that has not spawned anything (safe — its
+  claim fence stops it launching if the role moves) and a supervisor that was
+  spawned and has not registered (dangerous). `launch: 'pending' | 'spawning' |
+  'spawned'` makes it a recorded fact. A kill with no target inside the dangerous
+  phase yields `kill-pending`, not `killed`; in the safe phase, killing nothing IS
+  the whole kill and the runtime says so honestly.
+- **The supervisor re-checks its record and its claim immediately before exec.**
+  Sight-proving takes a moment, and a cancel or a takeover can land in it. So the
+  last thing before the spend is a re-read: the record must still say `running`
+  (a `kill-pending` one is honoured — the supervisor marks it `killed` and releases
+  the role, which is the cancel finally landing) and the role claim must still name
+  this job (`claim-lost` otherwise, without releasing a claim that is somebody
+  else's). Same principle as the dispatch-side fence, at the other end of the same
+  gap: check where the irreversible thing happens.
+- **Deliverability is versioned, and unstamped means unvouched.** Gating `result`
+  on `state === 'done'` alone meant that installing this runtime over 0.1/0.2 job
+  dirs delivered their answers immediately, under a gate those records were never
+  written against — and a 0.2 record whose sight said `unproven` even collected the
+  "the caller opted in" caveat, a consent claim inferred from a word in a string.
+  So the record now carries `recordVersion`, written by the dispatch that ran the
+  job, and delivery requires positive evidence: the stamp, a zero exit, and either
+  proven sight or the `allowUnprovenSight` boolean that same dispatch wrote. The
+  cost is real and accepted — **old jobs stop being deliverable when you upgrade** —
+  and it is the right cost: the alternative is handing over answers whose provenance
+  this release cannot speak to. The bytes are never hidden; the refusal names the
+  reason and the `out:` path.
+- **Untrusted strings are whitelisted at the READ boundary, and derived paths are
+  proved inside the jobs root.** Both halves, because they fail differently. The
+  whitelist is what makes the promise in "Corrupt records and job ids" true — the
+  value never reaches a caller in a form that could be joined. The containment
+  assert is what survives the whitelist being loosened one day by someone who does
+  not know why it is narrow. A violation is a loud refusal plus a corrupt
+  classification (`inspectClaim` → corrupt claim; `validateRecord` → corrupt
+  record), never a best-effort attempt to do something sensible with it: a claim
+  owner that is not a job id says nothing about what is running, and acting on that
+  silence is what killed an unrelated process in review.
+- **Control bytes are stripped at the write boundary AND at every print boundary.**
+  Either alone leaves a route. Stripping only on the way out means a control byte
+  lives in the record and every future reader must remember; stripping only on the
+  way in leaves records written by older releases, or by hand, untouched. The write
+  boundary is `writeRecord` (every string field), the print boundaries are `status`,
+  `list`, `result`'s stderr, the watcher's banner and the refusal messages. The
+  banner is the reason: it is the one line here meant to be believed from across
+  the room, and an escape sequence in a `sight:` field could redraw it.
+- **The sight token is content from inside the file, matched on stdout.** See
+  "Proving sight" for the rules. The principle behind them: a proof must require
+  something the prover could not have been *handed*. The first line of a file, and
+  its name, are both things a tool that never opened it can produce — so neither can
+  be the evidence.
 - **REVOKED: `out.txt` existence used to override `job.json` state.** The original
   rule said that if the supervisor died after codex finished but before finalizing
   the record, the job should still read `done`, because the out file was the
@@ -895,8 +1182,14 @@ Things the brief left open, decided here:
   after shell quote-stripping.
 - **`result` prints the answer to stdout only; all diagnostics go to stderr**,
   so stdout is pipe-safe verbatim bytes.
-- **Non-Windows fallback** kills the supervisor and codex pids directly (no
-  process-tree walk). Windows (`taskkill /T /F`) is the tested, first-class path.
+- **REVISED: the non-Windows fallback kills the process GROUP, not two pids.** It
+  used to signal the supervisor and codex pids directly and call that a tree kill,
+  which it never was — codex's own sandbox children are its descendants, not ours,
+  and they outlived every cancel off Windows. The supervisor and codex are now
+  spawned detached there, making each a group leader, and the kill signals
+  `-pgid` before the bare pid. Windows (`taskkill /T /F`) remains the tested,
+  first-class path; `killPlan` states both choices as data so the decision is
+  asserted on either platform.
 - **Jobs root on non-Windows** falls back to `~/.local/share/codex-dispatch/jobs`.
 - **Live smoke tolerates a trailing newline** when comparing `DISPATCH-OK` —
   the transported bytes are still untouched; only the assertion trims.

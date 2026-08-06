@@ -11,15 +11,25 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
+  ACCEPTED_SIGHT,
   BLIND_SIGNATURES,
   JOB_ID_RE,
   LIVE_STATES,
+  PROVEN_SIGHT_PREFIX,
+  RECORD_VERSION,
   ROLE_RE,
   binCandidates,
+  deliverability,
+  inRegistrationWindow,
   isDesktopApp,
+  isInsideRoot,
+  jobDirFor,
+  killPlan,
   livenessFromError,
   parseArgs,
+  parseClaimOwner,
   pickProbeTarget,
+  pickProbeToken,
   scanBlindLog,
   scanBlindText,
   stripControlBytes,
@@ -222,10 +232,156 @@ test('--allow-unproven-sight parses as a flag, not as a value-taking option', ()
 });
 
 test('the states that may still own processes are the ones that block a role', () => {
-  assert.deepEqual(LIVE_STATES, ['running', 'stale', 'kill-failed']);
+  assert.deepEqual(LIVE_STATES, ['running', 'kill-pending', 'stale', 'kill-failed']);
   for (const terminal of ['done', 'failed', 'killed']) {
     assert.equal(LIVE_STATES.includes(terminal), false, `${terminal} must not block its role`);
   }
+  assert.ok(LIVE_STATES.includes('kill-pending'),
+    'a cancel that killed nothing leaves a job that may still own processes');
+});
+
+test('deliverability needs the stamp, a clean exit, and proof or a recorded opt-in', () => {
+  const done = { state: 'done', started: '2026-08-06T00:00:00.000Z', exitCode: 0 };
+  const proven = { ...done, recordVersion: RECORD_VERSION, sight: `${PROVEN_SIGHT_PREFIX}LICENSE` };
+  assert.equal(deliverability(proven).ok, true);
+  assert.equal(deliverability({ ...proven, sight: 'cwd-file:a.txt' }).ok, true);
+
+  // The stamp is what separates this release's gate from the ones before it.
+  assert.equal(deliverability({ ...proven, recordVersion: undefined }).ok, false);
+  assert.match(deliverability({ ...proven, recordVersion: undefined }).reason, /no current schema stamp/);
+  assert.equal(deliverability({ ...proven, recordVersion: RECORD_VERSION - 1 }).ok, false);
+
+  // Legacy shapes, exactly as 0.1/0.2 wrote them.
+  for (const sight of [undefined, 'unproven', 'unproven (accepted by caller)', 'job-nonce']) {
+    assert.equal(deliverability({ ...done, sight }).ok, false,
+      `an unstamped record with sight ${JSON.stringify(sight)} must not deliver`);
+  }
+
+  // Consent is a boolean this runtime wrote, never a phrase in a label.
+  assert.equal(deliverability({ ...done, recordVersion: RECORD_VERSION, sight: ACCEPTED_SIGHT }).ok, false);
+  assert.match(
+    deliverability({ ...done, recordVersion: RECORD_VERSION, sight: ACCEPTED_SIGHT }).reason,
+    /no recorded opt-in/
+  );
+  const accepted = deliverability({
+    ...done, recordVersion: RECORD_VERSION, sight: ACCEPTED_SIGHT, allowUnprovenSight: true,
+  });
+  assert.equal(accepted.ok, true);
+  assert.equal(accepted.accepted, true, 'and it is flagged so the caveat rides with the bytes');
+
+  // A weaker sight, and a dirty exit, are each disqualifying on their own.
+  assert.equal(deliverability({ ...proven, sight: 'job-nonce' }).ok, false);
+  assert.equal(deliverability({ ...proven, exitCode: 1 }).ok, false);
+  assert.equal(deliverability({ ...proven, exitCode: null }).ok, false);
+  assert.equal(deliverability({ __corrupt: true, corruptReason: 'x' }).ok, false);
+  assert.equal(deliverability(null).ok, false);
+});
+
+test('a path that leaves the jobs root is never inside it', () => {
+  const root = path.join(os.tmpdir(), 'codex-dispatch-root');
+  assert.equal(isInsideRoot(root, path.join(root, 'review-1-2')), true);
+  assert.equal(isInsideRoot(root, path.join(root, '.role-locks', 'review')), true);
+  assert.equal(isInsideRoot(root, root), false, 'the root itself is not a job inside it');
+  assert.equal(isInsideRoot(root, path.join(root, '..', 'victim')), false);
+  assert.equal(isInsideRoot(root, path.join(root, 'a', '..', '..', 'victim')), false);
+  assert.equal(isInsideRoot(root, path.resolve(os.tmpdir(), 'elsewhere')), false);
+  // A sibling whose name merely starts with the root's is outside it.
+  assert.equal(isInsideRoot(root, `${root}-evil`), false);
+
+  assert.equal(jobDirFor(root, 'review-1-2'), path.join(root, 'review-1-2'));
+  for (const bad of ['../victim', '..\\victim', 'Review-1-2', 'foo-1', '', null, undefined, 42, {}]) {
+    assert.equal(jobDirFor(root, bad), null, `${JSON.stringify(bad)} must not resolve to a job dir`);
+  }
+});
+
+test('a claim owner is whitelisted where it is READ, not where it is used', () => {
+  assert.deepEqual(parseClaimOwner('review-1786022862-31668\n'), { owner: 'review-1786022862-31668' });
+  assert.deepEqual(parseClaimOwner('   a-0-0  '), { owner: 'a-0-0' });
+  assert.deepEqual(parseClaimOwner(''), { owner: null });
+  assert.deepEqual(parseClaimOwner('\n \n'), { owner: null });
+  assert.deepEqual(parseClaimOwner(undefined), { owner: null });
+  for (const bad of ['../not-a-job-dir', '..\\..\\windows', '/etc', 'C:\\Windows', 'Review-1-2']) {
+    const parsed = parseClaimOwner(bad);
+    assert.equal(parsed.owner, null, `${bad} must never be returned as a usable owner`);
+    assert.equal(parsed.invalid, bad, 'it comes back classified as invalid instead');
+  }
+  // What it reports is printed, so it is defanged on the way out.
+  const ESC = String.fromCharCode(27);
+  assert.equal(parseClaimOwner(`${ESC}[2Jsneaky`).invalid, '[2Jsneaky');
+});
+
+test('the record fields that become paths are whitelisted, not merely typed', () => {
+  const base = { state: 'done', started: '2026-08-06T00:00:00.000Z' };
+  assert.equal(validateRecord({ ...base, role: 'review', id: 'review-1-2' }), null);
+  // Strings, all of them — and every one of them a path segment somewhere.
+  for (const role of ['../../victim', '..\\victim', 'Review', 'live-smoke', 'a b', '']) {
+    assert.match(validateRecord({ ...base, role }), /field "role" is not a role/,
+      `role ${JSON.stringify(role)} must make the record corrupt`);
+  }
+  for (const id of ['../../victim', 'Review-1-2', 'foo-1']) {
+    assert.match(validateRecord({ ...base, id }), /field "id" is not a job id/);
+  }
+  assert.match(validateRecord({ ...base, role: 5 }), /field "role" is not a string/,
+    'the type check still runs first, and still names the type');
+  assert.equal(validateRecord({ ...base, recordVersion: 1 }), null);
+  assert.match(validateRecord({ ...base, recordVersion: '1' }), /field "recordVersion" is not a number/);
+  assert.equal(validateRecord({ ...base, launch: 'spawning' }), null);
+});
+
+test('the sight token comes from inside the file, never from its first line or its name', () => {
+  // The weakness this closes: a token taken from the first line is the part a
+  // stand-in that never opened the file is most likely to be able to produce —
+  // a header, or the file's own name echoed back off the command line.
+  assert.equal(pickProbeToken('first line here\nsecond line of content\n', 'a.txt'),
+    'second line of content');
+  assert.equal(pickProbeToken('only one line, quite a long one', 'a.txt'), null,
+    'a one-line file yields nothing: line 0 is never the token');
+  assert.equal(pickProbeToken('header\nshort\n', 'a.txt'), null, 'too short to be content');
+  assert.equal(pickProbeToken('header\nname-echo.txt\nreal content on this line\n', 'name-echo.txt'),
+    'real content on this line', 'a line that merely echoes the file name is skipped');
+  assert.equal(pickProbeToken('header\ncafé and other non-ascii text\nplain ascii content here\n', 'a.txt'),
+    'plain ascii content here', 'non-ASCII lines cannot survive a console codepage, so they are skipped');
+  assert.equal(pickProbeToken('h\n' + 'x'.repeat(200) + '\n', 'a.txt').length, 60, 'and it is capped');
+
+  // End to end through the file picker, on a directory that has both traps.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-token-'));
+  try {
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'a.txt\n');            // one line, and it is the name
+    fs.writeFileSync(path.join(dir, 'b.txt'), 'title\nthe content of b lives here\nmore\n');
+    const picked = pickProbeTarget(dir);
+    assert.equal(picked.name, 'b.txt', 'a file with no usable token is passed over');
+    assert.equal(picked.token, 'the content of b lives here');
+    assert.equal(picked.token.includes(picked.name), false, 'the token cannot echo the name');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a tree kill reaches the process group off Windows, and taskkill on it', () => {
+  assert.deepEqual(killPlan(4242, true), { tool: 'taskkill', args: ['/PID', '4242', '/T', '/F'] });
+  const posix = killPlan(4242, false);
+  assert.equal(posix.tool, undefined, 'there is no taskkill off Windows');
+  assert.deepEqual(posix.signals, [-4242, 4242],
+    'the GROUP comes first: codex\'s own children are in it, and a bare pid never reached them');
+});
+
+test('the registration window is a recorded phase, not a missing field', () => {
+  const now = Date.parse('2026-08-06T00:00:10.000Z');
+  const started = '2026-08-06T00:00:00.000Z';
+  // A supervisor was spawned and has not registered: nothing may call it dead.
+  assert.equal(inRegistrationWindow({ state: 'running', started, launch: 'spawning' }, now), true);
+  // Registered: there is a target, so a kill can be verified in the usual way.
+  assert.equal(
+    inRegistrationWindow({ state: 'running', started, launch: 'spawning', supervisorPid: 42 }, now), false);
+  // Nothing was ever spawned, and the claim fence stops it launching later.
+  assert.equal(inRegistrationWindow({ state: 'running', started, launch: 'pending' }, now), false);
+  // Past the window, a supervisor that never registered provably never arrived.
+  assert.equal(inRegistrationWindow({ state: 'running', started, launch: 'spawning' },
+    now + 60000), false);
+  // A record with no phase at all predates 0.4.0: conservative reading.
+  assert.equal(inRegistrationWindow({ state: 'running', started }, now), true);
+  assert.equal(inRegistrationWindow({ __corrupt: true }, now), false);
+  assert.equal(inRegistrationWindow(null, now), false);
 });
 
 test('the job-id and role whitelists accept ours and reject the rest', () => {

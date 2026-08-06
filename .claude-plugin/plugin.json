@@ -1,6 +1,6 @@
 {
   "name": "codex-dispatch",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Long-running, background, verbatim-transport dispatches to the OpenAI Codex CLI.",
   "author": {
     "name": "kitsupanic",
