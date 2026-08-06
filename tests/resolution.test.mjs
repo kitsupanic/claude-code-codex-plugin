@@ -13,6 +13,7 @@ import path from 'node:path';
 import {
   ACCEPTED_SIGHT,
   BLIND_SIGNATURES,
+  CMD_EXPANDS,
   JOB_ID_RE,
   JOB_REASONS,
   KNOWN_LAUNCH_PHASES,
@@ -25,6 +26,7 @@ import {
   ROLE_RE,
   binCandidates,
   canonicalState,
+  cmdQuote,
   deliverability,
   descendantsOf,
   inRegistrationWindow,
@@ -196,6 +198,39 @@ test('a file name a shell would expand is never quoted, and never picked', () =>
   for (const name of ['README.md', 'a-b_c.1.txt', 'a b.txt', 'ünïcode.txt']) {
     assert.equal(PROBE_UNSAFE_NAME.test(name), false, `${name} is an ordinary name`);
   }
+});
+
+test('cmdQuote: a trailing backslash cannot eat the closing quote', () => {
+  const bs = String.fromCharCode(92);
+
+  // Untouched when nothing needs quoting — the cheap path stays cheap.
+  assert.equal(cmdQuote('gpt-5.6-luna'), 'gpt-5.6-luna');
+  assert.equal(cmdQuote('medium'), 'medium');
+
+  // The defect (Codex review, 2026-08-07): `"foo bar\"` is read by
+  // CommandLineToArgvW as an ESCAPED quote, so the argument loses its delimiter
+  // and swallows the next one — `--model "x\" --sandbox read-only` stops being
+  // two arguments. Doubling the run restores a delimiter that survives the parse.
+  assert.equal(cmdQuote(`foo bar${bs}`), `"foo bar${bs}${bs}"`);
+  assert.equal(cmdQuote(`a b${bs}${bs}`), `"a b${bs}${bs}${bs}${bs}"`);
+  // Interior backslashes are NOT doubled: only the run against the delimiter is
+  // ambiguous, and a path is mostly interior backslashes.
+  assert.equal(cmdQuote(`C:${bs}Program Files${bs}x`), `"C:${bs}Program Files${bs}x"`);
+  // Quotes are escaped before the run is measured, so what gets doubled is the
+  // run that really does precede the closing delimiter.
+  assert.equal(cmdQuote('say "hi"'), '"say ""hi"""');
+});
+
+test('cmdQuote: % is refused, because cmd.exe expands it after quote stripping', () => {
+  // No in-band escape exists: `"%PATH%"` expands exactly like `%PATH%`. A value
+  // that silently becomes something else is the blind-answer failure in another
+  // costume, so the runtime refuses rather than mangles.
+  for (const v of ['%COMSPEC%', 'gpt-5 %PATH%', 'D:\\rep%o', '%']) {
+    assert.throws(() => cmdQuote(v), /contains "%"/, `${v} must be refused, not quoted`);
+  }
+  // And the refusal is reachable from where the value actually comes from.
+  assert.equal(CMD_EXPANDS.test('%COMSPEC%'), true);
+  assert.equal(CMD_EXPANDS.test('gpt-5.6-sol'), false);
 });
 
 test('a recorded pid whose start time has moved is not that process any more', () => {

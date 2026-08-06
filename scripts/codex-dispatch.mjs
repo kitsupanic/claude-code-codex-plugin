@@ -1065,9 +1065,35 @@ const UNPROVEN_EXPLANATION =
 
 const isScript = (bin) => /\.(mjs|cjs|js)$/i.test(bin);
 
+// cmd.exe expands `%VAR%` AFTER quote stripping, so no amount of quoting on a
+// command line escapes it — `"%PATH%"` expands exactly like `%PATH%` does. There
+// is no in-band escape to reach for, which makes refusal the only honest answer:
+// a `--model %COMSPEC%` that silently becomes something else is the same shape of
+// failure as a blind answer, confident and wrong with nothing surfacing it. The
+// dispatch boundary calls this so the user gets a clean refusal; cmdQuote asserts
+// it again where the command line actually exists, on the same reasoning the jobs
+// root uses two checks — a rule enforced only at the boundary is one refactor away
+// from being enforced nowhere.
+export const CMD_EXPANDS = /%/;
+
 // Windows cmd-line quoting for shell:true spawns (codex.cmd needs a shell).
-function cmdQuote(s) {
-  return /[\s&|<>()^"]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+// Exported for the unit tests: this is argv construction, and the two defects
+// below were both invisible until the output was asserted directly.
+export function cmdQuote(s) {
+  if (CMD_EXPANDS.test(s)) {
+    throw new Error(
+      `cannot quote for cmd.exe: ${JSON.stringify(s)} contains "%", which cmd.exe expands ` +
+      'after quote stripping. Remove it (or point --cd at a path without one).'
+    );
+  }
+  if (!/[\s&|<>()^"]/.test(s)) return s;
+  // The trailing backslash run is doubled because the closing quote we are about
+  // to add is read by CommandLineToArgvW, not by cmd.exe: there `\"` is an ESCAPED
+  // quote, so `"foo bar\"` loses its delimiter and swallows whatever argument
+  // comes next. N backslashes become 2N, which the same parser reads back as N
+  // literal backslashes followed by a delimiter that survives. Quotes are escaped
+  // first, so what this sees is the run that really does precede the delimiter.
+  return `"${s.replace(/"/g, '""').replace(/(\\+)$/, '$1$1')}"`;
 }
 
 // Returns { child, viaShell }. `viaShell` matters because of what it does to the
@@ -2390,6 +2416,24 @@ function cmdDispatch(opts) {
       `dispatch: invalid --role ${JSON.stringify(role)}\n` +
       `roles must match ${ROLE_RE} (lowercase letters only), so job ids stay ${JOB_ID_RE}.`
     );
+  }
+
+  // Windows only, because only Windows builds a command line: elsewhere argv is
+  // handed to spawn as an array and nothing re-parses it. See CMD_EXPANDS for why
+  // this is a refusal rather than an escaping scheme. `%` is a legal filename
+  // character on NTFS, so a --cd carrying one is refused rather than silently
+  // pointed somewhere else — the cure is named, and it is one directory away.
+  if (WIN) {
+    for (const [flag, value] of [['--model', opts.model], ['--effort', opts.effort], ['--cd', opts.cd]]) {
+      if (value && CMD_EXPANDS.test(value)) {
+        fail(
+          `dispatch: ${flag} ${JSON.stringify(value)} contains "%", which cmd.exe expands after\n` +
+          'quote stripping — codex would be launched with something other than what you typed.\n' +
+          'There is no escape for it on a command line, so this is refused rather than mangled.\n' +
+          `Cure: a ${flag} value without "%".`
+        );
+      }
+    }
   }
   const { bin } = preflight({ quiet: true });
 

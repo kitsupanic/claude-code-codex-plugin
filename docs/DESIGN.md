@@ -521,13 +521,26 @@ than opening nothing and claiming otherwise.
   `kill-failed` refuses a launch rather than launching a duplicate, and the
   reaped-pid list still stops a number already fired at from ever being fired
   at again.
-- **Windows `shell: true` quoting is best-effort.** `codex.cmd` needs a shell, so
-  `spawnCodex`/`runCodexSync` join argv into one command line with `cmdQuote`,
-  which quotes and doubles `"` but does not escape what `cmd.exe` expands *after*
-  quote stripping — `%VAR%` in particular, and `^` in some positions. Nothing
-  reachable today goes near it (job paths are generated, and the brief is never
-  inlined — invariant 1), but a `--cd`, `--model` or `--effort` value containing
-  `%` or `^` could still be mangled or expanded.
+- **Windows `shell: true` quoting refuses what it cannot escape.** `codex.cmd`
+  needs a shell, so `spawnCodex`/`runCodexSync` join argv into one command line
+  with `cmdQuote`. Two defects lived here until 0.7.0, both found by a Codex
+  review of this file's own subject:
+  - `%` is expanded by `cmd.exe` *after* quote stripping, so `"%PATH%"` expands
+    exactly like `%PATH%` and no quoting reaches it. There is no in-band escape,
+    so it is now **refused**: `dispatch` rejects a `--model`, `--effort` or `--cd`
+    carrying one (naming the cure), and `cmdQuote` throws if one arrives anyway.
+    `%` is a legal NTFS filename character, so a `--cd` with one in it is a real
+    directory this runtime will not point at — fail-closed by construction, and
+    the cure is one directory away.
+  - a **trailing backslash** run turned `foo bar\` into `"foo bar\"`, which
+    `CommandLineToArgvW` reads as an escaped quote: the argument lost its
+    delimiter and swallowed the next one. The run against the closing delimiter
+    is now doubled, which that parser reads back as N literal backslashes and a
+    delimiter that survives. Interior backslashes are untouched.
+
+  What remains: `CODEX_DISPATCH_BIN` is documented as trusted and unchecked, so a
+  binary path containing `%` reaches `cmdQuote`'s throw rather than a clean
+  refusal — fail-closed, but it surfaces as a stack trace instead of a message.
 - **The POSIX process-group kill is unit-tested everywhere and integration-tested
   only on POSIX.** `killPlan` pins the targets (`[-pid, pid]` off Windows,
   `taskkill /T /F` on it) as data, so the decision is asserted on both platforms;

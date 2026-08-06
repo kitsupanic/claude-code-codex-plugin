@@ -3,6 +3,29 @@
 Versioning rule: **a push that changes behavior MUST bump the version** — see
 [README → Releases and versioning](../README.md#releases-and-versioning) for why.
 
+## 0.7.0
+
+Windows command-line construction, fixed — both defects found by a Codex
+dispatch reviewing this runtime's own quoting, and both reachable from
+user-supplied flag values.
+
+`cmdQuote` doubles a **trailing backslash run** before the closing quote it adds:
+`foo bar\` used to become `"foo bar\"`, which `CommandLineToArgvW` reads as an
+escaped quote, so the argument lost its delimiter and merged with the next one.
+Interior backslashes are untouched.
+
+And **`%` is refused rather than mangled**. `cmd.exe` expands `%VAR%` after quote
+stripping, so no quoting reaches it and there is no in-band escape; a
+`--model %COMSPEC%` would silently launch codex with something other than what
+was typed. `dispatch` now rejects `--model`, `--effort` and `--cd` values
+carrying `%` (naming the cure), and `cmdQuote` throws as the backstop. This is
+**behavioral**: a value that previously ran, mangled, is now a clean refusal —
+on Windows only, since elsewhere argv is passed as an array and nothing
+re-parses it. `%` is a legal NTFS filename character, so a `--cd` with one in it
+is a real directory this release will not point at.
+
+`RECORD_VERSION` does not move: 0.6.0 records remain deliverable.
+
 ## 0.6.0
 
 The post-0.5.0 review, fixed. The POSIX sight probe quotes its filename for `sh`
