@@ -2,7 +2,7 @@
 // codex-dispatch — background job runtime for verbatim Codex CLI dispatches.
 // Node 18+, zero npm dependencies, Windows-first.
 //
-// Verbs: dispatch, status, result, cancel, list, watch, preflight,
+// Verbs: dispatch, status, result, cancel, list, clean, watch, preflight,
 //        _supervise / _watch (internal)
 
 import fs from 'node:fs';
@@ -250,6 +250,30 @@ function jobsRoot() {
   if (process.env.CODEX_DISPATCH_JOBS) return process.env.CODEX_DISPATCH_JOBS;
   const base = process.env.LOCALAPPDATA || path.join(os.homedir(), '.local', 'share');
   return path.join(base, 'codex-dispatch', 'jobs');
+}
+
+// THE JOBS ROOT LANDS ON THE CMD.EXE COMMAND LINE TOO. Every job is launched
+// with `--output-last-message <jobs-root>\<id>\out.txt`, so the root is subject
+// to exactly the same refusal `--model`, `--effort` and `--cd` are — and it was
+// the one value nothing checked. `%` and `!` are legal in a Windows user name,
+// so a default root under `C:\Users\o!livia\AppData\Local\...` passed preflight,
+// passed the sight probe, claimed a role, spawned a supervisor, and only then
+// failed the job as `codex-argv-refused` — every job, for ever, with the fault
+// named nowhere near where it could be fixed. Checked where it is READ instead:
+// once in preflight, and once at dispatch before anything is claimed.
+function assertJobsRootQuotable(root) {
+  if (!WIN || !CMD_UNSAFE.test(root)) return root;
+  fail(
+    `jobs root ${JSON.stringify(clean(root))} contains one of % ! " — cmd.exe expands or re-parses\n` +
+    `these after quote stripping, and the jobs root goes onto codex's command line as\n` +
+    `--output-last-message <jobs-root>\\<job-id>\\out.txt. No escaping on a command line reaches\n` +
+    `them, so it is refused here rather than mangled later: every job under this root would fail\n` +
+    `as codex-argv-refused after claiming a role and spawning a supervisor.\n` +
+    `Cure: point CODEX_DISPATCH_JOBS at a directory whose path has none of them, e.g.\n` +
+    `  set CODEX_DISPATCH_JOBS=C:\\codex-dispatch\\jobs\n` +
+    `(The default is %LOCALAPPDATA%\\codex-dispatch\\jobs, which carries your user name.)`
+  );
+  return null; // unreachable: fail() exits
 }
 
 const outPath = (dir) => path.join(dir, 'out.txt');
@@ -1540,6 +1564,11 @@ function sightProbe(bin, cwd, jobDir) {
 // Returns { bin } or exits loudly. With CODEX_DISPATCH_BIN set the checks are
 // skipped: the override is trusted (that is its point, for tests and stand-ins).
 function preflight({ quiet } = {}) {
+  // Before anything else, including the override below: a jobs root that cannot
+  // survive a cmd.exe command line breaks every job this install will ever run,
+  // and preflight is where an install-level fault belongs. It is checked at
+  // dispatch too, because that is where the value is read for a launch.
+  assertJobsRootQuotable(jobsRoot());
   // TEST HOOK: the pin below is the whole of preflight when it is set, so every
   // check this function exists to make — version, auth, the sandbox probe and the
   // three warnings hanging off it — has never once executed under test. This
@@ -1909,7 +1938,14 @@ function claimRole(root, role, jobId, { force } = {}) {
     if (claim.status === 'conflict') {
       if (!force) return { ok: false, message: conflictMessage(claim.job, claim.state, role) };
       const killed = killJob(claim.job);
-      if (!killed.ok) {
+      // A JOB THAT FINISHED IS NOT A CONFLICT. It reached its own verdict while
+      // the force was deciding, so there is nothing to kill and nothing to
+      // refuse: the role is releasable by ROLE_RELEASE_STATES' own definition,
+      // and the reclaim below takes it. The one thing that must not happen is
+      // this force reporting a kill it never made.
+      if (killed.terminal) {
+        console.log(`previous job finished on its own: ${claim.job.id} (${killed.terminal}) — nothing was killed`);
+      } else if (!killed.ok) {
         return {
           ok: false,
           message: killed.unrecorded
@@ -1920,8 +1956,9 @@ function claimRole(root, role, jobId, { force } = {}) {
               ? killPendingMessage(claim.job, role)
               : killFailedMessage(claim.job, killed),
         };
+      } else {
+        console.log(`killed previous job: ${claim.job.id} (was ${claim.state})`);
       }
-      console.log(`killed previous job: ${claim.job.id} (was ${claim.state})`);
     }
     // A reclaimable-but-unvouched-for owner gets the same verified-kill discipline
     // as a stale one. "The record is unreadable" is not "the processes are gone",
@@ -2408,9 +2445,25 @@ export function inRegistrationWindow(record, now = Date.now()) {
   return killWindow(record, now) !== 'none';
 }
 
+// THE PRECONDITION EVERY RECORD WRITE IN THE KILL SEAM CARRIES: the state must
+// still be one this runtime treats as LIVE. `stale` is in LIVE_STATES and is a
+// derived reading of a record that says `running`, so it never comes back from
+// `canonicalState` — which is exactly why the check is stated against the
+// canonical state rather than against `effectiveState`: this is about what the
+// record SAYS, evaluated inside the lock, not about what a pid probe concluded a
+// moment ago.
+export function stillCancellable(record) {
+  return !isCorrupt(record) && LIVE_STATES.includes(canonicalState(record));
+}
+
 // Returns { ok, survivors, targets }. A kill that cannot be shown to have worked
 // is NOT a kill: the job goes to `kill-failed`, keeps its role claim, and keeps
 // blocking dispatch — because whatever survived may still be codex, still billing.
+//
+// `terminal: <state>` is the other non-ok answer: the record reached a verdict of
+// its own — `done`, `failed`, a `killed` somebody else landed — before this kill
+// could be written down. Nothing is overwritten, because a job that finished is
+// not a job this cancel killed; the caller reports the state that is really there.
 function killJob(job) {
   // THE CALLER'S SNAPSHOT IS NOT THE RECORD. `job.record` was read at `getJob`
   // time, and everything between there and here is slow: `effectiveState` and the
@@ -2476,7 +2529,33 @@ function killJob(job) {
       sleepSync(Number(process.env.CODEX_DISPATCH_TEST_KILL_PAUSE_MS));
     }
     const after = readRecord(job.dir);
-    if (launchPhase(after) === launchPhase(r) && String(gather(after)) === String(written)) break;
+    // THE STATE IS PART OF "IT MOVED". This compared the phase and the pid list
+    // only, so a record whose STATE went from `running` to a terminal verdict in
+    // the gap looked unchanged, and the decision below was then made on the
+    // pre-pause snapshot: a supervisor that had just written `done` was killed
+    // and the answer it produced was overwritten with `killed`.
+    if (canonicalState(after) === canonicalState(r) &&
+        launchPhase(after) === launchPhase(r) &&
+        String(gather(after)) === String(written)) break;
+  }
+  // THE VERDICT MAY ALREADY HAVE BEEN REACHED, and it is not this cancel's to
+  // overwrite. The re-read loop above watched the launch PHASE and the pid list
+  // move; the STATE can move in the same gap and used to be invisible here — the
+  // supervisor lands `done` or `failed(sight-unproven)` while this process is in
+  // a shell asking about pid start times, and killJob then killed a supervisor
+  // that was already exiting and wrote `killed` over the answer it had just
+  // finished producing. `killed(sight-unproven)` is a state/reason pair this
+  // repo documents as impossible; a destroyed `done` is a deliverable answer
+  // thrown away by a cancel that killed nothing that was alive.
+  //
+  // Bailing here is the cheap half — it stops the kill as well as the write.
+  // The preconditions below are the half that actually holds, because the
+  // verdict can equally land after this line. A corrupt record is deliberately
+  // NOT terminal: it says nothing about what is alive, so it keeps the old path
+  // (its pid files are still reaped, and `updateRecordOutcome` refuses to
+  // rewrite it anyway).
+  if (!isCorrupt(r) && !stillCancellable(r)) {
+    return { ok: false, terminal: canonicalState(r), survivors: [], targets: [] };
   }
   const reissued = written.filter((pid) => !unique.includes(pid));
   if (reissued.length) {
@@ -2486,6 +2565,30 @@ function killJob(job) {
       `else and have NOT been\nsignalled; whatever this job ran is already gone.\n`
     );
   }
+  // Every write below is a COMPARE-AND-SWAP on "the state is still live", the
+  // same `expect` mechanism the supervisor's exit handler, the exec-spawning
+  // mark and dispatch's post-spawn write already use. A write that loses it did
+  // not lose data: it found a verdict, and the verdict is the answer.
+  //
+  // THE STATE REPORTED IS THE ONE THAT BEAT THE SWAP, read INSIDE the lock and
+  // handed back by `updateRecordOutcome`. Re-reading the record here instead
+  // would report a third state — whatever the file says by the time this line
+  // runs — which is a different claim from "this is what my write lost to", and
+  // in the corner where that re-read came back corrupt it would have told
+  // `claimRole` a job had finished on its own when nothing had vouched for it,
+  // skipping the reap discipline a corrupt owner is owed. `current` is never
+  // corrupt: `updateRecordOutcome` answers `why: 'corrupt'` before it ever
+  // evaluates a precondition, so the states reachable here are exactly the
+  // known, non-live ones — done, failed, killed.
+  const lostToVerdict = (outcome) => {
+    if (outcome.ok || outcome.why !== 'precondition') return null;
+    return canonicalState(outcome.current);
+  };
+  const markPending = () => {
+    const marked = updateRecordOutcome(job.dir, { state: 'kill-pending' }, { expect: stillCancellable });
+    const verdict = lostToVerdict(marked);
+    return verdict ? { ok: false, terminal: verdict, survivors: [], targets: [] } : null;
+  };
   const window = killWindow(r, Date.now(), {
     supervisorDead:
       !isCorrupt(r) && Boolean(r.supervisorPid) &&
@@ -2499,7 +2602,8 @@ function killJob(job) {
   // cancellable, and the supervisor lands the cancel the moment it has registered
   // the pids (it re-reads the record there, kills codex itself, and verifies).
   if (window === 'exec') {
-    updateRecord(job.dir, { state: 'kill-pending' });
+    const lost = markPending();
+    if (lost) return lost;
     return { ok: false, pending: true, survivors: [], targets: [], window };
   }
   // Nothing to kill AND nothing has registered yet: report, do not declare. The
@@ -2507,7 +2611,8 @@ function killJob(job) {
   // claim is NOT released, and the caller is told to retry — because the thing
   // this would otherwise have called dead is a supervisor that is still starting.
   if (!unique.length && window !== 'none') {
-    updateRecord(job.dir, { state: 'kill-pending' });
+    const lost = markPending();
+    if (lost) return lost;
     return { ok: false, pending: true, survivors: [], targets: [], window };
   }
   const killed = killPids(unique);
@@ -2521,11 +2626,23 @@ function killJob(job) {
   if (survivors.length) {
     // The pid files stay loaded on purpose: those processes are demonstrably still
     // alive, so the numbers are still theirs and still need firing at.
-    updateRecord(job.dir, {
+    const marked = updateRecordOutcome(job.dir, {
       state: 'kill-failed',
       finished,
       killSurvivors: survivors.join(', '),
-    });
+    }, { expect: stillCancellable });
+    const verdict = lostToVerdict(marked);
+    if (verdict) {
+      // A survivor outranks the bookkeeping: the verdict is left exactly as its
+      // writer left it, and the pids that outlived the kill are still reported,
+      // because one of them may be codex and codex that is alive is billing.
+      process.stderr.write(
+        `WARNING: job ${clean(job.id)} — pids ${survivors.join(', ')} survived the kill, but the record\n` +
+        `had already reached "${clean(verdict)}". That verdict has NOT been overwritten, so this job\n` +
+        `does not read kill-failed even though something is still alive. Kill them yourself:\n` +
+        `taskkill /PID <pid> /T /F\n`
+      );
+    }
     return { ok: false, survivors, targets: unique };
   }
   const spent = consumePidFiles(job.dir, unique);
@@ -2538,7 +2655,13 @@ function killJob(job) {
     finished,
     killSurvivors: undefined,
     warning: [priorWarning, renameWarning].filter(Boolean).join('; ') || undefined,
-  });
+  }, { expect: stillCancellable });
+  const verdict = lostToVerdict(recorded);
+  if (verdict) {
+    // The job finished under us. Nothing is rewritten and the role is NOT
+    // released — whoever wrote that verdict owns both decisions.
+    return { ok: false, terminal: verdict, survivors: [], targets: unique };
+  }
   // A KILL THAT COULD NOT BE WRITTEN DOWN IS NOT A KILL THAT HAPPENED, as far as
   // anything reading this job afterwards is concerned. Swallowing the failed write
   // and returning ok is the same shape of defect as every other one here: the
@@ -2623,6 +2746,20 @@ function reapFailedMessage(role, claim, reaped) {
   );
 }
 
+function uncontainedJobMessage(role, conflict) {
+  return (
+    `dispatch: REFUSING to launch — an entry in the jobs root carries the "${role}" role's name and is\n` +
+    `not a job directory this runtime created.\n` +
+    `entry: ${clean(conflict.dir)}\n` +
+    `why: ${clean(conflict.record.corruptReason)}\n` +
+    `A directory junction or symlink named like a job id redirects every read, kill, rename and\n` +
+    `removal at whatever it points at, and Windows needs no elevation to create one. So nothing has\n` +
+    `been read through it — not its record, not its pid files — which also means nothing here can\n` +
+    `prove the role is free. It stays blocked.\n` +
+    `Look at that entry yourself and remove or rename it, or dispatch under another --role.`
+  );
+}
+
 function killFailedMessage(job, killed) {
   return (
     `dispatch: REFUSING to launch — the previous "${clean(job.record.role)}" job could not be killed.\n` +
@@ -2659,6 +2796,16 @@ export function roleOfJob(job) {
 function findRoleConflict(role) {
   for (const j of allJobs()) {
     if (roleOfJob(j) !== role) continue;
+    // CONTAINMENT BEFORE THE FIRST READ, not only before the first kill. A
+    // junction named like a job id is classified corrupt by `allJobs` precisely
+    // so that "nothing was read through it" — and then this scan read its pid
+    // files and its record to decide whether it was dead, following the link and
+    // probing whatever numbers it found on the other side. `assertInsideRoot`
+    // stopped the reap later, which is a gate on the write boundary; the read
+    // boundary needs its own. Such an entry cannot be proved dead, so it blocks
+    // its role and says so, which is the same fail-closed answer a genuinely
+    // corrupt-but-contained job gets.
+    if (!j.contained) return { ...j, state: 'corrupt', unvouched: true, uncontained: true };
     const s = effectiveState(j);
     if (s === 'corrupt') {
       // Proven dead = it has no un-reaped pid file still naming a live process.
@@ -2731,6 +2878,11 @@ function cmdDispatch(opts) {
   // in NTFS filenames, so a cwd carrying one is a real directory this runtime will
   // not point at — the cure is named, and it is one directory away.
   if (WIN) {
+    // The jobs root is on that same command line (`--output-last-message`), and
+    // it is checked HERE — before preflight, before the claim, before the job
+    // dir — because the alternative is a refusal that arrives once per job,
+    // after a role has been taken and a supervisor spawned.
+    assertJobsRootQuotable(jobsRoot());
     for (const [flag, value] of [['--model', model], ['--effort', effort], ['--cd', cwd]]) {
       if (value && CMD_UNSAFE.test(value)) {
         fail(
@@ -2755,6 +2907,12 @@ function cmdDispatch(opts) {
   // claim to be running, and it cannot claim not to be either.
   const conflict = findRoleConflict(role);
   if (conflict) {
+    if (conflict.uncontained) {
+      // Nothing has been read through it and nothing will be: this entry is a
+      // link, or resolves outside the jobs root, and it carries the role's name.
+      // It cannot be proved dead without reading it, so the role stays blocked.
+      fail(uncontainedJobMessage(role, conflict));
+    }
     if (conflict.unvouched) {
       // A corrupt record cannot be marked killed — it is evidence and stays
       // byte-for-byte — so the discipline is the claim side's: reap its pid files,
@@ -2773,7 +2931,12 @@ function cmdDispatch(opts) {
     } else {
       if (!opts.force) fail(conflictMessage(conflict, conflict.state, role));
       const killed = killJob(conflict);
-      if (!killed.ok) {
+      // Terminal under the force: that job finished on its own, so there is
+      // nothing to kill, nothing to refuse, and — above all — nothing of its
+      // verdict to overwrite. The claim below is taken the ordinary way.
+      if (killed.terminal) {
+        console.log(`previous job finished on its own: ${conflict.id} (${killed.terminal}) — nothing was killed`);
+      } else if (!killed.ok) {
         if (killed.unrecorded) {
           fail(
             `dispatch: REFUSING to launch — the previous "${role}" job was killed, but that could not\n` +
@@ -2783,8 +2946,9 @@ function cmdDispatch(opts) {
           );
         }
         fail(killed.pending ? killPendingMessage(conflict, role) : killFailedMessage(conflict, killed));
+      } else {
+        console.log(`killed previous job: ${conflict.id} (was ${conflict.state})`);
       }
-      console.log(`killed previous job: ${conflict.id} (was ${conflict.state})`);
     }
   }
 
@@ -3662,6 +3826,14 @@ function cmdCancel(id) {
     return;
   }
   const killed = killJob(job);
+  if (killed.terminal) {
+    // It finished between the state read above and the write below — its own
+    // verdict, left exactly as written. Reported the way cancelling any other
+    // finished job is reported, because that is what this is.
+    console.log(`job ${id} is already ${killed.terminal}, nothing to kill`);
+    console.log(`out: ${outPath(job.dir)}`);
+    return;
+  }
   if (killed.unrecorded) {
     console.log(`out: ${outPath(job.dir)}`);
     process.stderr.write(
@@ -3722,12 +3894,216 @@ function cmdList() {
   }
 }
 
+// ---------------------------------------------------------------------- clean
+//
+// NOTHING HAS EVER REMOVED A JOB DIRECTORY. Every dispatch leaves one behind for
+// ever — a prompt, a run.log that can be megabytes, an answer file — and the
+// jobs root grows without bound until somebody deletes it by hand, which is the
+// one operation this runtime spends the most care making unsafe to do by hand.
+//
+// So: a MANUAL verb, never an automatic prune. A record is the only account of
+// what a job did, and deciding on the operator's behalf that an account has
+// expired is not a decision a background sweep gets to make. `clean` removes
+// only what the caller asks it to remove, and it asks for the ask explicitly:
+// with neither `--all` nor `--older-than <days>` it refuses rather than picking
+// a default that deletes something.
+//
+// WHAT IS ELIGIBLE is the runtime's existing notion of "everything this job
+// owned is gone" — ROLE_RELEASE_STATES, the same set the supervisor is allowed
+// to release a role on. `done`, `failed`, `killed`, and nothing else:
+//   - every LIVE state (running, kill-pending, stale, kill-failed, unknown) may
+//     still own processes. Removing the directory of a job that owns a codex
+//     removes the pid files that are the only way left to kill it.
+//   - `corrupt` is EVIDENCE. This runtime refuses to rewrite a corrupt record
+//     anywhere else (DECISIONS.md, "Corrupt records are contained, not
+//     repaired"); deleting one in bulk is the same claim with a bigger hammer.
+//   - `kill-failed` and `unknown` are deliberately NOT reachable by a flag.
+//     They are live by definition, and a `--force` that deleted them would be a
+//     flag whose meaning is "ignore the taxonomy". Cancel them until they are
+//     terminal, and then clean them.
+const DAY_MS = 86400000;
+
+function cmdClean(opts) {
+  const root = jobsRoot();
+  const all = Boolean(opts.all);
+  const days = opts.olderThan === undefined ? null : Number(opts.olderThan);
+  if (!all && days === null) {
+    fail(
+      'clean: say what to remove — nothing is removed by default.\n' +
+      '  clean --all                 every job in a terminal state (done, failed, killed)\n' +
+      '  clean --older-than <days>   the terminal ones that finished more than <days> days ago\n' +
+      'Jobs that may still own processes (running, kill-pending, stale, kill-failed, unknown) and\n' +
+      'jobs whose job.json is corrupt are never removed by either: the first may still be billing,\n' +
+      'and the second is the only evidence of how it broke.'
+    );
+  }
+  if (days !== null && (!Number.isFinite(days) || days < 0)) {
+    fail(`clean: --older-than ${JSON.stringify(String(opts.olderThan))} is not a number of days.`);
+  }
+  const cutoff = days === null ? null : Date.now() - days * DAY_MS;
+
+  const removed = [];
+  const kept = [];
+  const failures = [];
+  for (const job of allJobs()) {
+    // A link named like a job id is not a job directory, and this verb is the
+    // one that REMOVES things — so the classification `allJobs` already made is
+    // honoured before anything else is read or resolved.
+    if (!job.contained) {
+      kept.push(`${job.id}  refused: not a job directory this runtime created (${clean(job.record.corruptReason)})`);
+      continue;
+    }
+    const state = effectiveState(job);
+    if (!ROLE_RELEASE_STATES.includes(state)) {
+      kept.push(`${job.id}  ${state}`);
+      continue;
+    }
+    const when = Date.parse(job.record.finished || job.record.started);
+    if (cutoff !== null && !(Number.isFinite(when) && when < cutoff)) {
+      kept.push(`${job.id}  ${state}, ${Number.isFinite(when) ? `${humanDuration(Date.now() - when)} old` : 'no usable timestamp'}`);
+      continue;
+    }
+    // The whitelist and the containment assert, separately, exactly as every
+    // other path-taking operation in this runtime does them: the id must be one
+    // this runtime could have generated, AND the directory it resolves to must
+    // be provably inside the real jobs root before anything is removed.
+    const dir = jobDirFor(root, job.id);
+    if (!dir || dir !== job.dir) {
+      kept.push(`${job.id}  refused: the directory name is not a job id this runtime could have generated`);
+      continue;
+    }
+    assertInsideRoot(root, dir, 'remove a job directory');
+    // Under the record lock, and re-decided inside it: the state read above is a
+    // read from outside, and this is a removal. The same compare-and-swap
+    // discipline every other terminal decision here uses, with the removal in
+    // place of the write.
+    const held = withRecordLock(dir, () => {
+      const current = readRecord(dir);
+      if (isCorrupt(current) || !ROLE_RELEASE_STATES.includes(canonicalState(current))) {
+        return { removed: false, why: 'changed under the lock — not removed' };
+      }
+      try {
+        removeJobDir(dir);
+        return { removed: true };
+      } catch (err) {
+        // ONE STUCK FILE MUST NOT END THE RUN. A handle held on `run.log` (a
+        // watcher, an editor, an antivirus scan) makes a removal fail on
+        // Windows, and an uncaught throw out of here would abort the whole
+        // clean at whichever job happened to be first.
+        return { removed: false, failed: true, why: `could not be removed: ${clean(err.code || err.message)}` };
+      }
+    });
+    const outcome = held.locked
+      ? held.value
+      : { removed: false, why: 'its record could not be locked — not removed' };
+    if (outcome.removed) {
+      removed.push(job.id);
+    } else {
+      kept.push(`${job.id}  ${outcome.why}`);
+      if (outcome.failed) failures.push(`${job.id}: ${outcome.why}`);
+    }
+  }
+
+  if (!removed.length && !kept.length) return console.log(`no jobs in ${root}`);
+  for (const id of removed) console.log(`removed: ${id}`);
+  if (kept.length) {
+    console.log(kept.length === 1 ? 'kept 1 job:' : `kept ${kept.length} jobs:`);
+    for (const line of kept) console.log(`  ${line}`);
+  }
+  console.log(`removed ${removed.length} of ${removed.length + kept.length} in ${root}`);
+  if (failures.length) {
+    process.stderr.write(
+      `WARNING: ${failures.length} job director${failures.length === 1 ? 'y' : 'ies'} could not be removed:\n` +
+      failures.map((f) => `  ${f}\n`).join('') +
+      `Something is holding a file open (a watcher window, an editor, a virus scanner). Each of them\n` +
+      `still has its job.json, so it still lists, still reads as finished, and a later clean will take\n` +
+      `it. Nothing was left half-removed and invisible.\n`
+    );
+  }
+}
+
+// A job directory is dismantled with its RECORD LAST, because `job.json` is what
+// makes the directory visible at all: `allJobs` skips an entry without one, so a
+// removal that died partway with the record already gone would leave a directory
+// that `list`, `status` and `clean` itself can never see again — undeletable by
+// this runtime and invisible to the operator. Removing the contents first and the
+// record last means a failure anywhere leaves a job that still lists, still reads
+// as finished, and can simply be cleaned again.
+//
+// `job.json.lock` is skipped in the loop for the same reason from the other end:
+// this process is holding it, and removing it while the record is still there
+// would let another writer take the lock mid-removal. The final recursive rm
+// takes it, once there is no longer a record to write.
+//
+// `recursive` unlinks a link rather than following it, and the caller has already
+// proved this path is inside the real jobs root, so neither half can walk out.
+function removeJobDir(dir) {
+  for (const name of fs.readdirSync(dir)) {
+    if (name === 'job.json' || name === RECORD_LOCK) continue;
+    fs.rmSync(path.join(dir, name), { recursive: true, force: true });
+  }
+  fs.rmSync(recordPath(dir), { force: true });
+  fs.rmSync(dir, { recursive: true, force: true });
+}
+
 // ---------------------------------------------------------------------- watch
 //
 // Watching is a HUMAN affordance: a detached console window that follows the run
 // and then shouts, for the operator who has been burned by dropped wake-up
 // notifications four times in one day and does not trust a silent terminal.
 // Agents must never watch — they poll `result`.
+
+// The watcher window's command line, as data, because every defect in argv
+// construction here is invisible until the output is asserted directly.
+//
+// `start` gives the watcher its own console window; `cmd /k` keeps that window
+// open after the banner so the news survives the process that delivered it. The
+// node in the middle used to be the literal string `node` — the only spawn in
+// this runtime that did not go through `process.execPath`. On a machine where
+// node is not on the INTERACTIVE path (a nvm shim, a portable install, a PATH
+// that a parent process trimmed) the window opened, printed "'node' is not
+// recognized", and `watch` reported success: a claim made instead of a fact
+// checked, in the affordance that exists because notifications get dropped.
+//
+// Everything on this line is quoted with `cmdQuote`, which REFUSES `% ! "`
+// rather than escaping them — so an execPath or a runtime path carrying one is a
+// loud refusal naming the fault, not a window that silently runs something else.
+//
+// AND THE TAIL AFTER /K NEEDS ONE MORE PAIR OF QUOTES THAN LOOKS RIGHT, which is
+// the defect the first version of this shipped with (review, 2026-08-07,
+// reproduced). `cmd /k <tail>` does not parse the tail as an argv: with no /S it
+// preserves the quotes only when the tail contains EXACTLY TWO of them, and
+// otherwise falls back to "strip the first character if it is a quote, and strip
+// the last quote on the line". Quote both the node path and the runtime path —
+// which is every install under `C:\Program Files\nodejs` whose plugin also lives
+// under a path with a space — and the tail has four, so cmd stripped the opening
+// quote of the node path and the closing quote of the script path and ran
+// `C:\Program`. A window that opens saying "'C:\Program' is not recognized"
+// while `watch` prints `watching:` is the same false success the literal `node`
+// produced, in a narrower population.
+//
+// So the whole command is built as ONE string, quoted by `cmdQuote` token by
+// token, and handed to `cmd /s /k` wrapped in an outer pair. `/s` makes that
+// second rule unconditional: cmd strips exactly the outer pair and runs what is
+// left verbatim, whatever the inner quoting looks like. Verified end to end on
+// Windows for all four combinations of (node path quoted / not) × (runtime path
+// quoted / not), and the executing test below is what keeps it verified — the
+// broken version passed an argv-shape assertion perfectly.
+export function watchLaunchArgs(id, { title = `codex-dispatch ${id}`, node = process.execPath, self = SELF } = {}) {
+  const inner = [node, self, '_watch', id].map(cmdQuote).join(' ');
+  return ['/c', 'start', cmdQuote(title), 'cmd', '/s', '/k', `"${inner}"`];
+}
+
+function watchFailMessage(id, dir, detail) {
+  return (
+    `watch: FAILED to open a watcher console window for ${id}.\n` +
+    `${detail}\n` +
+    `The job itself is unaffected — nothing about it depends on being watched.\n` +
+    `Follow it here instead:\n` +
+    `  node "${SELF}" status ${id}\n` +
+    `out: ${outPath(dir)}`
+  );
+}
 
 function cmdWatch(id, { fromDispatch } = {}) {
   const job = getJob(id);
@@ -3742,12 +4118,27 @@ function cmdWatch(id, { fromDispatch } = {}) {
     fail(msg);
   }
   const title = `codex-dispatch ${id}`;
-  // `start` gives the watcher its own console window; `cmd /k` keeps that window
-  // open after the banner so the news survives the process that delivered it.
   const launcher = process.env.CODEX_DISPATCH_TEST_WATCH_BIN || 'cmd';
-  const child = spawn(launcher, ['/c', 'start', title, 'cmd', '/k', 'node', SELF, '_watch', id], {
+  let args;
+  try {
+    args = watchLaunchArgs(id, { title });
+  } catch (err) {
+    // Fail closed exactly as the WIN gate does: a value that cannot survive a
+    // cmd.exe command line is refused, never mangled. Reported through the same
+    // channel a launcher failure is, so `dispatch --watch` does not turn a
+    // running job into a failed dispatch over a window.
+    const msg = watchFailMessage(id, job.dir, `the watcher command line cannot be built: ${clean(err.message)}`);
+    if (fromDispatch) { process.stderr.write(msg + '\n'); return; }
+    fail(msg);
+  }
+  // Verbatim: the arguments below are already quoted for cmd.exe by `cmdQuote`,
+  // and letting libuv quote them again would put backslash-escaped quotes on a
+  // line cmd.exe parses by quote parity — two conventions that disagree (see
+  // CMD_UNSAFE). One quoting pass, by the function this runtime already uses.
+  const child = spawn(launcher, args, {
     detached: true,
     stdio: 'ignore',
+    windowsVerbatimArguments: true,
   });
 
   // A detached spawn that fails is silent: no window opens and the caller is told
@@ -3770,13 +4161,7 @@ function cmdWatch(id, { fromDispatch } = {}) {
     if (settled) return;
     settled = true;
     clearTimeout(timer);
-    const msg =
-      `watch: FAILED to open a watcher console window for ${id}.\n` +
-      `${detail}\n` +
-      `The job itself is unaffected — nothing about it depends on being watched.\n` +
-      `Follow it here instead:\n` +
-      `  node "${SELF}" status ${id}\n` +
-      `out: ${outPath(job.dir)}`;
+    const msg = watchFailMessage(id, job.dir, detail);
     // From `dispatch --watch` the job is already launched and its handle already
     // printed; a window that would not open must not turn that into a failure.
     if (fromDispatch) { process.stderr.write(msg + '\n'); return; }
@@ -3975,7 +4360,7 @@ function watchNextStep(state, r, id) {
 
 // ----------------------------------------------------------------------- main
 
-const BOOL_FLAGS = new Set(['write', 'force', 'watch', 'allow-unproven-sight']);
+const BOOL_FLAGS = new Set(['write', 'force', 'watch', 'allow-unproven-sight', 'all']);
 const camelCase = (s) => s.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
 
 export function parseArgs(argv) {
@@ -4015,6 +4400,7 @@ function run() {
     case 'result': cmdResult(opts._[0]); break;
     case 'cancel': cmdCancel(opts._[0]); break;
     case 'list': cmdList(); break;
+    case 'clean': cmdClean(opts); break;
     case 'watch': cmdWatch(opts._[0]); break;
     case 'preflight': preflight(); break;
     case '_supervise': cmdSupervise(opts._[0]); break;
@@ -4028,6 +4414,7 @@ function run() {
         '  result <job-id>\n' +
         '  cancel <job-id>\n' +
         '  list\n' +
+        '  clean --all | --older-than <days>\n' +
         '  watch <job-id>\n' +
         '  preflight'
       );

@@ -12,7 +12,7 @@ import { fileURLToPath } from 'node:url';
 // Imported, not hard-coded: the schema stamp is the thing the delivery gate reads,
 // so a fixture that wants to be deliverable has to carry whatever this release
 // writes. Hard-coded 1s silently stopped meaning "current" the moment it moved.
-import { RECORD_VERSION } from '../scripts/codex-dispatch.mjs';
+import { RECORD_VERSION, cmdQuote, watchLaunchArgs } from '../scripts/codex-dispatch.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.join(HERE, '..');
@@ -1272,6 +1272,91 @@ test('watch reports a launcher that cannot open a window instead of claiming it 
   assert.match(brokeEarly.stderr, /exited \d+ without opening a window/);
 });
 
+test('the watcher command line RUNS — every combination of spaced and unspaced paths',
+  { skip: process.platform === 'win32' ? false : 'Windows-only: cmd.exe is what parses this line' },
+  async () => {
+    // THE TEST THAT WOULD HAVE CAUGHT IT. The first version of watchLaunchArgs
+    // passed a perfect argv-shape assertion and produced a window that printed
+    // "'C:\Program' is not recognized" whenever BOTH the node path and the plugin
+    // path needed quoting — `cmd /k` keeps quotes only when the tail has exactly
+    // two of them, and otherwise strips the first character and the last quote.
+    // Every install under `C:\Program Files\nodejs` with a plugin under a path
+    // with a space is that case, and `watch` still reported success.
+    //
+    // So this one EXECUTES the line the runtime builds, for all four
+    // combinations, headless: `/k` becomes `/c` and `start` gets `/B /WAIT`, so
+    // nothing opens a console and the assertion is that the script really ran
+    // with the arguments it was supposed to get.
+    const room = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-watchline-'));
+    let junction = null;
+    try {
+      const probe = 'import fs from "node:fs";\n' +
+        'fs.writeFileSync(process.argv[2], "RAN " + process.argv.slice(3).join("|"));\n';
+      const spacedDir = path.join(room, 'plugin dir');
+      const plainDir = path.join(room, 'plugindir');
+      fs.mkdirSync(spacedDir); fs.mkdirSync(plainDir);
+      fs.writeFileSync(path.join(spacedDir, 'runtime.mjs'), probe);
+      fs.writeFileSync(path.join(plainDir, 'runtime.mjs'), probe);
+
+      // Two node paths, one needing quoting and one not. The unspaced one is a
+      // junction to the real node directory: a hard link into Program Files needs
+      // write access there, and copying node.exe to make a test decidable is not
+      // a trade worth making.
+      const nodes = [];
+      if (process.execPath !== cmdQuote(process.execPath)) nodes.push(['quoted', process.execPath]);
+      try {
+        const dir = path.join(room, 'nodedir');
+        fs.symlinkSync(path.dirname(process.execPath), dir, 'junction');
+        junction = dir;
+        const linked = path.join(dir, path.basename(process.execPath));
+        if (linked === cmdQuote(linked)) nodes.push(['bare', linked]);
+      } catch { /* reported below */ }
+      assert.ok(nodes.length, 'SKIPPED: neither a quoted nor an unquoted node path could be produced');
+      if (nodes.length < 2) {
+        process.stderr.write(
+          'NOTE: only one of the two node-path shapes was available on this machine ' +
+          `(${nodes.map(([k]) => k).join(', ')}); the other half of the matrix was not exercised.\n`
+        );
+      }
+
+      let ran = 0;
+      for (const [nodeKind, node] of nodes) {
+        for (const [selfKind, self] of [['quoted', path.join(spacedDir, 'runtime.mjs')],
+          ['bare', path.join(plainDir, 'runtime.mjs')]]) {
+          const marker = path.join(room, `marker-${nodeKind}-${selfKind}.txt`);
+          // The runtime's own line, with the two headless substitutions and the
+          // marker path threaded in as the probe's first argument. Everything
+          // else — the quoting, the /s, the outer pair — is what ships.
+          const args = watchLaunchArgs('review-1-2', { node, self })
+            .map((a) => (a === '/k' ? '/c' : a))
+            .map((a) => a.replace('_watch review-1-2"', `${cmdQuote(marker)} _watch review-1-2"`));
+          args.splice(3, 0, '/B', '/WAIT');
+
+          const r = await new Promise((resolve) => {
+            const c = spawn('cmd', args, { windowsVerbatimArguments: true, encoding: 'utf8' });
+            let out = '';
+            c.stdout.on('data', (d) => { out += d; });
+            c.stderr.on('data', (d) => { out += d; });
+            c.on('close', (code) => resolve({ code, out }));
+          });
+
+          const what = `node:${nodeKind} self:${selfKind}`;
+          assert.ok(fs.existsSync(marker),
+            `${what}: the watcher command never ran at all — cmd.exe said: ${r.out.trim()}`);
+          assert.equal(fs.readFileSync(marker, 'utf8'), 'RAN _watch|review-1-2',
+            `${what}: it ran with the wrong arguments`);
+          assert.equal(/is not recognized/.test(r.out), false,
+            `${what}: cmd.exe could not find what the line named: ${r.out.trim()}`);
+          ran++;
+        }
+      }
+      assert.ok(ran >= 2, 'the matrix must actually have been exercised');
+    } finally {
+      if (junction) { try { fs.unlinkSync(junction); } catch { /* best effort */ } }
+      fs.rmSync(room, { recursive: true, force: true });
+    }
+  });
+
 test('job ids outside the whitelist are refused before any path use', () => {
   const bad = ['../../etc/passwd', '..\\..\\windows\\system32', 'Review-1-2', 'foo-1', 'foo/1-2'];
   for (const id of bad) {
@@ -2026,6 +2111,24 @@ test('containment follows junctions: a linked job dir is refused, not read throu
     assert.match(l.stdout, new RegExp(`^${id}  corrupt  out: `, 'm'),
       'list must render a link as corrupt, not as a job');
 
+    // AND THE ROLE SCAN MUST NOT READ THROUGH IT EITHER. `findRoleConflict`
+    // treated a corrupt entry — which is how `allJobs` classifies exactly this —
+    // as "read its pid files and its record, then probe those numbers for
+    // liveness". Every one of those reads went through the junction, before any
+    // containment check, and the pids they returned belonged to whatever was on
+    // the other side. The kill was refused later; the read was not. A dispatch
+    // under the linked entry's role is refused now, naming the entry, having
+    // read nothing.
+    const brief = writeBrief('briefjunctionrole.md', 'quick');
+    const d = run(['dispatch', '--brief', brief, '--role', 'junction']);
+    assert.notEqual(d.status, 0, 'an entry that cannot be read cannot be proved dead, so it blocks');
+    assert.match(d.stderr, /not a job directory this runtime created/);
+    assert.ok(d.stderr.includes(link), 'and the refusal names the entry to go and look at');
+    assert.equal(fs.existsSync(path.join(JOBS, '.role-locks', 'junction')), false,
+      'no claim was taken');
+    const forced = run(['dispatch', '--brief', brief, '--role', 'junction', '--force']);
+    assert.notEqual(forced.status, 0, '--force is not a way through it either');
+
     assert.deepEqual(fs.readdirSync(outside).sort(), ['codex.pid', 'job.json', 'precious.txt'],
       'and nothing outside the jobs root may be created, renamed or removed');
   } finally {
@@ -2392,6 +2495,147 @@ test('a cancel decides on the record as it is NOW, not as it was when the job wa
     }
   });
 
+test('a cancel never writes its verdict over a terminal one the supervisor reached first',
+  async () => {
+    // THE OTHER HALF OF THE SAME RACE, and the one the test above could not see:
+    // it moved the launch PHASE during the injected pause and never the STATE.
+    // Every other writer in this seam carries a precondition — the supervisor's
+    // exit handler, the exec-spawning mark, dispatch's post-spawn check all write
+    // `expect: canonicalState === 'running'` — and killJob's writes carried none.
+    // So a cancel that lost the race to the supervisor's own verdict wrote
+    // `killed` straight over it: `killed(sight-unproven)`, a pair
+    // tests/resolution.test.mjs asserts impossible, or a deliverable `done`
+    // destroyed by a cancel that killed nothing that was still alive.
+    //
+    // Reproduced against the unfixed runtime through the same injected hold the
+    // phase-race test uses; what is under test is which record the WRITE is
+    // conditioned on, not which one the decision was read from.
+    const verdicts = [
+      {
+        role: 'killverdict',
+        patch: { state: 'failed', reason: 'sight-unproven', sight: 'unproven: nothing proved this job could read files' },
+        expect: /^job \S+ is already failed, nothing to kill$/m,
+      },
+      {
+        role: 'killdone',
+        patch: { state: 'done', exitCode: 0, sight: 'cwd-file:LICENSE' },
+        expect: /^job \S+ is already done, nothing to kill$/m,
+      },
+    ];
+    for (const [n, verdict] of verdicts.entries()) {
+      const id = `${verdict.role}-1-9993${n}`;
+      const dir = path.join(JOBS, id);
+      fs.mkdirSync(dir, { recursive: true });
+      // A live supervisor pid, so the unfixed path really had a target: it killed
+      // it, verified the death, and recorded `killed` over the verdict below.
+      const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)'], {
+        stdio: 'ignore', detached: true,
+      });
+      victim.unref();
+      const base = {
+        recordVersion: RECORD_VERSION, id, role: verdict.role, state: 'running',
+        started: new Date().toISOString(), supervisorPid: victim.pid,
+        codexPid: null, launch: 'spawned',
+      };
+      fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify(base));
+
+      try {
+        const cancelling = new Promise((resolve) => {
+          const child = spawn(process.execPath, [RUNTIME, 'cancel', id],
+            { env: { ...baseEnv, CODEX_DISPATCH_TEST_KILL_PAUSE_MS: '5000' }, cwd: REPO });
+          let stdout = '', stderr = '';
+          child.stdout.on('data', (d) => { stdout += d; });
+          child.stderr.on('data', (d) => { stderr += d; });
+          child.on('close', (code) => resolve({ code, stdout, stderr }));
+        });
+        // The supervisor finishes the job AFTER the cancel read the record and
+        // BEFORE the cancel decides what to write. That is the whole race.
+        await new Promise((r) => setTimeout(r, 1500));
+        fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+          ...base, ...verdict.patch, finished: new Date().toISOString(),
+        }));
+
+        const c = await cancelling;
+        const rec = record(id);
+        assert.equal(rec.state, verdict.patch.state,
+          `the terminal verdict must survive the cancel: ${JSON.stringify(rec)}`);
+        assert.equal(rec.reason, verdict.patch.reason,
+          'and it must still carry the reason its writer paired with it');
+        assert.notEqual(rec.state, 'killed',
+          'a cancel may not mint a death for a job that had already finished');
+        // Cancelling a job that is already finished is reported, not failed —
+        // the same convention `cancel` has always applied to a terminal job.
+        assert.equal(c.code, 0, `${c.stdout}${c.stderr}`);
+        assert.match(c.stdout, verdict.expect);
+        assert.match(c.stdout, /^out: /m, 'and it still names the out path');
+        assert.ok(pidAlive(victim.pid),
+          'and nothing is killed on behalf of a job whose record already reached a verdict');
+      } finally {
+        try { process.kill(victim.pid); } catch { /* already gone */ }
+      }
+    }
+  });
+
+test('--force treats a job that finished under it as finished, not as a conflict', async () => {
+  // The same hole through the OTHER door: `--force` reaches killJob via
+  // claimRole, and a job that reaches a terminal state while the force is
+  // deciding is not a conflict at all — the role is free, so the dispatch may
+  // take it. Before the preconditions it wrote `killed` over that verdict and
+  // then launched, which is the corruption plus a claim about a kill it never
+  // made.
+  const id = 'forcedone-1-99933';
+  const dir = path.join(JOBS, id);
+  fs.mkdirSync(dir, { recursive: true });
+  const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)'], {
+    stdio: 'ignore', detached: true,
+  });
+  victim.unref();
+  const base = {
+    recordVersion: RECORD_VERSION, id, role: 'forcedone', state: 'running',
+    started: new Date().toISOString(), supervisorPid: victim.pid,
+    codexPid: null, launch: 'spawned',
+  };
+  fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify(base));
+  // The answer it will have earned by the time the force gets there: the point of
+  // not overwriting the verdict is that these bytes stay deliverable.
+  fs.writeFileSync(path.join(dir, 'out.txt'), 'the answer that survived a --force\n');
+  const lock = path.join(JOBS, '.role-locks', 'forcedone');
+  fs.mkdirSync(lock, { recursive: true });
+  fs.writeFileSync(path.join(lock, 'owner'), id);
+
+  const brief = writeBrief('briefforcedone.md', 'quick');
+  const { keep, cancelAll } = reaper();
+  try {
+    const dispatching = new Promise((resolve) => {
+      const child = spawn(process.execPath,
+        [RUNTIME, 'dispatch', '--brief', brief, '--role', 'forcedone', '--force'],
+        { env: { ...baseEnv, CODEX_DISPATCH_TEST_KILL_PAUSE_MS: '5000' }, cwd: REPO });
+      let stdout = '', stderr = '';
+      child.stdout.on('data', (d) => { stdout += d; });
+      child.stderr.on('data', (d) => { stderr += d; });
+      child.on('close', (code) => resolve({ code, stdout, stderr }));
+    });
+    await new Promise((r) => setTimeout(r, 1500));
+    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+      ...base, state: 'done', exitCode: 0, sight: 'cwd-file:LICENSE',
+      finished: new Date().toISOString(),
+    }));
+
+    const d = await dispatching;
+    assert.equal(d.code, 0, `the role was free, so the forced dispatch proceeds: ${d.stderr}`);
+    const rec = record(id);
+    assert.equal(rec.state, 'done', `the old job's verdict is untouched: ${JSON.stringify(rec)}`);
+    assert.equal(d.stdout.includes('killed previous job'), false,
+      'and the force does not claim a kill it never made');
+    keep(jobIdFrom(d.stdout));
+    assert.equal(run(['result', id]).status, 0,
+      'the answer it had already earned is still deliverable');
+  } finally {
+    cancelAll();
+    try { process.kill(victim.pid); } catch { /* already gone */ }
+  }
+});
+
 test('the watcher keeps watching a live state instead of declaring an end', async () => {
   // kill-pending and kill-failed are declared live and process-owning, and the
   // watcher printed JOB ENDED for them and exited — an end declared while a
@@ -2496,6 +2740,37 @@ test('a cwd carrying a cmd.exe metacharacter is refused, even with no --cd to in
       'refused before anything was created: no job dir, no role claim, no ghost');
 
     fs.rmSync(odd, { recursive: true, force: true });
+  });
+
+test('a jobs root that cannot survive a cmd.exe command line is refused up front',
+  { skip: process.platform === 'win32' ? false : 'Windows-only: only Windows builds a command line' },
+  () => {
+    // The gate checked --model, --effort and --cd and not the jobs root — which
+    // lands on the same command line as `--output-last-message
+    // <jobs-root>\<id>\out.txt`. `%` and `!` are legal in a Windows user name, so
+    // the DEFAULT root under %LOCALAPPDATA% can carry one: preflight passed, the
+    // sight probe passed, a role was claimed and a supervisor spawned, and then
+    // every job failed late as codex-argv-refused with the fault named nowhere
+    // near where it could be fixed.
+    const odd = fs.mkdtempSync(path.join(os.tmpdir(), 'pct%jobs-'));
+    try {
+      const brief = writeBrief('briefpctjobs.md', 'quick');
+      const d = run(['dispatch', '--brief', brief, '--role', 'pctjobs'], { CODEX_DISPATCH_JOBS: odd });
+      assert.notEqual(d.status, 0, 'refused, not dispatched');
+      assert.match(d.stderr, /jobs root .*contains one of/, 'and it names the jobs root, not a flag');
+      assert.match(d.stderr, /CODEX_DISPATCH_JOBS/, 'and the override that fixes it');
+      assert.deepEqual(fs.readdirSync(odd), [],
+        'refused before anything was created: no job dir, no role lock, no ghost');
+
+      // Preflight is where an install-level fault belongs, so it says so there too
+      // — including under CODEX_DISPATCH_BIN, which short-circuits every other
+      // check and would otherwise report a healthy install.
+      const p = run(['preflight'], { CODEX_DISPATCH_JOBS: odd });
+      assert.notEqual(p.status, 0, 'an install whose every job would fail is not "ok"');
+      assert.match(p.stderr, /jobs root .*contains one of/);
+    } finally {
+      fs.rmSync(odd, { recursive: true, force: true });
+    }
   });
 
 test('a refused argv finalizes the record instead of stranding the job',
@@ -2773,6 +3048,159 @@ test('a bin path under a directory with a cmd.exe token separator still launches
       fs.rmSync(parent, { recursive: true, force: true });
     }
   });
+
+test('clean removes finished jobs, refuses live ones, and never leaves the jobs root', async () => {
+  // Nothing ever removed a job directory: every dispatch left one behind for
+  // ever, run.log and all, until somebody deleted the tree by hand — which is
+  // the one operation this runtime works hardest to make unsafe to do by hand.
+  // `clean` is that operation, done through the same invariants: the id
+  // whitelist, the junction refusal, the containment assert, and the record lock.
+  const room = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-clean-'));
+  const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-clean-outside-'));
+  const env = { CODEX_DISPATCH_JOBS: room };
+  const mk = (id, patch) => {
+    const dir = path.join(room, id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+      recordVersion: RECORD_VERSION, id, role: id.split('-')[0],
+      started: new Date(Date.now() - 10 * 86400000).toISOString(),
+      supervisorPid: null, codexPid: null, ...patch,
+    }));
+    fs.writeFileSync(path.join(dir, 'out.txt'), 'answer\n');
+    return dir;
+  };
+  let linked = false;
+  const link = path.join(room, 'linked-1-99902');
+  try {
+    const old = new Date(Date.now() - 9 * 86400000).toISOString();
+    const fresh = new Date().toISOString();
+    mk('donejob-1-99901', { state: 'done', exitCode: 0, finished: old, sight: 'cwd-file:LICENSE' });
+    mk('failjob-1-99903', { state: 'failed', reason: 'sight-unproven', finished: old });
+    mk('killjob-1-99904', { state: 'killed', finished: old });
+    mk('freshjob-1-99905', { state: 'done', exitCode: 0, finished: fresh, sight: 'cwd-file:LICENSE' });
+    // Every live state, one job each: none of them may be removed by any flag.
+    mk('runjob-1-99906', { state: 'running', supervisorPid: process.pid, started: fresh });
+    mk('stalejob-1-99907', { state: 'running', supervisorPid: 999999999 });
+    mk('pendjob-1-99908', { state: 'kill-pending' });
+    mk('kfjob-1-99909', { state: 'kill-failed', killSurvivors: '4242' });
+    mk('unkjob-1-99910', { state: 'cancelling' });
+    // A corrupt record is evidence, not litter.
+    const corrupt = path.join(room, 'corruptjob-1-99911');
+    fs.mkdirSync(corrupt, { recursive: true });
+    fs.writeFileSync(path.join(corrupt, 'job.json'), '{ not json');
+    // And a junction named like a job id, pointing at something precious.
+    fs.writeFileSync(path.join(outside, 'precious.txt'), 'do not touch\n');
+    fs.writeFileSync(path.join(outside, 'job.json'), JSON.stringify({
+      recordVersion: RECORD_VERSION, id: 'linked-1-99902', role: 'linked', state: 'done',
+      exitCode: 0, sight: 'cwd-file:LICENSE', started: old, finished: old,
+    }));
+    try { fs.symlinkSync(outside, link, 'junction'); linked = true; } catch { /* reported below */ }
+
+    // With no flag it removes NOTHING and says what to type: an explicit ask for
+    // a verb that deletes, rather than a default that does.
+    const bare = run(['clean'], env);
+    assert.notEqual(bare.status, 0, 'a verb that deletes must not have a default');
+    assert.match(bare.stderr, /--all/);
+    assert.match(bare.stderr, /--older-than/);
+    assert.equal(fs.existsSync(path.join(room, 'donejob-1-99901')), true, 'and it removed nothing');
+
+    // An age filter takes only what is old enough, and only what is terminal.
+    const aged = run(['clean', '--older-than', '5'], env);
+    assert.equal(aged.status, 0, aged.stderr);
+    for (const id of ['donejob-1-99901', 'failjob-1-99903', 'killjob-1-99904']) {
+      assert.match(aged.stdout, new RegExp(`^removed: ${id}$`, 'm'), `${id} is terminal and old`);
+      assert.equal(fs.existsSync(path.join(room, id)), false, `${id} must be gone from disk`);
+    }
+    assert.equal(fs.existsSync(path.join(room, 'freshjob-1-99905')), true,
+      'a job younger than the cutoff stays');
+
+    // --all takes the rest of the terminal ones and NONE of the live ones.
+    const all = run(['clean', '--all'], env);
+    assert.equal(all.status, 0, all.stderr);
+    assert.equal(fs.existsSync(path.join(room, 'freshjob-1-99905')), false, 'the fresh done job goes now');
+    for (const [id, why] of [
+      ['runjob-1-99906', 'running'], ['stalejob-1-99907', 'stale'],
+      ['pendjob-1-99908', 'kill-pending'], ['kfjob-1-99909', 'kill-failed'],
+      ['unkjob-1-99910', 'unknown'], ['corruptjob-1-99911', 'corrupt'],
+    ]) {
+      assert.equal(fs.existsSync(path.join(room, id)), true,
+        `${id} is ${why} — it may still own processes, or it is the only evidence of how it broke`);
+      assert.match(all.stdout, new RegExp(`^  ${id}  ${why}`, 'm'), `and clean says so: ${id}`);
+    }
+    if (linked) {
+      assert.equal(fs.existsSync(link), true, 'a junction named like a job id is refused, not removed');
+      assert.match(all.stdout, /linked-1-99902\s+refused: not a job directory/);
+      assert.deepEqual(fs.readdirSync(outside).sort(), ['job.json', 'precious.txt'],
+        'and NOTHING outside the jobs root is touched — that is the whole point of the refusal');
+    }
+    // --force is not a way past the taxonomy either: there is no such flag here.
+    const forced = run(['clean', '--all', '--force'], env);
+    assert.equal(forced.status, 0, forced.stderr);
+    assert.equal(fs.existsSync(path.join(room, 'kfjob-1-99909')), true,
+      'a live state is live whatever flags are passed');
+
+    // A REMOVAL THAT CANNOT FINISH MUST STAY VISIBLE, AND MUST NOT END THE RUN.
+    // Two things matter when one fails: the job keeps its job.json — without one
+    // `allJobs` cannot see the directory at all, so a record removed first would
+    // leave a tree nothing could ever list or clean again — and the other job in
+    // the same run is still removed rather than the whole clean aborting on a
+    // throw out of the lock.
+    //
+    // The blocker is a live process whose CWD is a directory inside the job dir.
+    // An open file handle is not one: libuv opens with FILE_SHARE_DELETE, so the
+    // unlink succeeds. A cwd is what an antivirus scan, a shell somebody left
+    // sitting in the folder, or a watcher process really looks like, and Windows
+    // refuses to remove it (EPERM) for as long as it is one.
+    //
+    // ITS NAME SORTS AFTER `job.json`, and that is the whole point of the
+    // fixture rather than an accident of it: a plain recursive rm walks the
+    // directory in readdir order, so a blocker named earlier fails before the
+    // record is reached and this test would pass against the defect. Every real
+    // blocker sorts later — `out.txt`, `run.log`, `supervisor.log` all do — which
+    // is exactly why the record has to be removed last deliberately.
+    const stuckDir = mk('stuckjob-1-99912', { state: 'done', exitCode: 0, finished: old, sight: 'cwd-file:LICENSE' });
+    const busy = path.join(stuckDir, 'zz-busy');
+    fs.mkdirSync(busy);
+    mk('alsojob-1-99913', { state: 'done', exitCode: 0, finished: old, sight: 'cwd-file:LICENSE' });
+    const sitting = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 30000)'],
+      { cwd: busy, stdio: 'ignore', detached: true });
+    sitting.unref();
+    let stuck;
+    try {
+      await poll(() => pidAlive(sitting.pid), 5000, 50);
+      stuck = run(['clean', '--all'], env);
+    } finally {
+      try { process.kill(sitting.pid); } catch { /* already gone */ }
+    }
+    assert.equal(stuck.status, 0, stuck.stderr);
+    assert.match(stuck.stdout, /^removed: alsojob-1-99913$/m,
+      'one stuck file must not abort the run for every other job');
+    if (fs.existsSync(stuckDir)) {
+      assert.equal(fs.existsSync(path.join(stuckDir, 'job.json')), true,
+        'the record is removed LAST, so a partial removal stays visible and retryable');
+      assert.match(stuck.stdout, /stuckjob-1-99912\s+could not be removed/,
+        'and clean says which job and why');
+      assert.match(stuck.stderr, /WARNING: 1 job directory could not be removed/);
+      assert.match(run(['list'], env).stdout, /^stuckjob-1-99912  done/m,
+        'it still lists — which is what makes "clean it again" a real cure');
+      // And once nothing is sitting in it, it really is retryable.
+      assert.ok(await poll(() => !pidAlive(sitting.pid), 10000), 'the blocker must be gone first');
+      const retry = run(['clean', '--all'], env);
+      assert.equal(retry.status, 0, retry.stderr);
+      assert.equal(fs.existsSync(stuckDir), false, 'the retry finishes what the first run could not');
+    } else {
+      // A platform that lets a process's cwd be removed underneath it (POSIX
+      // does) removes it cleanly. Say so rather than assert nothing.
+      process.stderr.write('NOTE: this platform allowed the removal of a directory in use; ' +
+        'the partial-failure half of the clean test did not fire.\n');
+      assert.match(stuck.stdout, /^removed: stuckjob-1-99912$/m);
+    }
+  } finally {
+    if (linked) { try { fs.unlinkSync(link); } catch { fs.rmSync(link, { recursive: true, force: true }); } }
+    fs.rmSync(room, { recursive: true, force: true });
+    fs.rmSync(outside, { recursive: true, force: true });
+  }
+});
 
 test('every state/reason pair this suite put on disk is one the docs allow', () => {
   // The record-level half of the pair contract (the source-level half is in

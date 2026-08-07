@@ -167,6 +167,51 @@ close gaps the review named rather than defects it found:
   a pid that IS targeted survives the no-op kill and is reported by name, so the
   control job fails exactly where the filtered one passes.
 
+The 0.8.0 additions pin the full-repo review of 0.7.3. Two of the blocks below
+fail against 0.7.3 by construction — three scenarios between them — which is how
+they were written:
+
+- **a cancel never writes over a terminal verdict** — the same
+  `CODEX_DISPATCH_TEST_KILL_PAUSE_MS` hold as the phase-race test, moving the
+  *state* rather than the launch phase: one block runs it twice, to
+  `failed(sight-unproven)` and to `done`.
+  The verdict survives, `killed(sight-unproven)` never reaches disk, nothing is
+  killed on behalf of a job that already finished, and `cancel` reports
+  `already <state>, nothing to kill` and exits 0 — the convention it has always
+  applied to a finished job. The second block races a `--force` through the same
+  window and asserts the old job's answer is still deliverable afterwards;
+- **`clean` removes what is finished and nothing else** — three terminal jobs
+  removed by `--older-than`, a younger one kept until `--all`, and all five live
+  states plus a corrupt record kept by both, each named in the output. A junction
+  named like a job id is refused and nothing outside the jobs root is touched, and
+  `--force` is shown to be no way past the taxonomy (there is no such flag).
+  The partial-failure half is driven by a live process whose cwd is a directory
+  **named to sort after `job.json`** — the ordering is the whole fixture, since a
+  blocker sorting earlier would pass against the defect, and every real one
+  (`out.txt`, `run.log`, `supervisor.log`) sorts later: the stuck job keeps its
+  record and stays listable, the other job in the same run is still removed, and
+  a retry finishes it. An open file handle is *not* a blocker — libuv opens with
+  `FILE_SHARE_DELETE`, so the unlink succeeds — which is why the cwd is used;
+- **the watcher command line is RUN, not just shaped** — the line the runtime
+  builds, executed headless (`/k` → `/c`, `start` with `/B /WAIT`) for all four
+  combinations of (node path quoted / not) × (runtime path quoted / not), with a
+  probe script standing in for the runtime and a junction to the node install
+  directory standing in for a node path that needs no quoting. This is the test
+  that would have caught the `cmd /k` quoting regression the argv-shape test
+  waved through; both are kept, in that order of authority;
+- **the role scan does not read through a junction** — extended onto the existing
+  junction drill: a dispatch under the linked entry's role is refused naming the
+  entry, with and without `--force`, and no claim is taken;
+- **the watcher's command line is also asserted as data** — `watchLaunchArgs`
+  never contains the bare word `node`, carries `process.execPath` quoted for
+  cmd.exe, is one argument after `/s /k` rather than an argv, spells the
+  both-quoted tail exactly, and throws `CMD_UNQUOTABLE` for a node or runtime
+  path carrying `%` or `!`. Kept, with the standing caveat that it once passed
+  against a line that could not run;
+- **a jobs root with a `%` in it is refused up front** — by `dispatch` before
+  anything is created and by `preflight` even under `CODEX_DISPATCH_BIN`, both
+  naming `CODEX_DISPATCH_JOBS`.
+
 **Thirteen test-only knobs live in the runtime**, each standing in for a condition
 that cannot be produced on demand in CI, on both platforms, from both shells. What
 is under test in every case is the runtime's *decision*, never the mechanism that

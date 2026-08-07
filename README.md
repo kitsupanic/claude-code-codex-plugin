@@ -54,8 +54,8 @@ this is orchestration infrastructure.
 | **Sandbox** | `read-only` for reviews; the rescue agent defaults to write-capable | `read-only` unless `--write`, plus a per-job positive sight proof in the job's own cwd before codex is launched |
 | **Job model** | background jobs polled from the session via a companion app-server broker | detached supervisor, on-disk records, unique job dirs, atomic role claims, verified kill-before-retry, stale reaping, atomic type-checked records, whitelisted ids and roles proved inside the jobs root |
 | **Hooks** | `SessionStart`/`SessionEnd` lifecycle, plus an opt-in stop-time review gate | none, ever — enforced by a test |
-| **Footprint** | companion app-server, agents, skills, prompt templates, output schemas, 8 commands | one zero-dependency script, 6 commands, 1 skill |
-| **Tests** | 8 test files, CI on every pull request | 111 tests — fake-codex lifecycle drills, the deliverability matrix, sight-gate and kill-verification drills, path-escape canaries, a concurrency race and a fenced-claim takeover, plus an opt-in live smoke |
+| **Footprint** | companion app-server, agents, skills, prompt templates, output schemas, 8 commands | one zero-dependency script, 7 commands, 1 skill |
+| **Tests** | 8 test files, CI on every pull request | 127 tests — fake-codex lifecycle drills, the deliverability matrix, sight-gate and kill-verification drills, path-escape canaries, a concurrency race and a fenced-claim takeover, plus an opt-in live smoke |
 
 Things the official plugin has that this one deliberately does not: the
 `codex-rescue` subagent, `/codex:review`'s zero-brief native reviewer, the
@@ -106,8 +106,8 @@ Three names, three jobs, and they are deliberately different:
   `codex-dispatch@kitsupanic` — `<plugin>@<marketplace>`.
 
 Commands appear as `/codex-dispatch:dispatch`, `:status`, `:result`, `:cancel`,
-`:list`, `:watch`. There are **no hooks** — this plugin never inserts itself into
-a session's lifecycle.
+`:list`, `:clean`, `:watch`. There are **no hooks** — this plugin never inserts
+itself into a session's lifecycle.
 
 Update after a push with `/plugin marketplace update kitsupanic`.
 
@@ -135,10 +135,10 @@ A typical session, start to finish:
 `dispatch` takes either a **path to an existing file** (used as the brief,
 byte-for-byte) or **inline text** (written verbatim to a temp file first — a
 brief never travels on a command line). The other commands — `:status`,
-`:result`, `:cancel`, `:list`, `:watch` — are one-argument wrappers over the
-runtime verbs below.
+`:result`, `:cancel`, `:list`, `:clean`, `:watch` — are one-argument wrappers
+over the runtime verbs below.
 
-All six commands are **user-typed only** (`disable-model-invocation: true`):
+All seven commands are **user-typed only** (`disable-model-invocation: true`):
 Claude never fires a dispatch on its own, because a dispatch bills.
 
 **Writing a brief.** The brief is transported verbatim and Codex sees nothing
@@ -194,15 +194,18 @@ every install was pinned to the first of them — the fix landed in the repo and
 nowhere else, silently, which is the same shape of failure as a blind answer:
 confident, and wrong in a way nothing surfaces.
 
-Current release: **0.7.3** — the fixes from another full-repo review. A dispatch
-that loses the race to its own supervisor no longer overwrites the verdict that
-supervisor reached; a probe that could not be POSED (a `--cd` that is not there,
-a bin path that cannot be quoted) is `sight-probe-error` rather than proven
-blindness, and a missing `--cd` is refused before anything is claimed or spawned;
-`cmdQuote` quotes `,`, `;` and `=`, which cmd.exe breaks a command token on; a
-`kill-failed` job keeps its role claim, as its contract always said; and a pid
-already fired at is never re-armed out of the record. 0.6.0 and later records
-remain deliverable. Full history, including the
+Current release: **0.8.0** — the fixes from a full-repo review of 0.7.3, whose
+lead finding was reproduced before it was reported. A `cancel` can no longer
+write its verdict over one the supervisor already reached: every write in the
+kill seam is a compare-and-swap on "the state is still live", so
+`killed(sight-unproven)` and destroyed `done` answers are gone, and a `--force`
+that finds a finished job takes the role instead of claiming a kill. New verb:
+`clean`, the manual (never automatic) way to remove FINISHED job directories,
+since nothing had ever removed one. The role scan no longer reads through a
+junction named like a job id; `watch` launches `process.execPath` rather than a
+literal `node`; and a jobs root carrying `%` or `!` is refused by `preflight` and
+`dispatch` instead of failing every job late. 0.6.0 and later records remain
+deliverable. Full history, including the
 `RECORD_VERSION` 2 cutoff that makes 0.1–0.4 records undeliverable, in
 [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
@@ -239,6 +242,11 @@ node scripts/codex-dispatch.mjs status <job-id>   # one job: state, sight, deliv
 node scripts/codex-dispatch.mjs result <job-id>   # the answer, verbatim, stdout only; nonzero + out: path unless the record says done AND vouches for it
 node scripts/codex-dispatch.mjs cancel <job-id>   # kill the whole tree, verify it died, mark killed
 node scripts/codex-dispatch.mjs list              # one line per job, newest first
+node scripts/codex-dispatch.mjs clean --all               # remove FINISHED job dirs (done/failed/killed) — never a live or corrupt one
+node scripts/codex-dispatch.mjs clean --older-than 30     # the same, only those that finished 30+ days ago
+  # ↑ manual, never automatic, and it refuses without one of those two flags:
+  #   nothing else in this runtime ever removes a job directory, and a record is
+  #   the only account of what a job did.
 node scripts/codex-dispatch.mjs watch <job-id>    # detached console window: tails run.log, then a JOB FINISHED banner
 node scripts/codex-dispatch.mjs preflight         # install / auth / functional-sandbox check
   # → preflight: ok
@@ -258,8 +266,12 @@ node scripts/codex-dispatch.mjs preflight         # install / auth / functional-
   rather than launched alongside it. State semantics are in
   [docs/DESIGN.md](docs/DESIGN.md).
 - Jobs root: `%LOCALAPPDATA%\codex-dispatch\jobs\`, overridable via
-  `CODEX_DISPATCH_JOBS`. Job records survive reboots; `list`/`status` mark jobs
-  whose recorded pids no longer exist as `stale`.
+  `CODEX_DISPATCH_JOBS`. Job records survive reboots and nothing removes them on
+  its own — `clean` is the manual verb for that; `list`/`status` mark jobs whose
+  recorded pids no longer exist as `stale`. On Windows the root goes onto codex's
+  own command line (`--output-last-message`), so a root containing `%`, `!` or
+  `"` is refused by `preflight` and by `dispatch` before anything is claimed —
+  those are legal in a user name, and the cure is `CODEX_DISPATCH_JOBS`.
 - `CODEX_DISPATCH_BIN` overrides the codex binary (a `.mjs`/`.cjs`/`.js` path is run
   via node — this is how the tests substitute a fake codex).
 - `watch` is a human affordance and Windows-only in this release; agents poll
@@ -268,14 +280,14 @@ node scripts/codex-dispatch.mjs preflight         # install / auth / functional-
 ## Tests
 
 ```
-node --test                            # everything: 111 tests (bare form — see below)
+node --test                            # everything: 127 tests (bare form — see below)
 node --test tests/dispatch.test.mjs    # lifecycle, against a fake codex
 node --test tests/packaging.test.mjs   # manifests, command frontmatter, no-hooks invariant
 node --test tests/resolution.test.mjs  # binary resolution, sight-probe targeting, blind scan, whitelists, deliverability (imported, not spawned)
 node tests/live-smoke.mjs              # one real cheap dispatch; skips loudly if codex absent/logged out
 ```
 
-One of the 111 is skipped on Windows and runs on POSIX: the process-group kill has
+One of the 127 is skipped on Windows and runs on POSIX: the process-group kill has
 no Windows analogue to assert (`taskkill /T` is the path there), so the *choice* of
 targets is unit-tested on both platforms via `killPlan` and the kill itself is
 integration-tested only where it applies.

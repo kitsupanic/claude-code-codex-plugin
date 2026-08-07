@@ -3,6 +3,91 @@
 Versioning rule: **a push that changes behavior MUST bump the version** — see
 [README → Releases and versioning](../README.md#releases-and-versioning) for why.
 
+## 0.8.0
+
+A full-repo review of 0.7.3, whose lead finding was reproduced on the shipped
+runtime before it was written down. The theme repeats: a rule this runtime
+states everywhere and applied in all but one place. Minor bump because there is
+a new verb.
+
+**A cancel may not write its verdict over one already reached.** Every writer in
+the kill seam carries a compare-and-swap precondition — the supervisor's exit
+handler, the `exec-spawning` mark, dispatch's post-spawn check all write
+`expect: canonicalState === 'running'` — and `killJob`'s four writes carried
+none. Its stale-snapshot re-read compared the launch *phase* and the pid list
+and never the *state*, so a verdict landing in the gap was invisible and the
+decision was made on the pre-gap read. Reproduced: the supervisor writes
+`failed(sight-unproven)` or `done`, the cancel kills a supervisor that was
+already exiting and writes `killed` over it — `killed(sight-unproven)`, the pair
+`commands/list.md` documents as impossible, or a deliverable answer destroyed.
+The same hole was reachable through `--force` by two routes. All four writes are
+CAS on "the state is still live" now, the re-read watches the state too, and a
+precondition that loses is not a lost write — it is a *found verdict*: nothing
+overwritten, nothing killed, no role released, and `cancel` reports
+`already <state>, nothing to kill` and exits 0, the convention it has always
+applied to a job that finished first. A terminal job is not a conflict, so
+`--force` takes the role rather than refusing, and stops claiming a kill it never
+made.
+
+**A `clean` verb, because nothing had ever removed a job directory.** Briefs,
+records, `run.log`s and answers accumulated for ever, and the only remedy was
+deleting the tree by hand. `clean --all` or `clean --older-than <days>`; with
+neither it removes nothing and says which to type. Eligible is
+`ROLE_RELEASE_STATES` — `done`, `failed`, `killed` — and nothing else: every live
+state may still own processes whose only kill targets are the `.pid` files inside
+that directory, and a corrupt `job.json` is evidence. There is deliberately no
+`--force` past either. Manual on purpose, never a background prune: a record is
+the only account of what a job did. A job directory is dismantled with its
+`job.json` **last** — an entry without one is invisible to `list`, `status` and
+`clean` itself, so a removal that dies partway (a process sitting in the
+directory, an antivirus hold) has to leave the record behind or it leaves a tree
+nothing can ever see again — and a failed removal is reported as a `kept:` line
+and a stderr warning rather than ending the run at the first stuck file.
+
+**The junction classification now holds at the READ boundary.** `allJobs` renders
+a directory junction named like a job id as corrupt so that nothing is read
+through it — and `findRoleConflict` then read its pid files and its record and
+probed the numbers it found on the other side. The kill was refused later by
+`assertInsideRoot`; the read was not. Such an entry is refused where it is read,
+blocks its role, and the refusal names the entry.
+
+**`watch` launches THIS node — and the line it builds is now proved by running
+it.** The one spawn that used the literal string `node` rather than
+`process.execPath`: where node is not on the interactive PATH the window opened,
+said `'node' is not recognized`, and `watch` reported success. The line is built
+from `process.execPath`, quoted once by `cmdQuote`, and refused rather than
+mangled when a path carries `% ! "`. The first version of that fix put the two
+quoted paths straight after `cmd /k`, which does not parse an argv: with four
+quotes on the tail cmd strips the first character and the last quote and runs
+`C:\Program` — so an install with a space in *both* the node path and the plugin
+path got a dead window and a `watching:` success, caught by review before
+release. The tail is one `cmd /s /k "<command>"` string now, verified end to end
+for all four quoting combinations by a test that executes it, because the broken
+version satisfied an argv-shape assertion perfectly.
+
+**The cmd.exe gate checks the jobs root.** It rides the same command line as
+`--output-last-message <jobs-root>\<id>\out.txt`, and `%` and `!` are legal in a
+Windows user name — so the default root under `%LOCALAPPDATA%` can carry one, and
+every job failed late as `codex-argv-refused` after claiming a role and spawning
+a supervisor. Refused now in `preflight` and in `dispatch` before anything is
+claimed, naming `CODEX_DISPATCH_JOBS`.
+
+**Docs:** `commands/result.md`'s "Not delivered" list omitted `unknown`, which
+`result` routes there like every other non-`done` state; the README's test count
+was stale again.
+
+**Tests: 121 → 127.** Two of the new blocks fail against 0.7.3 by construction,
+three scenarios between them: one moves the record to a terminal verdict inside
+the injected kill pause twice over (`failed(sight-unproven)`, then `done`) and
+asserts it survives, the other races a `--force` the same way. Plus the `clean`
+drill (eligible jobs removed, all five live states and a corrupt record kept, a
+junction named like a job id refused with nothing outside the root touched, and a
+removal blocked partway leaving a job that still lists and still cleans), a jobs
+root with a `%` in it refused by both `dispatch` and `preflight`, the junction
+read boundary asserted through a real dispatch, and the watcher's command line
+both asserted as data **and executed** for all four quoting combinations — the
+data assertion alone is what let the `cmd /k` regression through.
+
 ## 0.7.3
 
 A fresh single-arm review of 0.7.2, its two lead findings reproduced before

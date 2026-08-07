@@ -108,6 +108,12 @@ Runtime: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" <verb>`
   as evidence, and marks the spent pids so a second cancel replays nothing — that
   second cancel reports `already reaped` and changes nothing.
 - `list` — all jobs, newest first, one line each.
+- `clean --all | --older-than <days>` — removes FINISHED job directories
+  (`done`, `failed`, `killed`) and nothing else: a job in any live state may still
+  own processes, and a corrupt `job.json` is evidence. Manual only — nothing here
+  prunes on its own — and it refuses outright without one of those two flags. A
+  user's housekeeping call, never a step to slip into a workflow: the directory it
+  would remove holds the only account of what a job did.
 - `watch <job-id>` — opens a console window that follows the job and shouts when
   it finishes. **For humans only** (see below).
 - `preflight` — checks codex is installed, authenticated, and that its sandbox

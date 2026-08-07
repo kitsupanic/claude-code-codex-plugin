@@ -250,3 +250,108 @@ operator saw while the suite ran:
   number of times, and a persistent transport failure is `sight-probe-error` with
   its own message — refusable, opt-in-able, and never called blindness.
 
+
+### The 0.7.3 full-repo review (2026-08-07) — the kill seam, and everything nothing had ever removed
+
+One arm, one standalone brief, the whole repo. Eight findings, and the lead one
+was **reproduced against the shipped runtime before it was reported** — the shape
+this catalog trusts most. The theme is a familiar one wearing a new costume: a
+rule the runtime states everywhere and applies in all but one place.
+
+- **`killJob`'s terminal writes carried no precondition (reproduced).** Every
+  other writer in this seam is a compare-and-swap — the supervisor's exit handler,
+  the `exec-spawning` mark and dispatch's post-spawn check all pass
+  `expect: canonicalState === 'running'` — and the four writes a cancel makes
+  (`kill-pending` twice, `kill-failed`, `killed`) passed nothing at all. Worse,
+  `killJob`'s own stale-snapshot re-read compared the launch *phase* and the pid
+  list and never the *state*, so a record that reached a verdict inside the gap
+  looked unchanged and the decision was made on the pre-gap snapshot. A cancel
+  that lost the race to the supervisor therefore killed a supervisor that was
+  already exiting and wrote `killed` over its verdict: `killed(sight-unproven)`
+  on disk — the pair `tests/resolution.test.mjs` asserts impossible — or a
+  deliverable `done` answer destroyed. Reachable identically through `--force`,
+  by two routes (`claimRole` and `cmdDispatch`'s own conflict path). → All four
+  writes are CAS on "the state is still one of `LIVE_STATES`", the re-read watches
+  the state as well, and a precondition that loses is not a lost write but a
+  *found verdict*: nothing is overwritten, nothing is killed, the role is not
+  released, and the caller is told the state that is really there. `--force`
+  treats a terminal job as what it is — not a conflict — and takes the role
+  without claiming a kill it never made.
+- **The test that should have caught it moved the wrong field.** The kill-race
+  test held a cancel in the injected pause and moved the launch *phase* to
+  `exec-spawning`; it never moved the state. → Two new test blocks cover three
+  scenarios: one moves the state to `failed(sight-unproven)` and then to `done`
+  inside that window and asserts the verdict survives both times, the other puts
+  a `--force` in the same race. Both blocks fail against the unfixed runtime,
+  which is how they were written.
+- **Nothing had ever removed a job directory.** Unbounded on-disk growth: brief,
+  record, `run.log` and answer kept for ever, with the only remedy being to delete
+  the tree by hand — the operation this runtime spends the most care making unsafe
+  to do by hand. → A `clean` verb: manual, never automatic, refusing without
+  `--all` or `--older-than <days>`, eligible only on `ROLE_RELEASE_STATES`, no
+  `--force` past live or corrupt jobs, removal under the record lock with the
+  state re-decided inside it. See [DESIGN.md → Retention](DESIGN.md#retention--clean-and-why-it-is-manual).
+- **The role scan read through junctions.** `allJobs` classifies a directory
+  junction named like a job id as corrupt so that "nothing was read through it",
+  and `findRoleConflict` then read that entry's pid files and record — following
+  the link — and probed the numbers it found there for liveness. The kill was
+  refused later by `assertInsideRoot`; the read never was. → The containment
+  classification is honoured at the read boundary: such an entry is refused
+  outright, blocks its role (it cannot be proved dead without reading it), and the
+  refusal names the entry.
+- **`watch` spawned a literal `node`.** The only spawn in the runtime not using
+  `process.execPath`. Where node is not on the interactive PATH the window opened,
+  printed `'node' is not recognized`, and `watch` reported success. → The launcher
+  line is built from `process.execPath`, quoted once by `cmdQuote` with
+  `windowsVerbatimArguments`, exported as `watchLaunchArgs` so the argv is
+  asserted directly, and refused rather than mangled when a path carries `% ! "`.
+- **The cmd.exe gate never checked the jobs root.** It travels on the same command
+  line as `--output-last-message <jobs-root>\<id>\out.txt`, and `%` and `!` are
+  legal in a Windows user name — so the DEFAULT root can carry one. Preflight
+  passed, the sight probe passed, a role was claimed and a supervisor spawned, and
+  then every job failed as `codex-argv-refused`, for ever, with the fault named
+  nowhere near where it could be fixed. → Checked in `preflight` (before the
+  `CODEX_DISPATCH_BIN` short-circuit) and in `dispatch` before anything is
+  claimed, naming `CODEX_DISPATCH_JOBS` as the cure.
+- **Two documentation drifts.** `commands/result.md`'s "Not delivered"
+  enumeration omitted `unknown`, which `result` routes there like any other
+  non-`done` state; and the README still counted 111 tests. Both corrected.
+
+What the round did *not* find is worth recording too: the validator, the record
+lock, the claim fence, the containment asserts and the delivery gate were all
+probed and all held.
+
+**And the follow-up review of that diff found a regression it had introduced**,
+which is the entry in this catalog most worth keeping. The `watch` fix quoted the
+node path and the runtime path with `cmdQuote` and put them straight after
+`cmd /k` — and `cmd /k` does not parse an argv. With no `/S` it preserves quotes
+only when the tail holds *exactly two*, and otherwise strips the first character
+and the last quote: four quotes meant it ran `C:\Program`. So every install with
+a space in **both** paths — `C:\Program Files\nodejs` plus a plugin under
+`C:\Users\John Smith\...` — got a dead window and a `watching:` success, which is
+worse for that population than the literal `node` it replaced. Reproduced on the
+reviewer's machine and again here before the second fix.
+
+Two lessons, both structural:
+
+- **The argv-shape assertion was the gap.** `watchLaunchArgs` was exported and
+  tested as data precisely so this could not happen, and the broken line
+  satisfied every assertion in that test. A command line is not proved by its
+  shape; it is proved by running it. The suite now executes the real line for all
+  four combinations of (node path quoted / not) × (runtime path quoted / not),
+  headless — `/k` becomes `/c` and `start` gets `/B /WAIT` — and the data test is
+  kept beside it rather than instead of it.
+- **A fix that narrows a failure population can still widen it for somebody.**
+  The old line worked for a spaced plugin path whenever node was on PATH; the new
+  one broke exactly that case. "Strictly better" is a claim to check per
+  population, not to infer from the defect being real.
+
+The same review also closed three narrower things in this round's own work: the
+CAS's "which verdict beat me" answer now comes from the record read *inside* the
+lock (`updateRecordOutcome` already hands it back) rather than from a re-read
+that could report a third state; `clean` dismantles a job directory with its
+`job.json` **last**, because `allJobs` cannot see an entry without one and a
+removal that died partway with the record already gone left a tree nothing could
+ever list or clean again; and a removal that fails is caught and reported as a
+`kept:` line plus a stderr warning instead of throwing out of the lock and ending
+the run at the first stuck file.

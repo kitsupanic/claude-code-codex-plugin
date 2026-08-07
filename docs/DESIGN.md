@@ -161,7 +161,14 @@ the filesystem rather than to the record:
   root passed every check and then redirected everything through it. Containment is
   now proved against `fs.realpathSync.native`, links are refused rather than
   followed, and the listing walk renders one as `corrupt` instead of reading
-  through it.
+  through it. **That classification is honoured at the READ boundary, not only at
+  the kill.** The role-conflict scan treated a corrupt entry as "read its pid
+  files and its record, then probe those numbers for liveness" — every one of
+  those reads went through the junction before any containment check, so the
+  promise the walk makes ("nothing was read through it") held only for the write
+  side, where `assertInsideRoot` stopped the reap. Such an entry is refused where
+  it is read now: it cannot be proved dead without reading it, so it blocks its
+  role, and the refusal names the entry rather than a job.
 - **A corrupt record blocks its role until its processes are proven dead.** It
   cannot claim to be running; it cannot claim not to be either. Its role comes from
   the *directory name* — the one statement about a job that survives its record
@@ -302,6 +309,25 @@ that is evaluated *inside* the lock ("only if this still says running"). And a
 write that could not take the lock is **reported, not swallowed**: a `cancel` whose
 kill worked but whose record would not update exits nonzero saying exactly that,
 because a kill nothing else can see is not a kill anything else may act on.
+
+**Every writer in the kill seam carries a precondition, including the cancel.**
+The supervisor's exit handler, the `exec-spawning` mark and dispatch's post-spawn
+write all wrote `expect: canonicalState === 'running'`; `killJob`'s four writes —
+`kill-pending` twice, `kill-failed`, `killed` — carried none, and its own
+stale-snapshot re-read watched the launch *phase* and the pid list move without
+ever watching the *state*. So a cancel that lost the race to the supervisor's own
+verdict wrote straight over it: `killed(sight-unproven)`, a state/reason pair this
+document calls impossible, or a deliverable `done` destroyed by a cancel that
+killed nothing that was still alive (reproduced, 2026-08-07). Those writes are now
+compare-and-swap on **"the state is still one of `LIVE_STATES`"**, and a write that
+loses that precondition did not lose data — it *found a verdict*. Nothing is
+overwritten, nothing is killed (the re-read bails before the trigger too), the
+role is not released, and the answer is the state that is really there: `cancel`
+reports `job <id> is already <state>, nothing to kill` and exits 0, exactly as it
+always has for a job that finished before the cancel arrived. `--force` gets the
+same answer and treats it correctly — a terminal job is not a conflict, so the
+force takes the role rather than refusing, and it does not print a kill it never
+made.
 
 **Dispatch records the supervisor's pid itself, at spawn time, before it returns.**
 The supervisor used to write its own, which left a window — record says `running`,
@@ -477,6 +503,44 @@ Now a failed rename is reported on stderr and as a `warning:` on the record, and
 the written-down list — not the file name — is what the next reap consults. Pid
 numbers get reused; a replayed kill lands on whatever inherited them.
 
+## Retention — `clean`, and why it is manual
+
+Nothing removed a job directory until 0.8.0. Every dispatch left one behind for
+ever: the brief, the record, `run.log` (megabytes on a long run) and the answer.
+The jobs root therefore grew without bound, and the only way to reclaim it was to
+delete the tree by hand — which is precisely the operation the rest of this
+document works to make unsafe to do by hand.
+
+`clean` is that operation, done through the same invariants, and it is **manual on
+purpose**: no automatic pruning, no age default that deletes something the first
+time it runs. A record is the only account of what a job did, and deciding on the
+operator's behalf that an account has expired is not a decision a background sweep
+gets to make. With neither `--all` nor `--older-than <days>` it removes nothing
+and says which to type.
+
+**Eligible is `ROLE_RELEASE_STATES` — `done`, `failed`, `killed`** — the same set
+the supervisor is allowed to release a role on, and for the same reason: those are
+the states that say everything the job owned is gone. Everything else is kept and
+named in the output:
+
+- the five live states (`running`, `kill-pending`, `stale`, `kill-failed`,
+  `unknown`) may still own processes, and the `.pid` files inside that directory
+  are the only remaining way to kill them. There is deliberately **no `--force`**
+  for these: a flag whose meaning is "ignore the state taxonomy" is a flag that
+  makes a still-billing codex unkillable.
+- a `corrupt` `job.json` is evidence, and this runtime neither repairs nor deletes
+  one anywhere else.
+- an entry that is a link or resolves outside the jobs root is refused, exactly as
+  the listing walk classifies it — nothing is read through it and nothing is
+  removed through it.
+
+The removal itself takes the job's own record lock and **re-decides inside it**,
+so a job that turns live between the listing and the removal is kept; the id goes
+through the whitelist and the containment assert first, like every other path this
+runtime operates on. A removed job that still held a role claim leaves a claim
+naming a job directory that is not there, which `inspectClaim` already reads as
+reclaimable.
+
 ## Watching a job
 
 ```
@@ -530,6 +594,34 @@ characters** before they reach the console — `run.log` is whatever codex print
 including file contents and tool output it echoed, and an escape sequence in there
 can retitle the window, clear the screen, or drive the cursor back over the banner
 and rewrite it. Tab, newline and carriage return survive; C0 and C1 controls do not.
+
+**The window runs the node that is running this, not a `node` on somebody's PATH.**
+The launcher line was `cmd /c start <title> cmd /k node <self> _watch <id>` with
+`node` as a literal — the only spawn in the runtime that did not go through
+`process.execPath`. On a machine where node is not on the *interactive* path (an
+nvm shim, a portable install, a PATH a parent process trimmed) the window opened,
+printed `'node' is not recognized`, and `watch` reported success: a claim made
+instead of a fact checked, in the one affordance that exists because
+notifications get dropped. The line is now built from `process.execPath`, quoted
+by `cmdQuote` and spawned with `windowsVerbatimArguments` so there is exactly one
+quoting pass, and it fails closed on `% ! "` like every other value bound for a
+cmd.exe command line.
+
+**And the tail after `/k` needs one more pair of quotes than looks right**, which
+the first version of that fix got wrong and a follow-up review reproduced.
+`cmd /k <tail>` does not parse an argv: without `/S` it preserves quotes only
+when the tail contains *exactly two* of them, and otherwise strips the first
+character if it is a quote and the last quote on the line. Quote both the node
+path and the runtime path — every install under `C:\Program Files\nodejs` whose
+plugin also lives under a path with a space — and the tail has four, so cmd ran
+`C:\Program`. A window saying `'C:\Program' is not recognized` while `watch`
+prints `watching:` is the same false success the literal `node` produced, in a
+narrower population. So the whole command is one `cmdQuote`-quoted string handed
+to `cmd /s /k` inside an outer pair: `/s` makes the strip-outer-pair rule
+unconditional, and what is left runs verbatim. Verified end to end for all four
+combinations of (node path quoted / not) × (runtime path quoted / not) — and the
+test that keeps it verified **executes** the line, because the broken version
+satisfied an argv-shape assertion perfectly.
 
 Finally, `watch` **checks that the window opened**. A detached spawn that fails is
 silent, and the verb used to announce a window either way; now the launcher gets a
@@ -587,6 +679,18 @@ than opening nothing and claiming otherwise.
   doubled now, which that parser reads back as N literal backslashes and a
   delimiter that survives. Interior runs are untouched — only the run against the
   delimiter is ambiguous, and a Windows path is mostly interior runs.
+
+  **And it is applied to every value that reaches the line, including the jobs
+  root.** The gate checked `--model`, `--effort` and `--cd`, and the jobs root
+  travels on the same command line as `--output-last-message
+  <jobs-root>\<id>\out.txt`. `%` and `!` are legal in a Windows user name, so the
+  DEFAULT root under `%LOCALAPPDATA%` can carry one: preflight passed, the sight
+  probe passed, a role was claimed, a supervisor was spawned, and only then did
+  the job fail as `codex-argv-refused` — every job, for ever, with the fault named
+  nowhere near where it could be fixed. It is checked where it is read now: in
+  `preflight` (before the `CODEX_DISPATCH_BIN` short-circuit, because an install
+  whose every job would fail is not "ok") and in `dispatch` before anything is
+  claimed, naming the `CODEX_DISPATCH_JOBS` override that cures it.
 
   **The refusal is applied to the RESOLVED value, and it lands somewhere.** 0.7.0
   got both halves of that wrong. It validated `opts.cd`, so a dispatch with no

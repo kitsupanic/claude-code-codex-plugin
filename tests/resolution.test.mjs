@@ -56,6 +56,7 @@ import {
   stripControlBytes,
   validateRecord,
   verifyClaim,
+  watchLaunchArgs,
 } from '../scripts/codex-dispatch.mjs';
 
 const NPM = path.join('C:\\Users\\me\\AppData\\Roaming', 'npm', 'codex.cmd');
@@ -240,6 +241,59 @@ test('cmdQuote: , ; and = end a cmd.exe token exactly as a space does', () => {
   assert.equal(cmdQuote(`C:${bs}a,b;c=d${bs}`), `"C:${bs}a,b;c=d${bs}${bs}"`);
   // And the cheap path stays cheap: a path with none of them is still untouched.
   assert.equal(cmdQuote(`D:${bs}github${bs}repo${bs}codex.cmd`), `D:${bs}github${bs}repo${bs}codex.cmd`);
+});
+
+test('the watcher window launches THIS node, quoted for the cmd.exe line it lands on', () => {
+  // The one spawn in this runtime that did not use process.execPath: the watcher
+  // window was `cmd /c start <title> cmd /k node <self> _watch <id>`, with `node`
+  // as a literal. A machine whose interactive PATH has no node — an nvm shim, a
+  // portable install, a PATH a parent trimmed — opened a window that printed
+  // "'node' is not recognized" while `watch` reported success. Every other spawn
+  // here goes through process.execPath, which is the node that is demonstrably
+  // running this code.
+  //
+  // THIS TEST ASSERTS SHAPE, AND SHAPE IS NOT ENOUGH — the version of
+  // `watchLaunchArgs` that broke every install with a space in BOTH its node
+  // path and its plugin path satisfied every assertion below. The test that
+  // would have caught it is the one that runs the line; it lives in
+  // tests/dispatch.test.mjs and this one is kept beside it, not instead of it.
+  const bs = String.fromCharCode(92);
+  const args = watchLaunchArgs('review-1-2');
+  assert.deepEqual(args.slice(0, 2), ['/c', 'start'], 'start is what gives it its own window');
+  assert.equal(args[3], 'cmd');
+  assert.equal(args[4], '/s', '/s is what makes cmd strip exactly the outer quote pair below');
+  assert.equal(args[5], '/k', 'and /k is what keeps the window open after the banner');
+  assert.equal(args.includes('node'), false, 'never the bare word, which is a wish about PATH');
+  assert.ok(args[6].includes(cmdQuote(process.execPath)), 'the node running this, quoted for cmd.exe');
+  assert.match(args[6], /^".*"$/, 'and the whole tail carries the outer pair /s consumes');
+  assert.match(args[6], /_watch review-1-2"$/);
+  assert.equal(args.length, 7, 'the tail is ONE argument: cmd /k does not parse an argv');
+
+  // A path with a space is quoted once, by cmdQuote — the spawn is verbatim, so
+  // this is the only quoting pass and it has to be right. Both quoted at once is
+  // the case that was broken: four quotes inside, one outer pair around them.
+  const spaced = watchLaunchArgs('review-1-2', {
+    node: `C:${bs}Program Files${bs}nodejs${bs}node.exe`,
+    self: `D:${bs}my repo${bs}codex-dispatch.mjs`,
+    title: 'codex-dispatch review-1-2',
+  });
+  assert.equal(spaced[2], '"codex-dispatch review-1-2"', 'the title start reads must survive as one token');
+  assert.equal(
+    spaced[6],
+    `""C:${bs}Program Files${bs}nodejs${bs}node.exe" "D:${bs}my repo${bs}codex-dispatch.mjs" _watch review-1-2"`
+  );
+
+  // And it fails CLOSED on a path cmd.exe would re-parse, exactly like every
+  // other value bound for a command line here — a refusal that names the fault
+  // beats a window running something else.
+  assert.throws(
+    () => watchLaunchArgs('review-1-2', { node: `C:${bs}node%dir${bs}node.exe` }),
+    (err) => err.code === 'CMD_UNQUOTABLE'
+  );
+  assert.throws(
+    () => watchLaunchArgs('review-1-2', { self: `D:${bs}re!po${bs}codex-dispatch.mjs` }),
+    (err) => err.code === 'CMD_UNQUOTABLE'
+  );
 });
 
 test('cmdQuote: % ! and " are refused, because no escaping on a command line reaches them', () => {

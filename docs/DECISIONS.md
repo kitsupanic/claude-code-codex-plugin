@@ -293,7 +293,7 @@ Things the brief left open, decided here:
   Populating both costs a duplicated line and removes the guess.
 - **`tests/packaging.test.mjs` asserts the manifests rather than trusting
   them** — version identical in the three places that carry it, `source: "./"`
-  resolving to a real `plugin.json`, required frontmatter on all six commands
+  resolving to a real `plugin.json`, required frontmatter on all seven commands
   and the skill, and no `hooks/` directory. A broken manifest makes the plugin
   silently uninstallable, and no other test in this repo would notice.
 - **`supervisor.log` and (in tests) `child.pid` live in the job dir** alongside
