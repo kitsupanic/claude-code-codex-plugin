@@ -4132,6 +4132,275 @@ test('a record lock that changed hands is not removed by the writer that finishe
   }
 });
 
+// ------------------------------------------------------- record-lock fixtures
+//
+// The lock tests below fabricate the artifacts a crashed or descheduled writer
+// leaves behind — a lock, a staging directory, a break tombstone — and then run
+// REAL cancels against them. Shared here because the four of them differ only in
+// which artifact is planted and how old it is.
+const DEAD_PID = 424242; // ESRCH on every platform this suite runs on
+const lockPathOf = (dir) => path.join(dir, 'job.json.lock');
+const holderOf = (p) => path.join(p, 'holder');
+
+function lockJob(id, role, extra = {}) {
+  const dir = path.join(JOBS, id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+    recordVersion: RECORD_VERSION, id, role, state: 'running',
+    started: new Date().toISOString(), supervisorPid: null, codexPid: null,
+    launch: 'spawning', ...extra,
+  }));
+  return dir;
+}
+
+// A lock-shaped directory: `holder` is a pid to write inside it, or null for the
+// holderless artifact. Never assembled in place by the runtime — that is what the
+// staging rename exists to prevent — so a test that wants one builds it directly.
+function lockLike(p, holder) {
+  fs.mkdirSync(p, { recursive: true });
+  if (holder !== null) fs.writeFileSync(holderOf(p), `${holder}\n`);
+  return p;
+}
+
+// Older than any acquisition in flight could be (the stale age is five seconds).
+function aged(p) {
+  const t = new Date(Date.now() - 60000);
+  fs.utimesSync(p, t, t);
+  return p;
+}
+
+const tombsIn = (dir) => fs.readdirSync(dir).filter((n) => n.startsWith('job.json.lock.stale-'));
+
+test('a record lock whose holder cannot be READ is not broken, however old it is', () => {
+  // ENOENT ALONE IS "NO HOLDER". `lockHolderLives` used to answer null — no
+  // evidence, let the clock decide — for every failed read of the holder file,
+  // which hands the age-only break to any transient EBUSY, EPERM, EIO or ACL on a
+  // LIVE holder's file: the one reading that must never authorize a break is the
+  // one that failed. Now only ENOENT is absence; anything else is a holder that
+  // exists and could not be read, and an unreadable holder answers ALIVE.
+  //
+  // Unreadable on Windows without an ACL: the holder is a DIRECTORY of that name,
+  // so `readFileSync` raises EISDIR — a real non-ENOENT error out of the real
+  // call, not an injected one. The genuine-absence half of the rule (a holderless
+  // lock IS broken) is pinned by the staging-artifact test above; this is the
+  // other half, and the two together are the whole of the rule.
+  const id = 'lockunread-1-99961';
+  const dir = lockJob(id, 'lockunread');
+  const lock = aged(lockLike(lockPathOf(dir), null));
+  fs.mkdirSync(holderOf(lock));
+  try {
+    const t0 = Date.now();
+    const c = run(['cancel', id]);
+    // Non-vacuity (observed): with `lockHolderLives`'s unreadable branch reverted
+    // to null, this cancel CONDEMNS the lock and renames it away — the last
+    // assertion below fails on the hand-over warning that follows. The lock still
+    // survives, because `tombIsCondemned` refuses to remove a tombstone whose
+    // evidence was unreadable and puts it back; that is the second line of
+    // defence doing its job, and it is not this rule.
+    assert.notEqual(c.status, 0, `a lock that could not be proved dead must not be broken: ${c.stderr}`);
+    assert.match(c.stderr, /KILL NOT RECORDED/);
+    assert.ok(Date.now() - t0 > 10000,
+      'the cancel waited out its lock timeout rather than breaking in at five seconds');
+    assert.equal(record(id).state, 'running', 'and it wrote nothing under a lock it never held');
+    assert.equal(fs.existsSync(lock), true, 'the lock is exactly where it was');
+    assert.equal(fs.statSync(holderOf(lock)).isDirectory(), true,
+      'holder and all — nothing here was removed, renamed or read past');
+    assert.deepEqual(tombsIn(dir), [], 'and no tombstone was cut for it');
+    assert.equal(/changed hands/.test(c.stderr), false,
+      'it was never even MOVED: a lock whose holder could not be read is not condemned at all,'
+      + ' so nothing downstream has to put it back');
+  } finally {
+    fs.rmSync(lock, { recursive: true, force: true });
+  }
+});
+
+test('a break removes only what it CONDEMNED: a successor that took the path is put back', async () => {
+  // THE ABA. Winning the tombstone rename is single-winner per RENAME, not per
+  // LOCK. Two breakers condemn the same dead lock; the first breaks it, acquires
+  // and publishes a LIVE lock at the same path; the second — descheduled in
+  // between — then renames that successor into its own tombstone and deletes it.
+  // Two writers again, by way of the mechanism meant to stop them, because a
+  // pathname was all that bound the decision to the act and the pathname is
+  // exactly what changed hands.
+  //
+  // The interleaving is posed rather than raced: the cancel is held at the new
+  // condemn-to-rename pause, and the test plays breaker B in the window. The
+  // signal that the cancel has REACHED that window is the aged staging orphan —
+  // the sweep runs immediately before the pause, so the orphan's disappearance
+  // means the lock has been condemned and not yet moved.
+  const id = 'lockaba-1-99962';
+  const dir = lockJob(id, 'lockaba');
+  const lock = lockPathOf(dir);
+  const l0 = aged(lockLike(lock, DEAD_PID));
+  const orphan = aged(lockLike(path.join(dir, 'job.json.lock.staging-424242-abcdef'), process.pid));
+  try {
+    const breaker = cancelling(id, { CODEX_DISPATCH_TEST_BREAK_PAUSE_MS: '8000' });
+    assert.ok(await poll(() => !fs.existsSync(orphan), 20000),
+      'the cancel must have condemned the lock and be waiting to move it');
+
+    // Breaker B, complete: L0 broken and gone, a LIVE successor published at the
+    // path by the atomic rename the runtime itself uses. Its holder is this test
+    // runner — a pid that is alive, so it can never age out from under the
+    // assertions below.
+    fs.renameSync(l0, path.join(dir, 'l0-taken-by-b'));
+    const mine = `${process.pid}\n`;
+    const stage = lockLike(path.join(dir, 'b-stage'), process.pid);
+    fs.renameSync(stage, lock);
+
+    const done = await breaker;
+    // Non-vacuity (observed): with `tombIsCondemned` forced to true, the resumed
+    // breaker DELETES L1 and takes the path — the three assertions that follow
+    // fail (no lock, no holder, no warning) and the cancel goes on to write
+    // `kill-pending` under a lock it took from a live holder, which is the
+    // lost-update window reopened by way of the mechanism meant to close it.
+    assert.equal(fs.existsSync(lock), true, "L1 is back at the lock path: it is not this breaker's to take");
+    assert.equal(fs.readFileSync(holderOf(lock), 'utf8'), mine,
+      'and it survived byte for byte — a mismatched tombstone is somebody\'s lock, not a tombstone');
+    assert.match(done.stderr, /WARNING: the record lock at .*job\.json\.lock changed hands/,
+      'the hand-over is announced, not swallowed');
+    assert.match(done.stderr, /moved back and NOT removed/);
+    assert.deepEqual(tombsIn(dir), [], 'nothing is stranded: the restore put it back where it was');
+    assert.equal(record(id).state, 'running',
+      'and the breaker wrote nothing: a failed break is not an acquisition');
+    assert.notEqual(done.code, 0, 'it refuses loudly instead');
+    assert.match(done.stderr, /KILL NOT RECORDED/);
+  } finally {
+    fs.rmSync(lock, { recursive: true, force: true });
+  }
+});
+
+test('the staging sweep MOVES before it removes, and its tombstone goes with it', async () => {
+  // `rmSync` on a live path is not a single-winner move and it is not atomic: it
+  // unlinks the holder file first, and a stage's owner checks the LOCK before
+  // publishing, never its own stage. So an aged-but-still-owned stage hollowed out
+  // by a sweep is renamed onto the lock path by its owner as an EMPTY lock — the
+  // holderless lock staged acquisition exists to make impossible. The sweep is
+  // therefore a rename to a unique tombstone first, and only then a removal.
+  //
+  // Held at the new sweep pause, which stands in for the sweeper dying between the
+  // two: what is visible from outside in that window is the whole point.
+  const id = 'locksweep-1-99963';
+  const dir = lockJob(id, 'locksweep', {
+    started: new Date(Date.now() - 3600000).toISOString(), launch: 'exec',
+  });
+  const lock = aged(lockLike(lockPathOf(dir), null)); // holderless: breakable, so the sweep runs
+  const orphan = aged(lockLike(path.join(dir, 'job.json.lock.staging-424242-abcdef'), process.pid));
+
+  const c = cancelling(id, { CODEX_DISPATCH_TEST_SWEEP_PAUSE_MS: '6000' });
+  assert.ok(await poll(() => !fs.existsSync(orphan) && tombsIn(dir).length > 0, 20000),
+    'mid-sweep: the orphan has left its own path and a tombstone stands for it');
+  assert.equal(fs.existsSync(lock), true,
+    'and the lock itself is untouched while its neighbour is swept');
+
+  const done = await c;
+  assert.equal(done.code, 0, `the artifacts must not wedge the job: ${done.stderr}`);
+  assert.equal(record(id).state, 'killed', 'the write went through the lock the cancel took');
+  assert.equal(fs.existsSync(orphan), false, 'the orphan is gone');
+  assert.deepEqual(tombsIn(dir), [], 'and so is every tombstone cut on the way');
+  assert.equal(fs.existsSync(lock), false, 'and the lock this cancel took is released behind it');
+});
+
+test('an abandoned break tombstone ages out like any other orphan', () => {
+  // The leak the shared suffix closes: a breaker that dies between its rename and
+  // its removal used to leave a directory that nothing would ever collect, because
+  // only `.staging-` was swept. One suffix for both means an abandoned tombstone
+  // is itself sweepable — and, like the staging suffix, it is strictly longer than
+  // the lock's own name, so no swept prefix can ever match the lock.
+  const id = 'locktomb-1-99964';
+  const dir = lockJob(id, 'locktomb', {
+    started: new Date(Date.now() - 3600000).toISOString(), launch: 'exec',
+  });
+  const lock = aged(lockLike(lockPathOf(dir), DEAD_PID));
+  const abandoned = aged(lockLike(path.join(dir, 'job.json.lock.stale-424242-abandon'), DEAD_PID));
+
+  const c = run(['cancel', id]);
+  // Non-vacuity (observed): with the `RECORD_LOCK_TOMB` arm of the sweep's filter
+  // removed, the abandoned tombstone survives this cancel and the assertion below
+  // fails; everything else about the run is unchanged.
+  assert.equal(c.status, 0, c.stderr);
+  assert.equal(fs.existsSync(abandoned), false,
+    'an aged tombstone is swept by the next acquisition that reaches the break path');
+  assert.deepEqual(tombsIn(dir), [], 'including the one this break cut for itself');
+  assert.equal(fs.existsSync(lock), false, 'and the lock it broke and took is released');
+});
+
+test('a sweep interrupted after its rename strands a tombstone, never a hollowed stage', async () => {
+  // The other half of move-before-remove: the state a sweeper that DIES mid-sweep
+  // leaves on disk. Only what it moved can be half-removed, so the residue is a
+  // tombstone — the stage is whole somewhere, or gone, and never a directory its
+  // owner can publish empty onto the lock path.
+  //
+  // The owner is played by this test: it holds an aged stage and does exactly what
+  // `stageRecordLock` does with one, which is to publish it the moment the lock
+  // path is free. Losing must mean ENOENT, not a hollow publish.
+  const id = 'lockhollow-1-99965';
+  const dir = lockJob(id, 'lockhollow', {
+    started: new Date(Date.now() - 3600000).toISOString(), launch: 'exec',
+  });
+  const lock = aged(lockLike(lockPathOf(dir), DEAD_PID));
+  const stage = aged(lockLike(path.join(dir, 'job.json.lock.staging-424242-owned'), process.pid));
+
+  const child = spawn(process.execPath, [RUNTIME, 'cancel', id], {
+    env: { ...baseEnv, CODEX_DISPATCH_TEST_SWEEP_PAUSE_MS: '10000' }, cwd: REPO,
+  });
+  const closed = new Promise((r) => child.on('close', r));
+  try {
+    // A holderless lock at the lock path is the defect, and it is confirmed rather
+    // than snapped: `rmSync` releasing a lock unlinks the holder a moment before
+    // the directory, and that transient is not a hollow publish. A published hollow
+    // stage has no releaser and stays.
+    let hollow = false;
+    const hollowNow = () => fs.existsSync(lock) && !fs.existsSync(holderOf(lock));
+    // Waited for in a form that is true whichever way the sweep works — the stage
+    // no longer answers for its holder, because it was moved away or emptied — so
+    // the interruption below lands at the same point in both, and what differs is
+    // only what is left behind.
+    assert.ok(await poll(() => {
+      if (hollowNow()) hollow = true;
+      return !fs.existsSync(holderOf(stage));
+    }, 20000, 20), 'the sweeper must have reached the middle of its sweep');
+    child.kill('SIGKILL');
+    await closed;
+    assert.equal(fs.existsSync(stage), false,
+      'the stage was moved WHOLE, not emptied where it stood');
+
+    // The lock the killed sweeper never got as far as breaking: some later writer
+    // breaks it and releases it, which is the ordinary way the path comes free —
+    // and a free path is exactly when a stage's owner publishes.
+    assert.equal(fs.readFileSync(holderOf(lock), 'utf8'), `${DEAD_PID}\n`,
+      'the lock is as it was: a sweep never touches it');
+    fs.rmSync(lock, { recursive: true, force: true });
+
+    // The owner, resuming into that window and doing what `stageRecordLock` does.
+    // Non-vacuity (observed): with the sweep reverted to removing the stage in
+    // place — holder unlinked, then the pause, then the directory, which is
+    // `rmSync`'s own order — the kill leaves the stage hollow, this rename
+    // SUCCEEDS, and a lock with no owner stands at the lock path.
+    let ownerErr = null;
+    if (!fs.existsSync(lock)) {
+      try { fs.renameSync(stage, lock); } catch (err) { ownerErr = err; }
+    }
+    assert.equal(ownerErr && ownerErr.code, 'ENOENT',
+      'the owner loses cleanly: what it staged was gone, not emptied under it');
+    assert.equal(hollow || hollowNow(), false,
+      'and no lock without an owner ever stood at the lock path');
+
+    // The residue of a sweep that died halfway is a tombstone and nothing else —
+    // and one that ages out, since the rename it was made by carries the mtime the
+    // stage had (see the abandoned-tombstone test above).
+    const stranded = tombsIn(dir);
+    assert.equal(stranded.length, 1, 'exactly one tombstone is stranded by the interrupted sweep');
+    const strandedAt = path.join(dir, stranded[0]);
+    assert.equal(fs.readFileSync(holderOf(strandedAt), 'utf8'), `${process.pid}\n`,
+      'with the contents it was moved with: only what this process moved was ever to be removed');
+    assert.ok(Date.now() - fs.statSync(strandedAt).mtimeMs > 5000,
+      'and aged from birth, so the next sweep collects it');
+  } finally {
+    child.kill('SIGKILL');
+    fs.rmSync(lock, { recursive: true, force: true });
+  }
+});
+
 test('a cancel does not leave a reason it did not write, and result reads the state first',
   () => {
     // A live record CAN carry a reason: a version skew puts one beside a state

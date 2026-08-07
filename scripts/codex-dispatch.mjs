@@ -778,15 +778,39 @@ const RECORD_LOCK_HOLDER = 'holder';
 // A suffix on the lock's own name, so the staging directories sort beside it and
 // can never be confused with it: the lock is one exact path, and this is not it.
 const RECORD_LOCK_STAGING = '.staging-';
+// The tombstone a break moves a lock to, and the tombstone the staging sweep
+// moves an orphan to. One suffix for both, so an abandoned tombstone is itself
+// sweepable: a breaker that dies between the rename and the removal then leaks a
+// directory that ages out rather than one that never goes. Like the staging
+// suffix it is a suffix on the lock's own name, strictly longer than it, so no
+// swept prefix can ever match the lock — which is one exact path.
+const RECORD_LOCK_TOMB = '.stale-';
 
 const lockHolderLine = () => `${process.pid}\n`;
+const lockTombPath = (lock) => `${lock}${RECORD_LOCK_TOMB}${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
 
-// Alive — or unreadable, which is no evidence either way and leaves the age test
-// to decide.
-function lockHolderLives(lock) {
-  let text;
-  try { text = fs.readFileSync(path.join(lock, RECORD_LOCK_HOLDER), 'utf8'); } catch { return null; }
-  const m = String(text).trim().match(/^(\d+)/);
+// The holder file as EVIDENCE, not as a verdict: read once, so the breaker below
+// can judge and then condemn the same bytes rather than two different readings of
+// the same path. ENOENT ALONE IS "NO HOLDER". Every other error — EBUSY, EPERM,
+// EIO, an ACL, a cloud filter waking a file back up — is a holder file that
+// EXISTS and could not be read, which is evidence for a holder and not against
+// one.
+function lockHolderEvidence(lock) {
+  try { return { text: fs.readFileSync(path.join(lock, RECORD_LOCK_HOLDER), 'utf8') }; }
+  catch (err) { return err && err.code === 'ENOENT' ? { absent: true } : { unreadable: true }; }
+}
+
+// Alive — or null, no evidence either way, which leaves the age test to decide.
+// An UNREADABLE holder answers ALIVE, not null: the breaker's obligation is to
+// PROVE the holder gone, a read that failed proves nothing, and this is the only
+// consumer of that read that could fail open — one transient EBUSY on a live
+// holder's file would otherwise authorize breaking a live lock. Null is therefore
+// reserved for a holder that is genuinely not there (ENOENT) or not a pid: the
+// pre-upgrade artifact, which is the one age-only break there is.
+function lockHolderLives(ev) {
+  if (ev.unreadable) return true;
+  if (ev.absent) return null;
+  const m = String(ev.text).trim().match(/^(\d+)/);
   if (!m || !isPid(Number(m[1]))) return null;
   const pid = Number(m[1]);
   if (pid === process.pid) return true; // our own re-entry: never break it
@@ -834,25 +858,90 @@ function stageRecordLock(dir, lock) {
     try { fs.rmSync(stage, { recursive: true, force: true }); } catch { /* best effort */ }
     return { acquired: false };
   }
-  try { fs.renameSync(stage, lock); return { acquired: true }; } catch { /* held by someone else */ }
+  // A failure here is somebody else holding the path — or this stage having been
+  // swept out from under us while it aged (see sweepStaleStaging), in which case
+  // there is nothing to publish and nothing to remove. Both say the same thing to
+  // the caller: go round again.
+  try { fs.renameSync(stage, lock); return { acquired: true }; } catch { /* held by someone else, or swept */ }
   try { fs.rmSync(stage, { recursive: true, force: true }); } catch { /* best effort */ }
   return { acquired: false };
 }
 
-// Orphans of acquirers that died mid-stage. They are never mistaken for the lock
-// — the lock is one exact path — so they cost nothing but a directory, and they
-// are only swept once they are older than any acquisition in flight could be.
+// Orphans of acquirers that died mid-stage, and tombstones of breakers that died
+// mid-break. They are never mistaken for the lock — the lock is one exact path,
+// and both suffixes are strictly longer than it — so they cost nothing but a
+// directory, and they are only swept once they are older than any acquisition in
+// flight could be.
+//
+// SWEEPING IS A RENAME FIRST, THEN A REMOVAL, for the same reason breaking is.
+// `rmSync` on a live path is not a single-winner move and it is not atomic: it
+// unlinks the holder file first, and a stage's owner does not check its own stage
+// before publishing it — it checks the lock. So an aged-but-still-owned stage
+// hollowed out by a sweep gets renamed onto the lock path by its owner as an
+// EMPTY lock, which is the holderless lock the staged acquisition exists to make
+// impossible. Renaming the whole directory to a unique tombstone first decides
+// the race the way every other race here is decided: the rename fails, and the
+// owner (or another sweeper) has it, and its contents are never touched. Only
+// what this process moved is removed, and a removal interrupted halfway strands
+// an empty tombstone — never anything on a stage or a lock path.
+//
+// AND AN AGED TOMBSTONE IS NOT COLLECTED WHILE ITS HOLDER LIVES. Age alone is
+// evidence enough for a STAGING orphan — its holder never published, so nothing
+// depends on it — but a tombstone can hold a LIVE lock: a slow holder past five
+// seconds has an aged lock, a mismatch-bound breaker condemns it, and what is
+// standing in the tombstone until the restore runs is that holder's own lock,
+// carrying its own mtime. A second condemner sweeping it by age would delete a
+// live holder's lock, the one path in this whole mechanism where a live lock is
+// removed rather than stranded. So a tombstone with a live holder is a mid-flight
+// restore's cargo, not litter, and it is left alone — for the restore, or for a
+// later sweep once the holder is genuinely dead. An unreadable holder is skipped
+// too, fail-closed in the same direction as the break; an absent one is swept,
+// because a hollow tombstone is litter and nothing else.
 function sweepStaleStaging(dir) {
+  const lock = path.join(dir, RECORD_LOCK);
   let names;
   try { names = fs.readdirSync(dir); } catch { return; }
   for (const name of names) {
-    if (!name.startsWith(`${RECORD_LOCK}${RECORD_LOCK_STAGING}`)) continue;
+    const isTomb = name.startsWith(`${RECORD_LOCK}${RECORD_LOCK_TOMB}`);
+    if (!isTomb && !name.startsWith(`${RECORD_LOCK}${RECORD_LOCK_STAGING}`)) continue;
     const p = path.join(dir, name);
     try {
       if (Date.now() - fs.statSync(p).mtimeMs <= RECORD_LOCK_STALE_MS) continue;
-      fs.rmSync(p, { recursive: true, force: true });
-    } catch { /* best effort */ }
+      if (isTomb && lockHolderLives(lockHolderEvidence(p)) === true) continue;
+      const tomb = lockTombPath(lock);
+      fs.renameSync(p, tomb);
+      // TEST HOOK: stands in for this process dying (or being descheduled) between
+      // the rename that wins the orphan and the removal of what it won. What is
+      // under test is the state visible from outside in that window: the orphan
+      // gone from its own path, and nothing but a tombstone to show for it.
+      sleepSync(testPauseMs('CODEX_DISPATCH_TEST_SWEEP_PAUSE_MS'));
+      fs.rmSync(tomb, { recursive: true, force: true });
+    } catch { /* held, already swept, or gone: not ours to touch */ }
   }
+}
+
+// THE DESTROYER MUST PROVE IT IS DESTROYING WHAT IT CONDEMNED. Winning the
+// tombstone rename is single-winner per RENAME, which is not the same as per
+// LOCK: two breakers can both condemn the same dead lock, the first break it,
+// re-acquire and publish a LIVE successor at the same path, and the second —
+// descheduled in between — then move that successor into its own tombstone and
+// delete it, which is two writers again by way of the mechanism meant to stop
+// them. A pathname is all that bound the decision to the act, and the pathname is
+// exactly what changed hands. So the evidence taken at decision time is checked
+// against the tombstone before anything is removed: the same mtime (never
+// refreshed while a lock lives, and a rename does not touch it) AND the same
+// holder — the same pid, or the same genuine absence of one. An unreadable holder
+// proves nothing and therefore matches nothing, as does a decision taken without
+// a readable mtime at all.
+function tombIsCondemned(tomb, mtimeMs, condemned) {
+  if (mtimeMs === null || condemned.unreadable) return false;
+  let st;
+  try { st = fs.statSync(tomb); } catch { return false; }
+  if (st.mtimeMs !== mtimeMs) return false;
+  const now = lockHolderEvidence(tomb);
+  if (now.unreadable) return false;
+  if (condemned.absent) return now.absent === true;
+  return now.absent !== true && String(now.text).trim() === String(condemned.text).trim();
 }
 
 function withRecordLock(dir, fn) {
@@ -865,16 +954,36 @@ function withRecordLock(dir, fn) {
     // there is nothing to wait for, so it is reported like the old non-EEXIST
     // `mkdir` failure was.
     if (staged.error) return { locked: false, error: staged.error };
+    // A LOCK THAT WILL NOT STAT HAS NO AGE, and the two ways to fail want opposite
+    // moves. ENOENT is the lock GONE — the path is free, and the productive move is
+    // straight back to staging rather than a wait. Every other error (EPERM, EBUSY,
+    // EIO, an ACL) is a lock that is THERE and unmeasurable: no age proof, so no
+    // break, and nothing to do but wait like any contended iteration. Both used to
+    // land on `age = Infinity` and condemn: the absent lock renamed nothing and the
+    // unreadable one went round the condemn-rename-restore path every 20ms — a
+    // warning storm, and a lock path repeatedly emptied on no evidence at all.
     let age = Infinity;
-    try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { age = Infinity; }
-    if (age > RECORD_LOCK_STALE_MS && lockHolderLives(lock) !== true) {
+    let mtimeMs = null;
+    let vanished = false;
+    try { const st = fs.statSync(lock); mtimeMs = st.mtimeMs; age = Date.now() - st.mtimeMs; }
+    catch (err) { vanished = !!err && err.code === 'ENOENT'; }
+    if (vanished) {
+      if (Date.now() >= deadline) return { locked: false };
+      continue;
+    }
+    // The holder is read ONCE, and what is read is kept: the verdict below and the
+    // identity check after the break must be about the same bytes, or the break is
+    // bound to nothing but a pathname (see tombIsCondemned). No mtime, no
+    // condemnation: an age that was never measured is not an age.
+    const condemned = mtimeMs !== null && age > RECORD_LOCK_STALE_MS ? lockHolderEvidence(lock) : null;
+    if (condemned && lockHolderLives(condemned) !== true) {
       // The holder died — PROVED (see lockHolderLives), not assumed from the
       // clock; or there is no holder at all, which since acquisition became
       // atomic can only be an artifact or a corrupt directory. Breaking the
       // lock is safe in a way stealing a role claim is not: the loser of this
       // race rewrites from a fresh read.
       //
-      // But BREAKING IT MUST HAVE EXACTLY ONE WINNER, and `rmSync` has none.
+      // But BREAKING IT MUST NOT BE A DELETE, and `rmSync` has no winner at all.
       // Two processes can both stat the same stale lock and both decide to
       // break it; the second, descheduled after its stat, deleted the FRESH
       // lock the first had already created and was writing under — which
@@ -883,13 +992,75 @@ function withRecordLock(dir, fn) {
       // primitive the role claims use (see reclaimClaim), and only the process
       // that won the rename removes what it moved. A rename that fails means
       // somebody else broke it first — nothing to do but go round again.
-      const tomb = `${lock}.stale-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+      //
+      // THAT RENAME IS SINGLE-WINNER PER RENAME, NOT PER LOCK, which is the
+      // narrower guarantee this used to claim: the loser of the break can win a
+      // LATER rename of the live successor standing at the same path. So the
+      // destructive step is bound to the condemned lock's identity and not to its
+      // pathname — the tombstone is checked against the evidence before it is
+      // removed (see tombIsCondemned), and a successor found in it is put back.
+      //
+      // Swept BEFORE the break, never after: the sweep collects aged tombstones
+      // too, and this process's own tombstone is aged from birth (it holds a lock
+      // condemned for its age). Sweeping after would let it remove, unverified,
+      // the very directory the check below exists to verify.
+      sweepStaleStaging(dir);
+      // TEST HOOK: stands in for this process being descheduled between condemning
+      // the lock and moving it — the window in which the lock it judged can be
+      // broken by somebody else and replaced by a LIVE successor at the same path.
+      // A gap of a chosen length there is not producible on demand; what is under
+      // test is that the removal below is bound to the evidence, not to the path.
+      sleepSync(testPauseMs('CODEX_DISPATCH_TEST_BREAK_PAUSE_MS'));
+      const tomb = lockTombPath(lock);
       let broke = false;
       try { fs.renameSync(lock, tomb); broke = true; } catch { /* another breaker won it */ }
-      sweepStaleStaging(dir);
       if (broke) {
-        try { fs.rmSync(tomb, { recursive: true, force: true }); } catch { /* a tombstone; harmless */ }
-        continue;
+        // Gone already: a sweeper collected what we condemned, which is the same
+        // outcome by another hand. Nothing to prove and nothing to remove — and
+        // silence is right by construction now that the sweep skips a tombstone
+        // whose holder is alive: what a sweeper can collect out from under this
+        // verification is a tombstone whose holder was dead or absent, which is
+        // exactly what this break condemned it for.
+        if (!fs.existsSync(tomb)) continue;
+        if (tombIsCondemned(tomb, mtimeMs, condemned)) {
+          try { fs.rmSync(tomb, { recursive: true, force: true }); } catch { /* a tombstone; harmless */ }
+          continue;
+        }
+        // Not what we condemned: this rename moved a LIVE successor off the lock
+        // path, so it goes straight back and is never removed — a mismatched
+        // tombstone is somebody's lock, not a tombstone. The residual is stated in
+        // DESIGN.md: the path stands empty for the microseconds in between, and a
+        // third writer publishing into it makes the restore fail and strands the
+        // victim's lock in the tombstone, where it is left to be inspected rather
+        // than deleted. It is not treated as a won break either way.
+        let restored = true;
+        try { fs.renameSync(tomb, lock); } catch { restored = false; }
+        // A FAILED RESTORE HAS TWO CAUSES AND THEY ARE NOT THE SAME NEWS. The loud
+        // one is the lock path being occupied — a third writer published into the
+        // microseconds the restore needed — and then somebody's lock really is
+        // stranded in a tombstone and its holder really has lost mutual exclusion.
+        // The other is the TOMBSTONE having gone: a concurrent sweeper collected it
+        // mid-verification, and warning about a directory to inspect that no longer
+        // exists is a false alarm. It is also the calmer truth, because the sweep
+        // will not collect a tombstone whose holder is alive: one it did collect
+        // held a dead or absent holder, which is what this break condemned.
+        if (restored) {
+          process.stderr.write(
+            `WARNING: the record lock at ${lock} changed hands between the decision to break it as\n`
+            + `stale and the break itself. The successor was moved back and NOT removed.\n`);
+        } else if (!fs.existsSync(tomb)) {
+          process.stderr.write(
+            `WARNING: the record lock at ${lock} changed hands between the decision to break it as\n`
+            + `stale and the break itself, and the condemned tombstone was collected by a concurrent\n`
+            + `sweeper before it could be put back. Its holder was dead or absent — nothing live was\n`
+            + `removed — and the lock path is free for the next acquirer.\n`);
+        } else {
+          process.stderr.write(
+            `WARNING: the record lock at ${lock} changed hands between the decision to break it as\n`
+            + `stale and the break itself, and it could not be moved back — another writer took the\n`
+            + `path first. It is left in ${tomb} rather than removed, so it can be inspected. Its\n`
+            + `holder has lost mutual exclusion: stop what is writing this job before touching it.\n`);
+        }
       }
     }
     if (Date.now() >= deadline) return { locked: false };

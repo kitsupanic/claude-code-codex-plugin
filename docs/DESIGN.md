@@ -318,6 +318,16 @@ written in between: a cancel's `kill-pending` vanishing by way of the mechanism
 that stops a crash from wedging a job. So the holder writes its **pid** inside
 the lock, and a breaker needs both the age AND a holder it can show is gone.
 
+**Only `ENOENT` is "no holder".** The proof reads the holder file, and a read can
+fail for reasons that have nothing to do with the holder: `EBUSY`, `EPERM`,
+`EIO`, an ACL, a cloud filter waking the file back up. Collapsing every one of
+those to "nothing there" made a transient error on a *live* holder's file the
+permission to break its lock — the one place in this runtime where an unreadable
+answer failed open. An unreadable holder file is evidence a holder **exists**, so
+it now reads as alive and no break follows; the age-only break is reserved for a
+holder that is genuinely absent, which since acquisition became atomic can only
+be a pre-upgrade artifact or a corrupt directory.
+
 **A visible lock always has a holder**, which is what makes that proof worth
 anything. `mkdir` followed by a write is two steps, and between them sits a lock
 with nothing inside it: a second writer stats it past the stale age, finds no
@@ -333,8 +343,36 @@ acquirer that died mid-stage are swept once they age past the stale mark, and ar
 never mistaken for the lock, which is one exact path. A holderless lock is
 consequently no longer a live acquirer — it is a pre-upgrade artifact or a
 corrupt directory — and past the stale age it is still broken, because neither
-may wedge a job for ever. The break itself is unchanged: one atomic rename to a
-tombstone, so exactly one breaker can win.
+may wedge a job for ever.
+
+**The break is a rename to a tombstone, and the tombstone is checked before it is
+removed.** The rename alone was described as giving "exactly one winner"; it does
+not. It is single-winner per *rename*, not per lock, and the difference is a
+whole ABA: two breakers condemn the same dead lock, the first breaks it,
+re-acquires and publishes a live successor at the same path, and the second —
+descheduled in between — renames that **successor** into its own tombstone and
+deletes it. Two writers again, by way of the mechanism that exists to prevent
+them. So the decision records what it condemned — the lock's mtime, which is
+never refreshed while a lock lives, and its holder as read at that moment — and
+the destructive step happens only against a tombstone that still matches both.
+A mismatch means a live successor was moved, so it is renamed straight back and
+never removed. The guarantee is therefore **per condemned lock**: the directory a
+breaker destroys is the directory it proved dead.
+
+**Sweeping is a rename first too**, for the same reason. A recursive `rmSync` of
+an aged staging directory unlinks the holder file first, and the stage's owner
+never checks its own stage before publishing — it checks the lock — so a hollowed
+stage gets renamed onto the lock path as an **empty** lock, which is precisely
+what the staged acquisition exists to make impossible. The sweep therefore
+renames an aged orphan to a unique tombstone (a failed rename means the owner or
+another sweeper has it, and its contents are never touched) and only then removes
+what it moved. The owner's own rename then fails and it goes round again. The
+sweep collects abandoned **break** tombstones as well, under the same age gate
+plus one more test — the tombstone's holder must not be alive: a breaker that
+dies between its rename and its removal would otherwise leak one for ever, while
+a tombstone holding a *live* lock (a slow holder condemned for its age, waiting
+on a restore) must not be collected at all. Both suffixes are strictly longer
+than the lock's name, so nothing the sweep matches can ever be the lock itself.
 
 Release is **by identity, not by path**. `rmSync` on the lock path removes
 whatever is there, and after a legitimate stale break that is somebody else's
@@ -861,6 +899,26 @@ than opening nothing and claiming otherwise.
   different releases writing the same job directory at the same time, which is
   already the record-version-mismatch domain — a mismatch a supervisor refuses
   on sight. One runtime per jobs root is the cure, and it is the rule anyway.
+- **A break that moved a live successor puts it back, and the put-back can
+  lose.** The stale break is bound to the condemned lock's identity, so a breaker
+  that finds a successor in its tombstone renames it back to the lock path rather
+  than removing it — but the path stands empty for the microseconds in between,
+  and a third writer publishing into that gap makes the restore fail. The victim's
+  lock is then stranded in the tombstone: it is **left there rather than removed**,
+  so it can be inspected, and the breaker says so loudly on stderr, naming the
+  tombstone and warning that the victim has lost mutual exclusion. That stranded
+  tombstone is swept once it ages past the stale mark *and* its holder is no
+  longer alive: the sweep skips an aged tombstone whose holder file names a live
+  pid, because such a tombstone is a mid-flight restore's cargo — a live holder's
+  own lock — and collecting it by age would be the one place in this mechanism
+  where a live lock is deleted rather than stranded. The residual is two ways of
+  reading a holder wrongly, and both fall toward leaving the tombstone, which is
+  the safe direction: a sweep that lands on the exact instant of the holder's
+  death (and an unreadable holder file, which is skipped fail-closed) leaves a
+  tombstone standing until the next sweep, and pid reuse makes a dead holder look
+  alive and leaves it standing for as long as the impostor runs. The precondition
+  for the stranding itself is three writers on one job directory inside one
+  microsecond window, against a lock that was already dead enough to condemn.
 - **Windows `shell: true` quoting refuses what it cannot escape.** `codex.cmd`
   needs a shell, so `spawnCodex`/`runCodexSync` join argv into one command line
   with `cmdQuote`. Three characters cannot survive that command line and are

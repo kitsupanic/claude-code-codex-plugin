@@ -3,6 +3,95 @@
 Versioning rule: **a push that changes behavior MUST bump the version** — see
 [README → Releases and versioning](../README.md#releases-and-versioning) for why.
 
+## 0.8.3
+
+A second opinion from GPT-5.6 on 0.8.2's own lock rework — the entry below —
+read against the source before a line was changed, and the pre-commit review's
+three closing notes with it. All three findings confirmed by adjudication; one
+reproduced live. Patch bump: no new verb, no schema change, three fixes, and a
+shared thesis: **the destroyer must prove it is destroying the thing it
+condemned.**
+
+**The stale break is bound to the condemned lock's identity, not to its
+pathname.** The entry below called the rename to a tombstone "exactly one
+winner". It is one winner per *rename*, which is not the same as per *lock*,
+and the gap between the two is a whole ABA: two breakers stat the same dead
+lock and both condemn it, the first breaks it, re-acquires and publishes a
+**live successor** at the same path — and the second, descheduled in between,
+renames that successor into its own tombstone and deletes it. Two writers in
+the critical section, arrived at by way of the mechanism that exists to stop
+them, and a pathname was the whole of what bound the decision to the act. So
+the decision now records what it condemned: the lock's **mtime** — never
+refreshed while a lock lives, and untouched by a rename — and its **holder** as
+read at that moment, a pid or a genuine absence. The removal runs only against
+a tombstone that still matches both. A mismatch means a live successor was
+moved, so it is renamed straight back, never removed, and said loudly: a
+mismatched tombstone is somebody's lock, not a tombstone. What is left is
+stated rather than claimed closed — the lock path stands empty for the
+microseconds the restore needs, and a third writer publishing into that gap
+makes the restore fail. The victim's lock is then **stranded in the tombstone
+rather than deleted**, where it can be inspected, and DESIGN's known issues
+carry it as the three-writers-in-one-microsecond residual it is.
+
+**Only `ENOENT` is "no holder".** The proof of a dead holder reads the holder
+file, and a read can fail for reasons that have nothing to do with the holder:
+an antivirus sharing violation, an ACL, `EIO`, a cloud filter waking the file
+back up. Every one of them collapsed to "nothing there", which made a transient
+error on a **live** holder's file the permission to break its lock — the one
+read in this runtime that failed open, in the one place that cannot afford to.
+An unreadable holder file is evidence a holder **exists**: it answers alive now,
+the breaker's obligation is unmet, and no break follows. The age-only break is
+reserved for a holder that is genuinely absent or is not a pid at all, which
+since acquisition became atomic can only be a pre-upgrade artifact or a corrupt
+directory. **A lock that will not stat no longer fabricates staleness** for the
+matching reason: both failures used to land on an infinite age and condemn, so
+an absent lock renamed nothing and an unreadable one went round the
+condemn-rename-restore path every 20ms — a warning storm over a lock path
+repeatedly emptied on no evidence at all. `ENOENT` is the lock **gone** and
+re-stages immediately; anything else is a lock that is **there** and
+unmeasurable, and an age that was never measured is not an age.
+
+**The staging sweep is a rename first, then a removal**, for the same reason
+the break is. A recursive `rmSync` is not atomic and has no winner: it unlinks
+the holder file before the directory, and a stage's owner never checks its own
+stage before publishing — it checks the lock. So an aged-but-still-owned stage
+hollowed out by a sweep gets renamed onto the lock path by its owner as an
+**empty lock**, which is precisely the holderless lock the staged acquisition
+exists to make impossible; reproduced on this machine as `acquired: true` over
+a lock directory with zero entries. An aged orphan is moved to a unique
+tombstone first, so a failed rename means the owner or another sweeper has it
+and its contents are never touched, only what this process moved is removed,
+and a removal interrupted halfway strands an empty tombstone rather than
+anything on a stage or a lock path. The sweep now collects **abandoned break
+tombstones** too, so a breaker that dies between its rename and its removal
+leaks a directory that ages out instead of one that never goes — but it refuses
+any tombstone whose holder is **alive**, and skips an unreadable one
+fail-closed in the same direction as the break. A tombstone can hold a live
+lock: a slow holder past the stale mark is condemned for its age, and what
+stands in the tombstone until the restore runs is that holder's own lock. A
+tombstone with a live holder is a mid-flight restore's cargo, not litter, and
+collecting it by age would be the single path in this whole mechanism where a
+live lock is deleted rather than stranded.
+
+**Two new WARNING shapes, and the split between them is honest.** A break that
+moved a live successor and put it back says so and names nothing to inspect. A
+break whose condemned tombstone was collected by a concurrent sweeper before
+the put-back could run says *that*, and says it calmly: the sweep will not
+collect a tombstone whose holder is alive, so one it did collect held a dead or
+absent holder — exactly what the break condemned it for — and nothing live was
+removed. Only the third case, a restore that lost the lock path to another
+writer, carries the loud sentence: the tombstone is named, it is left standing,
+and its holder has lost mutual exclusion.
+
+**Test hooks: two new pause points.** One stands a process between condemning
+a lock and moving it — the window in which a live successor can take the path —
+and one inside the sweep between the rename that wins an orphan and the removal
+of what it won, which poses the interrupted sweep from outside. Both go through
+`testPauseMs` like the rest.
+
+**Tests: 95 → 100 in the dispatch suite, 154 total.** Each new one was pinned
+non-vacuously against a deliberately broken copy of the guard it covers.
+
 ## 0.8.2
 
 A two-model review of `5f9f292..HEAD` — the Claude arm reading beside the suite,

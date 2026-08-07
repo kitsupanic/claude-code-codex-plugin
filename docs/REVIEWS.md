@@ -2,8 +2,9 @@
 
 Every constraint in the runtime traces to an entry here. The catalog records the
 production failures this design answers; the review sections record the dual
-frontier reviews of 0.3.0, 0.4.0, 0.8.0 and 0.8.1 and the 0.7.3 full-repo
-review, whose findings became 0.4.0, 0.5.0, 0.8.0, 0.8.1 and 0.8.2.
+frontier reviews of 0.3.0, 0.4.0, 0.8.0 and 0.8.1, the 0.7.3 full-repo
+review, and the 0.8.2 single-seam review, whose findings became 0.4.0,
+0.5.0, 0.8.0, 0.8.1, 0.8.2 and 0.8.3.
 
 ## The failure catalog behind the design (2026-08-05/06, all seen in production)
 
@@ -561,3 +562,75 @@ promised ran on a mechanism that does not exist. Fixed the same day, outside
 this repo where the relay lives: the caller owns the watch now, and the
 example agent file in this repo carries the warning so nobody rebuilds the
 broken shape from the template.
+
+### The 0.8.2 single-seam review (2026-08-07) — the second opinion goes three for three
+
+The first dispatch under the rewritten relay contract — the caller holding the
+watch this time, and the answer arriving with no nudge — was pointed at the
+newest seam in the runtime: 0.8.2's own record-lock rework, one commit old,
+already reviewed once, with an adversarial question ("construct any
+interleaving in which two processes hold this lock"). GPT-5.6-sol at xhigh
+said *no, it does not close the window*, and produced four findings. One was
+the residual 0.8.2 had already documented. The other three were adjudicated —
+one fresh arm each, against the source — and **all three were CONFIRMED**,
+one of them by live reproduction on the development machine. Both Highs
+resized to Medium on measured evidence, which is the adjudication doing its
+job in the other direction; neither resize touched the consequence, only the
+frequency.
+
+- **The stale break was a pathname ABA.** The condemnation (stat, holder
+  liveness) and the act (rename to tombstone) were bound only by the path
+  between them — two non-syscall statements apart — so a delayed breaker
+  could move and delete a successor's LIVE lock on the strength of a verdict
+  passed on the dead one, and the 20 ms retry cadence actively synchronized
+  contending breakers around every crashed holder. The claimed "exactly one
+  breaker can win" was one winner per path occupant, not per condemned lock.
+  → The evidence is captured at decision time and the WON tombstone verified
+  against it before anything is removed; a mismatch is a live successor,
+  renamed back loudly and never deleted. The restore-loses residual is in
+  known issues, failing toward a stranded, inspectable tombstone.
+- **Any holder read error was permission to break a live holder.** Every
+  `readFileSync` failure collapsed to the same answer as "no holder", and
+  the break path was the only consumer of that read failing open — while the
+  pid probe and the release's identity check, in the same file, fail closed
+  on the identical operations. Adjudication measured the headline AV vector
+  as largely self-blocking on Windows (the handle that denies the read pins
+  the rename), which is what resized it — but non-handle errors (ACL, EIO,
+  cloud-filter) stay real, and a failed stat fabricated an age of Infinity
+  besides. → Only ENOENT is "no holder"; an unreadable holder is evidence a
+  holder EXISTS, and an age never measured authorizes nothing.
+- **The staging sweep hollowed what it swept.** Recursive removal unlinks
+  the holder before the directory, and the stage's owner rechecked only the
+  lock path — so a sweep interrupted between the two left an empty stage the
+  owner then published as a holderless lock. Reproduced with no crash at
+  all: the owner's rename landing between the sweep's unlink and rmdir,
+  ENOENT swallowed, `acquired: true` over zero entries — the exact invariant
+  0.8.2 shipped ("every lock this release publishes is non-empty") broken by
+  its own janitor. → The sweep is a rename first, the same single-winner
+  primitive as the break: a partial removal strands only a tombstone, the
+  owner's rename fails ENOENT and loops, and the sweep now also collects
+  abandoned break tombstones while refusing any whose holder is alive or
+  unreadable — a tombstone with a live holder is a mid-flight restore's
+  cargo, not litter.
+
+The pre-commit gate then found the theme once more at the next depth: the
+sweep's pure age rule could collect a *mismatched* tombstone — a live
+holder's lock, mid-restore — once its holder had been slow past the stale
+mark, the one remaining path where a live lock was deleted rather than
+stranded. Closed with the same predicate the break uses, plus honest
+diagnosis on the restore's two failure causes, plus no break attempt without
+a measured age. Five tests went in with the fixes (149 → 154), each verified
+to fail against a scratch-broken guard — including one the discipline caught
+in its own pass: the first draft of the unreadable-holder test passed against
+the broken build because the tombstone verification independently saved the
+lock, and the assertion that pins the ENOENT rule's *own* effect had to be
+found and added.
+
+What held, probed adversarially: dual condemners on one lock (one rename
+wins, each breaker verifies only its own tombstone), the mtime-plus-holder
+match criteria across the 5-second gap, the mixed-version bare-mkdir lock
+still aging out, release-by-identity on every trace, and the sweep's
+inability to construct the lock path. The lesson this round adds to the
+catalog: a seam reviewed and fixed is not a seam proved — 0.8.2's staged
+acquisition was correct, and the two-writer window it closed was still open
+two syscalls to the right, in the break that guards it.
