@@ -3,6 +3,58 @@
 Versioning rule: **a push that changes behavior MUST bump the version** — see
 [README → Releases and versioning](../README.md#releases-and-versioning) for why.
 
+## 0.7.2
+
+A full-repo review — runtime, tests and docs each read by its own reviewer —
+fixed. The theme every finding shared: the code was strongest where the record
+meets its own state machine and weakest where the record meets the real OS
+process boundary.
+
+**The cancel race.** `killJob` decided its kill window from the record snapshot
+its caller had read, then spent seconds in process-table queries — time enough
+for the supervisor to reach `exec-spawning` and spawn codex detached. On POSIX
+that codex leads its own group and reparents to init when the supervisor dies,
+so the kill missed it, the leftover check could not see it, and the job was
+recorded `killed` with its role released: an orphan codex billing beside the
+next dispatch, the exact artifact this runtime exists to prevent. The window
+and the target set are now re-read immediately before firing, and re-checked
+once after the slow identity pass, so a fresh `exec-spawning` takes the
+kill-pending path.
+
+**`child.pid` is out of the kill surface.** Only the test fake ever wrote that
+file, and its presence in `PID_FILES` made the grandchild a direct kill target
+— so the Windows tree-kill tests passed even with `taskkill /T` traversal
+broken. The runtime no longer reads it, and the tests now genuinely fail if
+the tree walk does.
+
+**Domains on the fields the supervisor hands to spawn.** `sandbox` is
+whitelisted (`read-only`, `workspace-write`), `model` and `effort` are
+shape-checked, and `started` must parse as a date — checked at dispatch, where
+a bad value is a refusal, and in the validator, where one is corruption. This
+is **behavioral** in the fail-closed direction: a job.json rewritten to
+`danger-full-access` now reads corrupt instead of launching codex unsandboxed.
+`RECORD_VERSION` does not move — records this runtime wrote remain
+deliverable; only a value it would never have written reads corrupt.
+
+**Smaller closures, same review.** A stale record lock is broken by
+rename-to-tombstone, so two breakers can no longer free two concurrent
+writers; reaped-pid merges happen under that lock, so a spent pid cannot be
+re-armed by a lost entry; a stale Windows ppid pointing at a reissued number
+no longer adopts an unrelated process as a kill target (a child cannot predate
+its parent — one batched start-time query, and the check still only ever
+subtracts); an unreadable claim owner inside the grace window is a live claim,
+not an ownerless one, in `claimRole` and in `releaseRole`, whose comment had
+promised the behaviour it did not implement.
+
+**Tests: 103 → 111, and the process boundary is covered.** The codex argv is
+asserted flag by flag out of the fake's echo, the brief is byte-compared
+against what actually reached codex's stdin (CRLF, unicode, no trailing
+newline), a nonzero exec and a done-with-no-answer-file both run end to end,
+and preflight's six verdict branches run against the fake through the new
+`CODEX_DISPATCH_TEST_PREFLIGHT_FULL` hook. The suite also cleans up after
+itself now: the temp jobs tree is reaped and removed, long-lived fakes die in
+`finally`, and the one order-dependent test builds its own fixtures.
+
 ## 0.7.1
 
 0.7.0's own fix, reviewed by another dispatch, and it had left three holes.
