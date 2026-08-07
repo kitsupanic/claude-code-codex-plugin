@@ -3,6 +3,73 @@
 Versioning rule: **a push that changes behavior MUST bump the version** — see
 [README → Releases and versioning](../README.md#releases-and-versioning) for why.
 
+## 0.8.1
+
+A dual review of 0.8.0, and its lead finding is a correction to what 0.8.0
+itself claimed. Patch bump: no new verb, no schema change, six fixes.
+
+**The one writer in the kill seam that never had its compare-and-swap was
+dispatch's own.** The entry below, and `docs/DESIGN.md` with it, said the
+post-spawn cancel branch wrote `expect: canonicalState === 'running'`. It did
+not: it read the record once, spent the seconds a verified kill costs on the
+supervisor it had just spawned, and wrote `killed` or `kill-failed` over whatever
+landed in the gap — including the supervisor's own `failed(sight-unproven)`, the
+pair `commands/list.md` documents as impossible. Both writes are CAS on
+`stillCancellable` now, and a lost precondition is a *found verdict*: reported,
+not overwritten, and **no role released**. Its kill target goes through the
+reaped-pid list first, and the spent pid files are consumed only after a kill
+that verified. Both passages are corrected rather than left standing.
+
+**So was the supervisor's cancelled-during-exec landing, one writer to the
+left.** It races the same cancel-shaped record from the other side: the dispatch
+kills *it*, records `killed` and releases the role, while it is inside its own
+kill — and its unconditioned write then landed on top, leaving a `kill-failed`
+record whose role was already free. Same compare-and-swap, and a write that loses
+it reports into the job's `run.log` and releases nothing: whoever's write landed
+owns the verdict and the release together.
+
+**An unreadable process table is a failed verification, not an empty tree.**
+`killPids` has always reported `enumerated: false` when neither shell would
+answer, and only `cancel`'s corrupt-record branch ever looked at it — so
+everywhere else "nothing was seen" was read as "nothing survived": a verified
+`killed`, a released role, and the codex behind a `.cmd` wrapper never checked.
+`killJob`, dispatch's post-spawn branch and the supervisor's
+cancelled-during-exec landing now record `kill-failed` with the unreadable table
+named on the record, keep the role, consume no pid file, and say to re-run; the
+reap of an unvouched-for claim refuses the takeover instead of taking it.
+
+**A `clean` that fails at the last step no longer hides the job it could not
+remove.** `removeJobDir` deletes the contents, then `job.json`, then the
+directory — and on Windows that final `rmdir` fails alone whenever the directory
+is some process's current one: every file unlinked, the directory left, the
+record gone, and a job `list`, `status` and `clean` can never see again. Exactly
+what removing the record last exists to prevent. The record's bytes are held
+across that removal and put back if it throws, so a removal that fails anywhere
+still leaves a job that lists.
+
+**`kill-pending` is only reported when it was written.** `markPending` treated a
+write that could not take the lock, or that found a corrupt record, as a success:
+`cancel` announced "the state is kill-pending" for a state nothing had written,
+and the launch-block that state exists to arm was not armed. Three outcomes now —
+marked, lost to a verdict, or unrecorded — and the unrecorded one says so and
+tells the caller to re-run, without claiming a kill or a state.
+
+**Three smaller ones, same discipline.** A relative `CODEX_DISPATCH_JOBS` — the
+override the README names as a cure — is `path.resolve`d, so the jobs root and
+every `out:` path stop depending on the directory a verb was run from.
+Reclaiming an OWNERLESS role claim is fenced as "still ownerless" instead of
+"whatever is there", which is what used to let a reclaim rename away a fresh
+claim whose owner had already passed its verify fence and launched. And the
+record lock's stale break now needs a holder it can prove is *gone* — the lock
+carries the holder's pid — rather than treating any five-second-old lock as a
+dead one, which is how a live writer stalled inside its critical section lost
+mutual exclusion and clobbered the breaker's write. Deliberately a pid and no
+start time: reading one costs a PowerShell spawn on the lock path, and identity
+here would be evidence FOR breaking a live-looking lock, which inverts the
+direction that machinery is allowed to push in everywhere else. The terminal
+kill patches also clear `reason`, and `result` reads the never-ran reasons only
+when the state is `failed`, so a reason can no longer outrank a state.
+
 ## 0.8.0
 
 A full-repo review of 0.7.3, whose lead finding was reproduced on the shipped

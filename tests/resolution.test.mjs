@@ -39,6 +39,7 @@ import {
   isPid,
   isProbeFileName,
   jobDirFor,
+  jobsRoot,
   killPlan,
   killWindow,
   launchPhase,
@@ -47,6 +48,7 @@ import {
   parseClaimOwner,
   pickProbeTarget,
   pickProbeToken,
+  reclaimClaim,
   roleOfJob,
   sameStartTime,
   scanBlindLog,
@@ -419,6 +421,73 @@ test('verify-own-claim compares the owner, not the existence of the lock', () =>
     assert.equal(verifyClaim(path.join(dir, 'gone'), 'a-1-2'), false, 'the lock dir vanished');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('an OWNERLESS claim is reclaimed as ownerless, not as "whatever is there"', () => {
+  // `expected === undefined` used to mean "take whatever holds the role", and
+  // both call sites reached it by mapping a null owner onto it — so a reclaim
+  // judged against a claim that named nobody renamed away whatever was standing
+  // there at the moment of the rename, including a claim installed since by a
+  // dispatch that had already passed its own verify fence and launched. Two
+  // same-role codexes out of a claim that was ownerless one read ago.
+  //
+  // The window between the read and the rename is not reachable from a spawned
+  // verb, so the fence is asserted directly on the function that holds it.
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-reclaim-'));
+  const lock = path.join(root, '.role-locks', 'rec');
+  const owner = path.join(lock, 'owner');
+  try {
+    // A genuinely ownerless claim IS reclaimable — that path is why null exists.
+    fs.mkdirSync(lock, { recursive: true });
+    assert.equal(reclaimClaim(root, 'rec', null).ok, true, 'nobody holds it, so it may be taken');
+    assert.equal(fs.existsSync(lock), false, 'and it is gone');
+
+    // The claim that replaced it is somebody's. Expecting "ownerless" must
+    // refuse it, and must leave it exactly where it was.
+    fs.mkdirSync(lock, { recursive: true });
+    fs.writeFileSync(owner, 'rec-1-2\n');
+    const refused = reclaimClaim(root, 'rec', null);
+    assert.equal(refused.ok, false, 'an owned claim is not an ownerless one');
+    assert.equal(fs.existsSync(owner), true, 'and the claim it refused is still standing');
+    assert.equal(fs.readFileSync(owner, 'utf8').trim(), 'rec-1-2', 'with its owner intact');
+
+    // The named-owner fence is unchanged: the owner it was judged against wins.
+    assert.equal(reclaimClaim(root, 'rec', 'someone-1-2').ok, false, 'a different owner is refused');
+    assert.equal(fs.existsSync(owner), true);
+    assert.equal(reclaimClaim(root, 'rec', 'rec-1-2').ok, true, 'the one it inspected is taken');
+    assert.equal(fs.existsSync(lock), false);
+
+    // A claim that is not there at all is the same outcome as having taken it.
+    assert.deepEqual(reclaimClaim(root, 'rec', null), { ok: true, gone: true });
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a relative CODEX_DISPATCH_JOBS is resolved, so no path depends on the cwd', () => {
+  // The override is user-facing — the README names it as the cure for a `%` in
+  // the default root — so a relative value is a realistic thing to be handed,
+  // and it used to be taken verbatim: the jobs root, every job directory and
+  // every `out:` path a verb printed then meant something different depending on
+  // where that verb was run from, and a dispatch and the `result` collecting it
+  // would each truthfully report that the other's job did not exist.
+  const before = process.env.CODEX_DISPATCH_JOBS;
+  try {
+    process.env.CODEX_DISPATCH_JOBS = path.join('.', 'relative-jobs');
+    const root = jobsRoot();
+    assert.equal(path.isAbsolute(root), true, `the jobs root must be absolute, got ${root}`);
+    assert.equal(root, path.resolve('relative-jobs'));
+    // And every path derived from it inherits that, which is the point: a job
+    // directory is what `out:` is printed from.
+    const dir = jobDirFor(root, 'rel-1-2');
+    assert.ok(dir && path.isAbsolute(dir), 'a job directory under it is absolute too');
+
+    process.env.CODEX_DISPATCH_JOBS = 'relative-jobs';
+    assert.equal(jobsRoot(), root, 'with or without the ./, it is the same absolute root');
+  } finally {
+    if (before === undefined) delete process.env.CODEX_DISPATCH_JOBS;
+    else process.env.CODEX_DISPATCH_JOBS = before;
   }
 });
 

@@ -303,16 +303,41 @@ was released, and codex ran.
 
 So every record update takes a lock first — `job.json.lock`, a directory, the same
 atomic primitive the role claim uses — and does its read and its write inside it.
-A holder that died is broken out of after five seconds, so a crash cannot wedge a
-job. Each write bumps a `generation` counter, and callers may pass a precondition
+A holder that died is broken out of, so a crash cannot wedge a job — and
+**"died" is proved, not assumed from the clock**. The break used to be an age
+test alone: five seconds old meant dead. The lock's mtime is never refreshed, so
+a writer that was merely slow — a `pidStartTimes` query in a cold PowerShell, a
+paged-out process, a machine under load — lost mutual exclusion at exactly that
+mark, and then wrote from its pre-break read over whatever the breaker had
+written in between: a cancel's `kill-pending` vanishing by way of the mechanism
+that stops a crash from wedging a job. So the holder writes its **pid** inside
+the lock, and a breaker needs both the age AND a holder it can show is gone.
+A holder file that is missing or unreadable past the stale age keeps the
+age-only behaviour, because a process that died between the `mkdir` and that
+write must not wedge the job either. The break itself is unchanged: one atomic
+rename to a tombstone, so exactly one breaker can win.
+
+**A pid and nothing else**, which is a decision rather than an omission. The
+start time could go beside it, as it does for every kill target — but reading it
+is a synchronous PowerShell spawn, so paid lazily it lands *inside* the critical
+section this exists to protect and paid eagerly it lands on the first record
+write of every process; and the direction is wrong twice over. Start-time
+identity everywhere else in this runtime only ever **subtracts** — it withdraws
+a kill target or a liveness claim, and can never manufacture one — while here it
+would be the evidence justifying the break of a lock that still looks held,
+which is the exact action being prevented. What that leaves is in the known
+issues: a holder that dies and whose number is instantly reissued to something
+long-lived keeps the lock, and writers then refuse loudly instead of losing an
+update quietly.
+Each write bumps a `generation` counter, and callers may pass a precondition
 that is evaluated *inside* the lock ("only if this still says running"). And a
 write that could not take the lock is **reported, not swallowed**: a `cancel` whose
 kill worked but whose record would not update exits nonzero saying exactly that,
 because a kill nothing else can see is not a kill anything else may act on.
 
 **Every writer in the kill seam carries a precondition, including the cancel.**
-The supervisor's exit handler, the `exec-spawning` mark and dispatch's post-spawn
-write all wrote `expect: canonicalState === 'running'`; `killJob`'s four writes —
+The supervisor's exit handler and the `exec-spawning` mark wrote
+`expect: canonicalState === 'running'`; `killJob`'s four writes —
 `kill-pending` twice, `kill-failed`, `killed` — carried none, and its own
 stale-snapshot re-read watched the launch *phase* and the pid list move without
 ever watching the *state*. So a cancel that lost the race to the supervisor's own
@@ -328,6 +353,33 @@ always has for a job that finished before the cancel arrived. `--force` gets the
 same answer and treats it correctly — a terminal job is not a conflict, so the
 force takes the role rather than refusing, and it does not print a kill it never
 made.
+
+**And "every writer" now includes dispatch's own post-spawn cancel branch**,
+which this section claimed carried `expect: canonicalState === 'running'` for a
+release in which it carried nothing at all. It read the record once, spent the
+one to three seconds a verified kill costs on the supervisor it had just
+spawned, and then wrote `killed` or `kill-failed` over whatever landed in that
+gap — a supervisor's `failed(sight-unproven)` among them, which is the pair this
+document calls impossible, reached by the one route the CAS work of 0.8.0 did
+not close. Both of its writes are compare-and-swap on `stillCancellable` now,
+and a lost precondition is read here exactly as it is in `killJob`: a verdict was
+found, it is reported and not overwritten, and **no role is released** — the
+process that wrote the verdict owns that decision too. Its kill target goes
+through the reaped-pid list first, like every other kill target in this runtime,
+and the spent pid files are consumed only after a kill that verified.
+
+**And the supervisor's own cancelled-during-exec landing is the other one**, for
+the same reason and against the same opponent. That landing reads the record,
+kills codex — seconds, in a shell — and writes `killed` or `kill-failed`; the
+dispatch that spawned it is looking at the same cancel-shaped record and its
+post-spawn branch kills *this supervisor*, records `killed` and releases the
+role. Without a precondition the landing wrote straight over that verdict, and
+what it left was a `kill-failed` record whose role was already free: the state
+says something may still be alive, and nothing is blocking a second dispatch.
+It is a compare-and-swap on `stillCancellable` too, and a write that loses it
+reports into the job's own `run.log` and releases nothing — a second release
+could hand away a claim a new dispatch has taken since. Same rule, both
+directions: whoever's write landed owns the verdict *and* the release.
 
 **Dispatch records the supervisor's pid itself, at spawn time, before it returns.**
 The supervisor used to write its own, which left a window — record says `running`,
@@ -471,9 +523,23 @@ targets and verification targets like any other. And the kill walks the **tree**
 live descendants of every target are killed alongside it, and anything still
 descended from one afterwards is a survivor, even if it was never a recorded pid.
 The table comes from `Get-CimInstance Win32_Process` on Windows and `ps -eo
-pid=,ppid=` elsewhere; if it cannot be read, that is **reported** — as a warning on
-`cancel`, and as a refusal to conclude anything inside the codex-exec window — never
-quietly treated as an empty tree. Off Windows the process group is the other half
+pid=,ppid=` elsewhere. **If it cannot be read, the kill is not verified** — and
+that is a state, not a warning. `killPids` answers `enumerated: false` when
+neither shell would say (both `powershell` and `pwsh` failing on Windows), which
+means the descendants were never enumerated and the leftover sweep read nothing:
+the recorded pids can be gone while the codex behind a `.cmd` wrapper is not, and
+that worker is precisely what these two mechanisms exist to catch. For a release
+only the corrupt-record branch of `cancel` looked at the field at all, so
+everywhere else an unreadable table WAS quietly an empty tree — a verified
+`killed`, a released role. Every caller now treats it as a failed verification:
+`killJob`, dispatch's post-spawn branch and the supervisor's cancelled-during-exec
+landing all record **`kill-failed`** (compare-and-swap, like every write in this
+seam) with the unreadable table named in the record's `warning`, the role stays
+claimed, no pid file is consumed, and the caller is told to re-run once the table
+can be read; the reap of an unvouched-for job refuses the takeover instead of
+taking the role, and leaves the corrupt record and the loaded pid files exactly
+as it found them. `cancel` keeps its warning for the corrupt-record path, whose
+record may never be rewritten in the first place. Off Windows the process group is the other half
 of the same proof: `codexPgid` is recorded, and a group that still has members
 after the kill counts as a survivor.
 
@@ -540,6 +606,19 @@ through the whitelist and the containment assert first, like every other path th
 runtime operates on. A removed job that still held a role claim leaves a claim
 naming a job directory that is not there, which `inspectClaim` already reads as
 reclaimable.
+
+**A removal that fails ANYWHERE leaves a job that still lists**, and that took
+two mechanisms rather than one. The directory is dismantled with its `job.json`
+last, because an entry without one is invisible to `list`, `status` and `clean`
+itself — but the *last* step can fail on its own: on Windows a directory that is
+some process's current one lets every file inside it unlink and then refuses the
+`rmdir`. Which produced exactly the outcome the ordering exists to prevent — the
+record gone, the directory left, nothing able to see it again. So the record's
+bytes are held across that final removal and written straight back if it throws;
+the failure is then reported as a `kept:` line and a stderr warning, and a retry
+takes the job once whatever was sitting in it has moved. A restore that itself
+fails is reported on its own, because that is the one case where a job really has
+become unlistable.
 
 ## Watching a job
 
@@ -646,10 +725,30 @@ than opening nothing and claiming otherwise.
   What remains: records written before the field existed keep the old behavior,
   macOS `ps` has no `etimes` so the query answers nothing there, and start
   times are memoized per invocation — a reuse occurring mid-run degrades to the
-  old behavior. Every remaining case fails in the safe direction: a spurious
+  old behavior. Most remaining cases fail in the safe direction: a spurious
   `kill-failed` refuses a launch rather than launching a duplicate, and the
   reaped-pid list still stops a number already fired at from ever being fired
   at again.
+
+  **One case does not, and it is the kill targets read out of the `.pid` files
+  when there is no usable record to check them against.** `pidStarts` lives in
+  `job.json`, so a job whose record is corrupt or absent — the reap that clears
+  an unvouched-for claim, and `cancel` on a corrupt job — has nothing to compare
+  a number to, and those numbers are fired at on the strength of the number
+  alone. That is the first shot, which is the one that can land on a stranger;
+  the reaped list only ever stopped the second. The `.pid` files are deliberately
+  not given a start-time sidecar of their own: a second file to keep in step with
+  the first is a second thing to be wrong, and the record is where identity is
+  written down. Stated here rather than implied away.
+- **A record lock whose holder died and whose pid was instantly reissued is not
+  broken until that impostor exits.** The holder file carries a pid and no start
+  time (the reasoning is under the write lock above), so a number that is alive
+  reads as a holder that is alive. The window is small — the lock is held for
+  milliseconds, and the holder has to die inside it — and the consequence is the
+  safe one: every writer waits its fifteen seconds and then REFUSES, saying the
+  record could not be locked and to re-run, rather than writing over somebody.
+  `cancel`, `--force` and `clean` all report it. Removing the `job.json.lock`
+  directory by hand is the manual cure, and it is safe once nothing is running.
 - **Windows `shell: true` quoting refuses what it cannot escape.** `codex.cmd`
   needs a shell, so `spawnCodex`/`runCodexSync` join argv into one command line
   with `cmdQuote`. Three characters cannot survive that command line and are

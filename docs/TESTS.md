@@ -212,7 +212,58 @@ they were written:
   anything is created and by `preflight` even under `CODEX_DISPATCH_BIN`, both
   naming `CODEX_DISPATCH_JOBS`.
 
-**Thirteen test-only knobs live in the runtime**, each standing in for a condition
+The 0.8.1 additions pin a dual review of 0.8.0, and every one of them was
+confirmed to **fail against 0.8.0** before the fixes landed — eight lifecycle
+tests and two unit ones:
+
+- **a dispatch may not write over a verdict reached while it paused** — the
+  post-spawn cancel branch, held open with `CODEX_DISPATCH_TEST_SPAWN_PAUSE_MS`
+  while a `killed` verdict is written into the record. The verdict and its reason
+  survive, the role claim is NOT released (which is the half that costs money),
+  the supervisor is still killed, and the message reports the state it found
+  rather than a kill it recorded. Its sibling asserts the same branch fires
+  through the reaped-pid list: a supervisor recorded as already reaped is left
+  alive and never named, and the survivor list of the `kill-failed` it wrote over
+  is cleared rather than carried into a verified death;
+- **the supervisor's cancelled-during-exec landing may not write over one
+  either** — the same rule from the other side of the same record, with the
+  supervisor held in the codex-exec window by `CODEX_DISPATCH_TEST_EXEC_PAUSE_MS`
+  while a terminal verdict is written. codex is still killed; the verdict and its
+  reason survive; the landing reports into the job's own log that it wrote
+  nothing and released no claim, and the role claim is not released a second
+  time. Confirmed to fail both against 0.8.0 and against this release with only
+  that one precondition removed;
+- **a kill nothing could enumerate is not a verified kill** —
+  `CODEX_DISPATCH_TEST_NO_PROCESS_TABLE` makes the table unreadable while the
+  signals really are sent. The job lands `kill-failed` with the unreadable table
+  named on the record and no survivor list (nobody enumerated one), the role
+  stays blocked, and the targets are still dead: a verification failure, not a
+  refusal to try;
+- **a `kill-pending` that could not be written is never reported as one** — the
+  record lock held by a live process named in the lock's own holder file. The
+  cancel waits it out, reports that nothing was killed and nothing recorded, and
+  the record is untouched. The same fixture is half of the lock fix: a lock whose
+  holder is alive is not stale however old it gets;
+- **a live holder stalled past the stale age keeps the record lock** — the other
+  half, with a real writer descheduled inside its critical section by
+  `CODEX_DISPATCH_TEST_RECORD_PAUSE_MS` for longer than the five-second break.
+  The second cancel waits and then decides on the record the first one finished
+  writing, instead of breaking in and announcing a kill of its own;
+- **a cancel does not leave a reason it did not write** — a live record carrying
+  `sight-unproven` (reachable through version skew: an unknown state is live and
+  cancellable) is cancelled and comes back plain `killed`. Plus the other
+  direction: `result` on a `killed` record carrying that reason refuses it for
+  its STATE, and never as a job that "never ran";
+- **a clean whose last step fails leaves a job that still lists** — the blocker
+  is a live process whose cwd is the JOB DIRECTORY ITSELF, not a child of it, so
+  every file unlinks and only the `rmdir` refuses. The record is put back, the job
+  still lists and still reads as finished, and a retry takes it;
+- **the ownerless claim fence and the resolved jobs root**, both asserted
+  directly on the functions that hold them: an owned claim is refused a reclaim
+  that expected ownerless (and is left standing), and a relative
+  `CODEX_DISPATCH_JOBS` comes back absolute.
+
+**Fourteen test-only knobs live in the runtime**, each standing in for a condition
 that cannot be produced on demand in CI, on both platforms, from both shells. What
 is under test in every case is the runtime's *decision*, never the mechanism that
 would have caused the condition:
@@ -257,6 +308,11 @@ would have caused the condition:
 - `CODEX_DISPATCH_TEST_START_TIME=<pid>:<start>[,<pid>:<start>]` — the OS start time
   answered for those pids, so pid reuse (a number reissued to something else) can
   be posed without waiting for an OS to reissue one.
+- `CODEX_DISPATCH_TEST_NO_PROCESS_TABLE=1` — the process table cannot be read at
+  all: a host whose PowerShell will not run, a WMI service that is down, a `ps`
+  that is not on PATH. The decision under test is what every caller then does
+  about it — a kill nothing could enumerate is not a verified kill — never the
+  shell failure itself.
 - `CODEX_DISPATCH_TEST_PREFLIGHT_FULL=1` — `CODEX_DISPATCH_BIN` stops
   short-circuiting `preflight`, so the version, auth and sandbox checks it exists
   to make actually run — against a stand-in that answers the way codex-cli does.

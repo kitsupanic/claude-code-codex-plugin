@@ -3202,6 +3202,433 @@ test('clean removes finished jobs, refuses live ones, and never leaves the jobs 
   }
 });
 
+// A dispatch held in its post-spawn window, so the record can be moved
+// underneath it. Shared by the two blocks below because the fixture is the whole
+// setup: the window is milliseconds wide in reality and cannot be aimed at.
+function dispatchPaused(brief, role, pauseMs, env = {}) {
+  return new Promise((resolve) => {
+    const child = spawn(process.execPath, [RUNTIME, 'dispatch', '--brief', brief, '--role', role], {
+      env: { ...baseEnv, CODEX_DISPATCH_TEST_SPAWN_PAUSE_MS: String(pauseMs), ...env },
+      cwd: REPO,
+    });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('close', (code) => resolve({ code, stdout, stderr }));
+  });
+}
+
+test('the dispatch that spawned a job may not write over a verdict reached while it paused',
+  async () => {
+    // THE ONE WRITER IN THE KILL SEAM THAT NEVER HAD ITS COMPARE-AND-SWAP — and
+    // the runtime's own docs said for a release that it did. The post-spawn check
+    // reads the record once, then spends the seconds a verified kill costs, then
+    // writes `killed` or `kill-failed`. Anything that reached a verdict in
+    // between was overwritten, the role was released on the strength of it, and
+    // the message announced a kill this dispatch had not made.
+    //
+    // The verdict is a `killed` a cancel landed while this dispatch was starting
+    // — which is a state a CANCEL writes, so the branch really is entered — and
+    // it is written during the injected hold, deterministically, rather than
+    // raced.
+    // A codex that is still running through the whole hold, deliberately: with a
+    // fast one the supervisor reaches its own exit handler inside the window and
+    // releases the role on the terminal verdict it finds — legitimately, being
+    // the process that owns that decision — and the claim assertion below could
+    // then be measuring the wrong writer.
+    const brief = writeBrief('briefpostspawncas.md', 'slow');
+    const dispatching = dispatchPaused(brief, 'postspawn', 9000, { FAKE_CODEX_SLEEP_MS: '60000' });
+    const findDir = () => fs.readdirSync(JOBS).find((n) => n.startsWith('postspawn-'));
+    assert.ok(await poll(() => findDir() && record(findDir()).supervisorPid, 20000),
+      'the dispatch must have registered its supervisor before the hold');
+    const id = findDir();
+    const supervisorPid = record(id).supervisorPid;
+    const verdict = {
+      ...record(id),
+      state: 'killed',
+      reason: 'cancelled-during-registration',
+      finished: new Date().toISOString(),
+    };
+    fs.writeFileSync(path.join(JOBS, id, 'job.json'), JSON.stringify(verdict));
+
+    const d = await dispatching;
+    assert.notEqual(d.code, 0, 'a job that was cancelled while starting is still a failed dispatch');
+    const rec = record(id);
+    assert.equal(rec.state, 'killed', `the verdict stands: ${JSON.stringify(rec)}`);
+    assert.equal(rec.reason, 'cancelled-during-registration',
+      'with the reason its writer paired with it');
+    assert.equal(rec.killSurvivors, undefined, 'and no kill bookkeeping written over it');
+    // The half that costs money when it is wrong: the writer of that verdict owns
+    // the release decision too, so this dispatch may not make it.
+    const owner = path.join(JOBS, '.role-locks', 'postspawn', 'owner');
+    assert.equal(fs.existsSync(owner), true, 'the role claim is NOT released by a dispatch that lost');
+    assert.equal(fs.readFileSync(owner, 'utf8').trim(), id, 'and still names this job');
+    assert.match(d.stderr, /reached "killed"/, 'the message reports the verdict it found');
+    // What it says is what it KNOWS: this dispatch released nothing. It may not
+    // claim the claim is still held — the cancel that wrote that verdict owns
+    // the release decision and may already have made it.
+    assert.match(d.stderr, /this dispatch released\nnothing/,
+      'and says only what it did itself');
+    assert.equal(/killed and verified dead/.test(d.stderr), false,
+      'never a claim about a kill it recorded');
+    assert.ok(await poll(() => !pidAlive(supervisorPid), 20000),
+      'the supervisor is still killed — the verdict is about the record, not about what is alive');
+    for (const pid of [supervisorPid, ...(record(id).codexPids || [])].filter(Boolean)) {
+      try { process.kill(pid); } catch { /* the tree kill took it */ }
+    }
+    fs.rmSync(path.join(JOBS, '.role-locks', 'postspawn'), { recursive: true, force: true });
+  });
+
+test('the post-spawn kill fires through the reaped-pid list like every other kill', async () => {
+  // Every kill target in this runtime is filtered through the numbers already
+  // fired at — the record fields, the pid files, all of them — because a pid is
+  // reissued and a replayed kill lands on whatever inherited it. This one branch
+  // fired `child.pid` unfiltered.
+  //
+  // Decidable because the supervisor is ALIVE and stays that way: a targeted pid
+  // would be killed and verified, a filtered one is left standing.
+  const brief = writeBrief('briefpostspawnreaped.md', 'slow');
+  const dispatching = dispatchPaused(brief, 'postreap', 12000, { FAKE_CODEX_SLEEP_MS: '60000' });
+  const findDir = () => fs.readdirSync(JOBS).find((n) => n.startsWith('postreap-'));
+  let id, supervisorPid;
+  try {
+    // Wait for the supervisor to be past its own last check (codex launched), so
+    // that writing a cancel-shaped state below cannot make it land the cancel
+    // itself — this test is about what the DISPATCH does with that state.
+    assert.ok(await poll(() => findDir() && record(findDir()).launch === 'exec', 20000),
+      'codex must be running before the record is moved');
+    id = findDir();
+    supervisorPid = record(id).supervisorPid;
+    fs.writeFileSync(path.join(JOBS, id, 'job.json'), JSON.stringify({
+      ...record(id),
+      // Cancel-shaped and still LIVE, so the branch is entered and its write
+      // keeps its precondition — and the supervisor does not land it (only
+      // kill-pending is landed there).
+      state: 'kill-failed',
+      killSurvivors: String(supervisorPid),
+      reapedPids: [supervisorPid],
+    }));
+
+    const d = await dispatching;
+    assert.notEqual(d.code, 0);
+    assert.equal(d.stdout.includes(String(supervisorPid)), false,
+      'a spent pid may not be named as a target');
+    assert.equal(d.stderr.includes(String(supervisorPid)), false,
+      'nor as a survivor of a kill it was never fired at');
+    assert.ok(pidAlive(supervisorPid),
+      `pid ${supervisorPid} was recorded as reaped and was fired at anyway`);
+    const rec = record(id);
+    assert.equal(rec.state, 'killed', 'with nothing left to fire at, the kill is verified and recorded');
+    // The state it wrote over was a `kill-failed` carrying a survivor list. A
+    // `killed` record that keeps one makes `result` and `status` report
+    // survivors of a kill that verified.
+    assert.equal(rec.killSurvivors, undefined,
+      'and the earlier kill-failed survivor list is cleared, not carried into a verified death');
+  } finally {
+    for (const pid of [supervisorPid, ...(id ? (record(id).codexPids || []) : [])].filter(Boolean)) {
+      try { process.kill(pid); } catch { /* already gone */ }
+    }
+    fs.rmSync(path.join(JOBS, '.role-locks', 'postreap'), { recursive: true, force: true });
+  }
+});
+
+test('the supervisor landing a cancel may not write over a verdict either', async () => {
+  // THE SAME RULE, ONE WRITER TO THE LEFT. The supervisor reads the record
+  // before a kill that spends seconds in a shell, and it is not the only writer
+  // looking at that cancel-shaped record: the dispatch that spawned it sees the
+  // same state, kills THIS process, records `killed` and releases the role. The
+  // landing write carried no precondition, so it went straight over that verdict
+  // — a `kill-failed(cancelled-during-exec)` record whose role was already free.
+  //
+  // The supervisor is held inside the codex-exec window while the verdict is
+  // written, so the interleaving is posed rather than raced. The role claim is
+  // left in place deliberately: in the real race the dispatch has already
+  // released it, and what is under test is that this supervisor does not make
+  // that decision a second time.
+  const brief = writeBrief('briefexecverdict.md', 'slow');
+  const r = run(['dispatch', '--brief', brief, '--role', 'execverdict'], {
+    FAKE_CODEX_SLEEP_MS: '60000',
+    CODEX_DISPATCH_TEST_EXEC_PAUSE_MS: '8000',
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const id = jobIdFrom(r.stdout);
+  const dir = path.join(JOBS, id);
+  try {
+    assert.ok(await poll(() => record(id).launch === 'exec-spawning', 20000),
+      'the supervisor must be inside the codex-exec window');
+    const verdict = {
+      ...record(id),
+      state: 'killed',
+      reason: 'cancelled-during-registration',
+      finished: new Date().toISOString(),
+    };
+    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify(verdict));
+
+    // The landing is over when the supervisor is: it kills codex, decides what
+    // it may write, and exits. Reading before that is reading mid-decision.
+    const supervisorPid = record(id).supervisorPid;
+    assert.ok(await poll(() => record(id).launch === 'exec', 20000),
+      'the supervisor must come out of the window and land the cancel');
+    assert.ok(await poll(() => !pidAlive(supervisorPid), 30000), 'and then exit');
+    // It kills codex either way — the verdict is about the RECORD, not about
+    // what is alive.
+    assert.equal((record(id).codexPids || []).some(pidAlive), false,
+      'codex is still killed for the cancel it found');
+
+    const rec = record(id);
+    assert.equal(rec.state, 'killed', `the verdict stands: ${JSON.stringify(rec)}`);
+    assert.equal(rec.reason, 'cancelled-during-registration',
+      'not overwritten with this supervisor\'s own cancelled-during-exec');
+    assert.equal(rec.killSurvivors, undefined);
+    // Both places a human looks: the job's own transcript and the supervisor's
+    // diagnostics, which is where its stderr lands.
+    const logs = ['run.log', 'supervisor.log']
+      .map((f) => { try { return fs.readFileSync(path.join(dir, f), 'utf8'); } catch { return ''; } })
+      .join('\n');
+    assert.match(logs, /released no role claim/, 'and it says what it did not do, where a human looks');
+    assert.match(logs, /already reached "killed"/, 'naming the verdict it found');
+    const owner = path.join(JOBS, '.role-locks', 'execverdict', 'owner');
+    assert.equal(fs.existsSync(owner), true,
+      'the claim is not released twice: the writer of the verdict owns that decision');
+    assert.equal(fs.readFileSync(owner, 'utf8').trim(), id);
+  } finally {
+    for (const pid of [record(id).supervisorPid, ...(record(id).codexPids || [])].filter(Boolean)) {
+      try { process.kill(pid); } catch { /* already gone */ }
+    }
+    fs.rmSync(path.join(JOBS, '.role-locks', 'execverdict'), { recursive: true, force: true });
+  }
+});
+
+test('a kill nothing could enumerate is not a verified kill', async () => {
+  // `killPids` has always reported `enumerated: false` when neither shell would
+  // answer, and only cancel's corrupt-record branch ever read it — so everywhere
+  // else "the process table could not be read" was silently "there was nothing
+  // there": a verified `killed`, a released role, and the codex behind a .cmd
+  // wrapper (a DESCENDANT, which is exactly what an enumeration finds) never
+  // checked at all.
+  //
+  // The unreadable table is injected: a host whose PowerShell will not run is
+  // not producible in CI, and what is under test is the decision made about it.
+  const id = 'noenum-1-99940';
+  const dir = path.join(JOBS, id);
+  fs.mkdirSync(dir, { recursive: true });
+  const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)'], {
+    stdio: 'ignore', detached: true,
+  });
+  victim.unref();
+  fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+    recordVersion: RECORD_VERSION, id, role: 'noenum', state: 'running',
+    started: new Date(Date.now() - 3600000).toISOString(),
+    supervisorPid: victim.pid, codexPid: null, launch: 'exec',
+  }));
+  try {
+    const c = run(['cancel', id], { CODEX_DISPATCH_TEST_NO_PROCESS_TABLE: '1' });
+    assert.notEqual(c.status, 0, 'a kill that verified nothing must not exit 0');
+    assert.match(c.stderr, /KILL NOT VERIFIED/);
+    assert.match(c.stderr, /process table/, 'and it names what could not be read');
+    assert.equal(/these pids survived/.test(c.stderr), false,
+      'it must not name survivors nobody enumerated');
+
+    const rec = record(id);
+    assert.equal(rec.state, 'kill-failed', `kill-failed, NOT killed: ${JSON.stringify(rec)}`);
+    assert.equal(rec.killSurvivors, undefined, 'nothing was seen to survive, so nothing is listed');
+    assert.match(rec.warning, /process table/, 'the record says why it could not be verified');
+    // The signals really were sent — this is a verification failure, not a
+    // refusal to try.
+    assert.ok(await poll(() => !pidAlive(victim.pid)), 'the targets were still signalled');
+    // And the state that says so keeps blocking the role, which is the point.
+    const brief = writeBrief('briefnoenum.md', 'quick');
+    const blocked = run(['dispatch', '--brief', brief, '--role', 'noenum']);
+    assert.notEqual(blocked.status, 0, 'an unverified kill keeps its role blocked');
+    assert.match(blocked.stderr, /already kill-failed/);
+  } finally {
+    try { process.kill(victim.pid); } catch { /* already gone */ }
+  }
+});
+
+test('a kill-pending that could not be written is never reported as one', async () => {
+  // `lostToVerdict` answers null for a write that could not take the lock and for
+  // one that found a corrupt record, exactly as it does for a write that
+  // SUCCEEDED — so `markPending` read a failed write as a mark, `cancel`
+  // announced "the state is kill-pending", and the launch-block that state exists
+  // to arm was not armed. A state nobody wrote, reported as fact.
+  //
+  // The lock is held by a live process this test names as the holder, which is
+  // also the other half of the fixture: a lock whose holder is alive is not
+  // stale however old it gets, so the write really does time out rather than
+  // breaking in after five seconds.
+  const id = 'unrecpend-1-99941';
+  const dir = path.join(JOBS, id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+    recordVersion: RECORD_VERSION, id, role: 'unrecpend', state: 'running',
+    // Inside the supervisor-registration window, with nothing recorded to kill:
+    // the path whose only outcome is a mark.
+    started: new Date().toISOString(), supervisorPid: null, codexPid: null,
+    launch: 'spawning',
+  }));
+  const lock = path.join(dir, 'job.json.lock');
+  fs.mkdirSync(lock);
+  fs.writeFileSync(path.join(lock, 'holder'), `${process.pid}\n`);
+  try {
+    const c = run(['cancel', id]);
+    assert.notEqual(c.status, 0, 'a cancel that recorded nothing must not exit 0');
+    assert.match(c.stderr, /KILL NOT RECORDED/);
+    assert.match(c.stderr, /NOTHING was killed/,
+      'and it must not borrow the sentence about processes killed and verified dead');
+    assert.equal(/KILL PENDING/.test(c.stderr), false, 'no state is announced that was not written');
+    assert.equal(record(id).state, 'running',
+      'the record is exactly as it was: the mark never reached it');
+    // The live holder kept its lock for the whole wait — the age-only break would
+    // have taken it after five seconds and written the mark.
+    assert.equal(fs.existsSync(path.join(lock, 'holder')), true,
+      'a lock whose holder is alive is not stale, however old it is');
+  } finally {
+    fs.rmSync(lock, { recursive: true, force: true });
+  }
+});
+
+test('a live holder stalled past the stale age keeps the record lock', async () => {
+  // The other side of the same rule, with a REAL writer rather than a named
+  // holder: the lock's mtime is never refreshed, so a writer descheduled inside
+  // its critical section for longer than five seconds used to lose mutual
+  // exclusion — the breaker read the record, wrote, and then the resumed holder
+  // wrote from its own earlier read, over the top. The pause is injected because
+  // a stall of a chosen length is not producible on demand.
+  const id = 'lockhold-1-99942';
+  const dir = path.join(JOBS, id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+    recordVersion: RECORD_VERSION, id, role: 'lockhold', state: 'running',
+    // An hour old with nothing to kill: both cancels take the one path that
+    // writes exactly once, so the whole test is about that one write.
+    started: new Date(Date.now() - 3600000).toISOString(),
+    supervisorPid: null, codexPid: null, launch: 'exec',
+  }));
+  const cancelling = (env, ms = 0) => new Promise((resolve) => setTimeout(() => {
+    const t0 = Date.now();
+    const child = spawn(process.execPath, [RUNTIME, 'cancel', id], { env: { ...baseEnv, ...env }, cwd: REPO });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('close', (code) => resolve({ code, stdout, stderr, ms: Date.now() - t0 }));
+  }, ms));
+
+  const [held, second] = await Promise.all([
+    cancelling({ CODEX_DISPATCH_TEST_RECORD_PAUSE_MS: '8000' }),
+    cancelling({}, 1000),
+  ]);
+  assert.equal(held.code, 0, `the stalled writer still completes its write: ${held.stderr}`);
+  assert.match(held.stdout, new RegExp(`^killed: ${id}$`, 'm'));
+  // The second cancel had to WAIT — and then decide on the record the first one
+  // had finished writing, which is what serialization means. Breaking in at five
+  // seconds made it read the pre-write record and announce a kill of its own.
+  assert.equal(second.code, 0, second.stderr);
+  assert.match(second.stdout, /is already killed, nothing to kill/,
+    'the second writer decides on the finished record, not on the one it broke into');
+  assert.ok(second.ms > 5000, `it waited rather than breaking the lock (took ${second.ms}ms)`);
+});
+
+test('a cancel does not leave a reason it did not write, and result reads the state first',
+  () => {
+    // A live record CAN carry a reason: a version skew puts one beside a state
+    // this release calls `unknown`, which is live and cancellable. The terminal
+    // kill patches never touched `reason`, so cancelling one produced
+    // `killed(sight-unproven)` — the pair this repo documents as impossible.
+    const id = 'reasonpair-1-99943';
+    const dir = path.join(JOBS, id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+      recordVersion: RECORD_VERSION, id, role: 'reasonpair', state: 'cancelling',
+      reason: 'sight-unproven', sight: 'unproven: nothing proved this job could read files',
+      started: new Date(Date.now() - 3600000).toISOString(),
+      supervisorPid: null, codexPid: null, launch: 'exec',
+    }));
+    const c = run(['cancel', id]);
+    assert.equal(c.status, 0, `nothing to kill, so the cancel succeeds: ${c.stderr}`);
+    const rec = record(id);
+    assert.equal(rec.state, 'killed');
+    assert.equal(rec.reason, undefined,
+      'the state and the reason are written as a pair, so a stale reason does not survive');
+    assert.match(run(['list']).stdout, new RegExp(`^${id}  killed  `, 'm'),
+      'and the listing shows no reason this cancel did not write');
+
+    // The other half: `result` read `reason` BEFORE it read `state`, so a killed
+    // job carrying one of the never-ran reasons was reported as a job that never
+    // ran. The pair is what means something, and only `failed` can carry these.
+    const room = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-reason-'));
+    try {
+      const stale = 'reasonres-1-99944';
+      fs.mkdirSync(path.join(room, stale));
+      fs.writeFileSync(path.join(room, stale, 'job.json'), JSON.stringify({
+        recordVersion: RECORD_VERSION, id: stale, role: 'reasonres', state: 'killed',
+        reason: 'sight-unproven', started: new Date(Date.now() - 3600000).toISOString(),
+        finished: new Date().toISOString(),
+      }));
+      const r = run(['result', stale], { CODEX_DISPATCH_JOBS: room });
+      assert.notEqual(r.status, 0);
+      assert.match(r.stderr, /NOT DELIVERED/, 'the state is what this job is refused for');
+      assert.match(r.stderr, /is killed/);
+      assert.equal(/never ran/.test(r.stderr), false,
+        'a reason may not outrank a state: this job was killed, not refused before it ran');
+    } finally {
+      fs.rmSync(room, { recursive: true, force: true });
+    }
+  });
+
+test('a clean whose LAST step fails leaves a job that still lists', async () => {
+  // `removeJobDir` removes the contents, then `job.json`, then the directory —
+  // and that last `rmdir` fails on its own whenever the directory is some
+  // process's current one: every file unlinked, the directory left behind, the
+  // record gone. Which is precisely the outcome removing the record last exists
+  // to prevent — a job `list`, `status` and `clean` can never see again.
+  //
+  // The blocker sits in the JOB DIRECTORY ITSELF rather than in a child of it
+  // (the partial-failure fixture above), because a blocked child fails in the
+  // loop, long before the record is touched.
+  const room = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-lastrm-'));
+  const env = { CODEX_DISPATCH_JOBS: room };
+  const id = 'lastrm-1-99945';
+  const dir = path.join(room, id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+    recordVersion: RECORD_VERSION, id, role: 'lastrm', state: 'done', exitCode: 0,
+    sight: 'cwd-file:LICENSE', started: new Date(Date.now() - 10 * 86400000).toISOString(),
+    finished: new Date(Date.now() - 9 * 86400000).toISOString(),
+  }));
+  fs.writeFileSync(path.join(dir, 'out.txt'), 'answer\n');
+  const sitting = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 30000)'],
+    { cwd: dir, stdio: 'ignore', detached: true });
+  sitting.unref();
+  let stuck;
+  try {
+    await poll(() => pidAlive(sitting.pid), 5000, 50);
+    stuck = run(['clean', '--all'], env);
+  } finally {
+    try { process.kill(sitting.pid); } catch { /* already gone */ }
+  }
+  assert.equal(stuck.status, 0, stuck.stderr);
+  if (fs.existsSync(dir)) {
+    assert.equal(fs.existsSync(path.join(dir, 'job.json')), true,
+      'the record is PUT BACK when the directory removal fails, or the job is invisible for ever');
+    assert.match(stuck.stdout, /lastrm-1-99945\s+could not be removed/, 'and clean says so');
+    assert.match(run(['list'], env).stdout, /^lastrm-1-99945  done/m,
+      'it still lists — which is what makes "clean it again" a real cure');
+    assert.match(run(['status', id], env).stdout, /^state: done$/m, 'and still reads as finished');
+    assert.ok(await poll(() => !pidAlive(sitting.pid), 10000), 'the blocker must be gone first');
+    const retry = run(['clean', '--all'], env);
+    assert.equal(retry.status, 0, retry.stderr);
+    assert.equal(fs.existsSync(dir), false, 'and the retry finishes what the first run could not');
+  } else {
+    // POSIX lets a process's cwd be removed underneath it, so there is nothing to
+    // block. Say so rather than assert nothing.
+    process.stderr.write('NOTE: this platform allowed the removal of a directory in use; ' +
+      'the last-step-failure test did not fire.\n');
+    assert.match(stuck.stdout, /^removed: lastrm-1-99945$/m);
+  }
+  fs.rmSync(room, { recursive: true, force: true });
+});
+
 test('every state/reason pair this suite put on disk is one the docs allow', () => {
   // The record-level half of the pair contract (the source-level half is in
   // tests/resolution.test.mjs). It reads the pairs this runtime ACTUALLY wrote

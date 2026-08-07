@@ -2,7 +2,8 @@
 
 Every constraint in the runtime traces to an entry here. The catalog records the
 production failures this design answers; the review sections record the dual
-frontier reviews of 0.3.0 and 0.4.0, whose findings became 0.4.0 and 0.5.0.
+frontier reviews of 0.3.0, 0.4.0 and 0.8.0 and the 0.7.3 full-repo review,
+whose findings became 0.4.0, 0.5.0, 0.8.0 and 0.8.1.
 
 ## The failure catalog behind the design (2026-08-05/06, all seen in production)
 
@@ -355,3 +356,133 @@ removal that died partway with the record already gone left a tree nothing could
 ever list or clean again; and a removal that fails is caught and reported as a
 `kept:` line plus a stderr warning instead of throwing out of the lock and ending
 the run at the first stuck file.
+
+### The 0.8.0 dual review (2026-08-07) — the arms disagree, and adjudication decides
+
+`0.8.0` went back to two arms, full repo, one standalone brief each,
+independently: Claude Fable 5 with fresh context and the whole suite green
+beside it, and GPT-5.6-sol at xhigh — dispatched **through this runtime
+itself**, in the read-only sandbox the second-opinion contract mandates, which
+meant the Codex arm could execute only the 46 non-writing tests and traced the
+rest from source. For the first time the verdicts split: the Claude arm said
+*safe to build on, with one asterisk*; the Codex arm said *not yet safe*. The
+split was resolved the only way it can be — every disputed finding adjudicated
+against the source — and **all six of the Codex arm's extra findings survived,
+two of them in areas the Claude arm had explicitly probed and recorded as
+sound.** The 0.3.0 lesson gains its corollary: an arm's "checked and found
+sound" is a claim like any other finding, and the disagreement between arms is
+where the review actually happens.
+
+Converged — both arms, independently, the same trace:
+
+- **Dispatch's post-spawn cancel branch was the one writer left in the kill
+  seam without its precondition** — the exact class 0.8.0 declared closed, one
+  process to the left. It read the record once, spent seconds inside
+  `killPids`, then wrote `killed`/`kill-failed` unguarded, so a cancel landing
+  in the spawning window while the sight probe failed could put
+  `killed(sight-unproven)` — the pair `commands/list.md` documents as
+  impossible — back on disk. And DESIGN claimed the branch carried
+  `expect: canonicalState === 'running'`, which it never had, at any revision:
+  the next auditor would have concluded from the docs that the bug could not
+  exist. → CAS on `stillCancellable` like the rest of the seam; a lost
+  precondition is a found verdict — nothing overwritten, nothing released; the
+  kill target goes through the reaped-pid list first and pid files are consumed
+  only after a verified kill; both doc passages corrected.
+- **An unenumerated process tree counted as verified dead.** `killPids` said
+  `enumerated: false` when the process table could not be read, and exactly one
+  call site listened — the corrupt-record cancel. `killJob`, the post-spawn
+  branch, the unvouched reap and the supervisor's cancel landing all verified
+  only the pids they had fired at, concluded `killed`, and released the role —
+  while DESIGN promised an unreadable table is "never quietly treated as an
+  empty tree". → `enumerated: false` is a failed verification: `kill-failed`,
+  role kept, pid files left loaded, re-run advised — on every path, and the
+  DESIGN passage is now true.
+
+Codex arm only — all six confirmed by adjudication, none demoted:
+
+- **`clean` did not actually delete the record last.** `removeJobDir` unlinked
+  `job.json` and *then* removed the directory — an operation that can fail
+  alone (a process whose cwd is the job directory, on Windows: every file
+  unlinks, the rmdir refuses), leaving the invisible tree the comment above the
+  function promised away — while the failure warning told the operator "each of
+  them still has its job.json". The Claude arm had recorded `clean` as sound;
+  its test blocked a child directory and never the root. → The record's raw
+  bytes are captured before the unlink and written back when the final removal
+  throws, so a failure anywhere leaves a job that still lists; the new test
+  blocks the directory itself.
+- **`markPending` reported a state it failed to write.** A `locked`/`corrupt`
+  write failure was indistinguishable from success, so `cancel` printed "the
+  state is kill-pending" over a record still saying `running` — and the
+  exec-window launch block, which is the entire point of the mark, was silently
+  not armed. → Three outcomes: marked, lost-to-verdict, and unrecorded — the
+  last reported as "not recorded, nothing killed, re-run" through every caller.
+- **An ownerless claim was reclaimed with no fence at all.** `expected:
+  undefined` skipped both owner checks, so a reclaimer that resumed after the
+  grace window renamed away whatever held the lock at that moment — including a
+  fresh claim whose owner had already passed the verify fence and launched: two
+  same-role codexes, the one failure this runtime exists to prevent. The Claude
+  arm had recorded the ABA fence sound; the fence existed only for named
+  owners, and the code's own comment called the unfenced damage "bounded" on a
+  bound that fails exactly when the victim is past its fence. → `null` is a
+  fenced expectation of its own — "still ownerless", checked before the rename
+  and re-checked on what was actually moved — and the unfenced case is retired;
+  no caller remained that had never read an owner.
+- **The record-lock stale-break trusted age alone.** The lock's mtime was never
+  refreshed and no liveness was checked, so a live writer stalled five seconds
+  inside its critical section lost mutual exclusion, and its resumed write
+  clobbered the breaker's — a cancel's `kill-pending`, say. The CAS tests pause
+  2.5 s, specifically under the break, and so could never see it. → The lock
+  names its holder, and the break requires stale age *and* a holder not
+  provably alive.
+- **The jobs root was used verbatim.** A relative `CODEX_DISPATCH_JOBS` — the
+  README's own documented cure for a `%` in a user name — made job identity and
+  every printed `out:` path depend on the caller's cwd. → `path.resolve`, one
+  line, plus the test.
+- **Kill patches preserved a live record's `reason`, and `result` read the
+  reason before the state.** A version-skewed record — a state this release
+  cannot name, carrying `sight-unproven` — is `unknown`, which is live, which
+  is cancellable; the kill patch merged `killed` over it without touching the
+  reason, and `result` then printed "UNPROVEN: job never ran" for a job that
+  ran and was killed. → Terminal kill patches clear `reason`, and the never-ran
+  checks are gated on the state actually being `failed`, so a reason can never
+  outrank a state again.
+
+**And the follow-up review of the fix diff found the theme again, one writer
+further left**: the supervisor's cancelled-during-exec landing wrote its
+`killed`/`kill-failed` unguarded — while the freshly corrected DESIGN passage
+claimed all three late writers were compare-and-swap. Dispatch's now-fenced
+branch could write `killed` and release the role during the seconds the
+supervisor spent inside its own `killPids`; the supervisor then stamped
+`kill-failed` over that verdict with the role already free — a record that
+blocks nothing while claiming to. → The landing carries the same precondition,
+under an ownership rule stated both directions: whoever's write lands owns the
+verdict *and* the release together; a loser reports into `run.log`, overwrites
+nothing, releases nothing — and still kills codex, because the verdict is about
+the record, not about what is alive. Pinned by an interleaving test confirmed
+failing against 0.8.0 **and** against the fixed tree with only its `expect:`
+removed. The same follow-up caught the stale-break fix planting a synchronous
+PowerShell start-time query inside the very critical section it protected — on
+a cold shell, longer than the stale age itself. Cured at the root rather than
+relocated: the holder file carries the pid and nothing else, because start-time
+identity everywhere else in this runtime only ever *subtracts* kill targets,
+and here it would have been the evidence *justifying* the break of a
+live-looking lock. The residual — a dead holder whose pid is instantly reissued
+keeps the lock, and writers refuse loudly rather than lose an update — is in
+DESIGN's known issues, failing in the safe direction. Plus three honesty
+repairs of the round's own making: an advice line claiming pids were recorded
+spent when an unverified kill consumes nothing, a verified `killed` carrying
+the stale `killSurvivors` list of the `kill-failed` it overwrote, and two
+messages asserting claim-states they had not checked.
+
+Ten tests went in with the fixes (127 → 137), every one confirmed to fail
+against the unfixed runtime before it landed. What held, probed by both arms:
+`killJob`'s 0.8.0 CAS repair, the validator and its domains, the delivery gate
+and its version stamp, junction containment at both boundaries, the cmd.exe
+quoting gate, and all of the 0.7.3 fixes.
+
+One operational note, for symmetry with the entry that opens this catalog: the
+Codex arm's answer was retrieved through the printed `out:` path after the
+relay's wake-up chain dropped — the same dropped-notification failure that
+motivated the `out:` line in the first place, caught this time by the fallback
+it exists to provide. The contract held; the relay's polling loop is the thing
+to fix, and it lives outside this repo.
