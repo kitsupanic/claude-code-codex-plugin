@@ -1,12 +1,24 @@
-// Fake codex CLI for tests: mimics `codex exec -` and `codex sandbox <cmd>` far
-// enough to exercise the dispatch lifecycle. `exec` reads the brief from stdin,
-// spawns a long-lived child (so tree-kill can be asserted), sleeps, then writes
-// the out file. `sandbox` really runs the command it is handed, so the sight
-// precheck is exercised end to end rather than stubbed.
+// Fake codex CLI for tests: mimics `codex exec -`, `codex sandbox <cmd>`,
+// `codex --version` and `codex login status` far enough to exercise the dispatch
+// lifecycle AND preflight. `exec` reads the brief from stdin, spawns a long-lived
+// child (so tree-kill can be asserted), sleeps, then writes the out file.
+// `sandbox` really runs the command it is handed, so the sight precheck is
+// exercised end to end rather than stubbed.
 //
 // Env knobs:
 //   FAKE_CODEX_SLEEP_MS   (default 300)
 //   FAKE_CODEX_OUT        out file content
+//   FAKE_CODEX_EXEC_EXIT  exec writes the out file and then exits with this code —
+//                         a codex that produced something and still failed. The
+//                         supervisor's exit-code branch is the only thing that can
+//                         tell that apart from a success.
+//   FAKE_CODEX_NO_OUT     exec exits 0 having written NO out file: the shape where
+//                         the record honestly says `done` and there is nothing on
+//                         disk to deliver
+//   FAKE_CODEX_LOGIN_FAIL `login status` exits nonzero, the way an unauthenticated
+//                         codex-cli does — preflight's auth branch
+//   FAKE_CODEX_VERSION_FAIL  `--version` exits nonzero: a binary that is there and
+//                         will not run
 //   FAKE_CODEX_BLIND      emit the Windows-sandbox failure signatures on stderr
 //                         during exec, still write an out file, still exit 0 —
 //                         the silent blind success seen in production. The
@@ -29,6 +41,30 @@ import path from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 
 const args = process.argv.slice(2);
+
+// -------------------------------------------------- codex --version / login
+// Both answer in the shape real codex-cli does, because preflight PRINTS what
+// they say (`version:` / `auth:` lines) and a test that pins those lines is
+// pinning the parse. Placed before every other branch: `--version` and
+// `login status` never carry an --output-last-message, so the exec branch below
+// would refuse them.
+if (args[0] === '--version' || args[0] === '-V') {
+  if (process.env.FAKE_CODEX_VERSION_FAIL) {
+    process.stderr.write('error: could not start codex\n');
+    process.exit(1);
+  }
+  process.stdout.write('codex-cli 0.146.0\n');
+  process.exit(0);
+}
+if (args[0] === 'login') {
+  if (process.env.FAKE_CODEX_LOGIN_FAIL) {
+    // What an unauthenticated codex-cli says, on stderr, exiting nonzero.
+    process.stderr.write('Not logged in.\n');
+    process.exit(1);
+  }
+  process.stdout.write('Logged in using ChatGPT\n');
+  process.exit(0);
+}
 
 // ------------------------------------------------------------ codex sandbox
 if (args[0] === 'sandbox') {
@@ -89,9 +125,19 @@ const sleepMs = Number(process.env.FAKE_CODEX_SLEEP_MS || 300);
 const child = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)'], {
   stdio: 'ignore', windowsHide: true,
 });
+// A TEST ARTIFACT, not a kill target. It exists so a test can learn the
+// grandchild's pid and then assert it died — by DESCENT, through `taskkill /T` or
+// the process group. The runtime deliberately does not read this file: while it
+// did, the grandchild was a directly recorded target and the tree-kill tests
+// could not fail on the traversal they exist to prove.
 fs.writeFileSync(path.join(jobDir, 'child.pid'), String(child.pid));
 
 const brief = fs.readFileSync(0);
+// The bytes, not a count of them. The runtime's whole transport claim is that the
+// brief reaches the model unaltered, and a byte COUNT survives a newline
+// translation, a BOM, or a re-encode — every mangling the claim is about. Written
+// where the test can diff it against the file that was dispatched.
+fs.writeFileSync(path.join(jobDir, 'received-brief.bin'), brief);
 process.stdout.write(`fake-codex: got ${brief.length} brief bytes, args: ${args.join(' ')}\n`);
 
 // Verbatim shape of the real failure: the helper never launches, every sandboxed
@@ -125,7 +171,12 @@ if (process.env.FAKE_CODEX_ECHO) {
 }
 
 setTimeout(() => {
-  fs.writeFileSync(out, process.env.FAKE_CODEX_OUT ?? 'FAKE-RESULT line one\nline twoé\n');
+  // The out file is written FIRST and the exit code chosen after, deliberately:
+  // that is the ordering that makes an answer file and a verdict two different
+  // things, which is the property the record-authoritative gate rests on.
+  if (!process.env.FAKE_CODEX_NO_OUT) {
+    fs.writeFileSync(out, process.env.FAKE_CODEX_OUT ?? 'FAKE-RESULT line one\nline twoé\n');
+  }
   child.kill();
-  process.exit(0);
+  process.exit(Number(process.env.FAKE_CODEX_EXEC_EXIT || 0));
 }, sleepMs);

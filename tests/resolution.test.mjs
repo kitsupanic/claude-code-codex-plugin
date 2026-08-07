@@ -29,6 +29,7 @@ import {
   cmdQuote,
   deliverability,
   descendantsOf,
+  livingDescendantsOf,
   inRegistrationWindow,
   isDesktopApp,
   isInsideRoot,
@@ -320,7 +321,14 @@ test('control bytes are stripped from log output; text and whitespace survive', 
     'tab, CR and LF are the log\'s own formatting and must survive');
   assert.equal(stripControlBytes('hyphens-and-dashes — stay'), 'hyphens-and-dashes — stay',
     'the character class must not eat a literal hyphen');
-  assert.equal(stripControlBytes("C1controlstoo"), "C1controlstoo",
+  // Written as \u escapes, never as the raw bytes that used to sit here. Those
+  // bytes survive on disk today, but they are invisible in every editor and one
+  // transcoding pass — a save as UTF-16, a tool that normalises the file — turns
+  // them into something stripControlBytes has no reason to touch. The assert would
+  // then read "this text equals itself" and go on passing, having quietly stopped
+  // testing the C1 range at all. \u009b is CSI and \u0080 is PAD: both inside
+  // 0x80-0x9f, the range some terminals still act on.
+  assert.equal(stripControlBytes('C1\u009bcontrols\u0080too'), 'C1controlstoo',
     'the C1 range some terminals still act on goes too');
 });
 
@@ -455,6 +463,51 @@ test('a record whose pid fields leave the pid domain is corrupt', () => {
   assert.match(validateRecord({ ...base, exitCode: 0.5 }), /field "exitCode" is not an integer/);
 });
 
+test('the fields that reach a codex command line are domain- and shape-checked', () => {
+  // These three are handed STRAIGHT to codex by the supervisor and were only ever
+  // type-checked. `sandbox` has a two-word domain; a rewritten job.json saying
+  // `danger-full-access` was a string, so it validated, so codex launched
+  // unsandboxed on a record this runtime never wrote.
+  const base = { state: 'running', started: '2026-08-06T00:00:00.000Z' };
+  assert.equal(validateRecord({ ...base, sandbox: 'read-only' }), null);
+  assert.equal(validateRecord({ ...base, sandbox: 'workspace-write' }), null);
+  assert.equal(validateRecord({ ...base }), null, 'and absent stays valid');
+  for (const bad of ['danger-full-access', 'Read-Only', 'read-only ', '', 'none']) {
+    assert.match(validateRecord({ ...base, sandbox: bad }), /field "sandbox" is not a sandbox mode/,
+      `sandbox ${JSON.stringify(bad)} must make the record corrupt`);
+  }
+  assert.match(validateRecord({ ...base, sandbox: 5 }), /field "sandbox" is not a string/,
+    'the type check still runs first');
+
+  // model/effort get no whitelist — codex adds models — so the SHAPE is the check.
+  for (const good of ['gpt-5.6-luna', 'gpt-5.6-sol', 'o3_mini', 'medium', 'xhigh', 'a']) {
+    assert.equal(validateRecord({ ...base, model: good, effort: good }), null, good);
+  }
+  for (const bad of ['gpt 5', 'a;rm -rf /', '$(id)', 'a|b', 'a>b', '%PATH%', '', 'x'.repeat(81)]) {
+    assert.match(validateRecord({ ...base, model: bad }),
+      /field "model" is not a name this runtime would put on a codex command line/,
+      `model ${JSON.stringify(bad)} must make the record corrupt`);
+    assert.match(validateRecord({ ...base, effort: bad }), /field "effort" is not a name/);
+  }
+});
+
+test('a started that is not a time makes the record corrupt, not the window harmless', () => {
+  // `killWindow` measures the supervisor-registration window from `started`, and
+  // an unparseable one fell out of Number.isFinite(Date.parse(...)) as window
+  // `none` — so a cancel inside the window killed nothing, recorded `killed` and
+  // released the role while the supervisor went on to launch codex. Fail-open, in
+  // the one place this runtime may not be.
+  assert.equal(validateRecord({ state: 'running', started: '2026-08-06T00:00:00.000Z' }), null);
+  assert.equal(validateRecord({ state: 'running', started: '2026-08-06' }), null,
+    'any shape Date.parse understands is a time');
+  for (const bad of ['x', 'soon', 'yesterday', '2026-13-45T99:99:99Z']) {
+    assert.match(validateRecord({ state: 'running', started: bad }),
+      /field "started" is not a date/, `started ${JSON.stringify(bad)} must make the record corrupt`);
+  }
+  assert.match(validateRecord({ state: 'running' }), /field "started" is missing/,
+    'and missing is still reported as missing, not as unparseable');
+});
+
 test('a sight is a proof or it is not — a prefix is never one', () => {
   assert.equal(isProbeFileName('LICENSE'), true);
   assert.equal(isProbeFileName('a file with spaces.txt'), true);
@@ -477,7 +530,7 @@ test('a sight is a proof or it is not — a prefix is never one', () => {
   ]) {
     assert.equal(sightVerdict({ sight: forged }).kind, 'malformed',
       `${JSON.stringify(forged)} claims the prefix and is not a proof`);
-    assert.match(validateRecord({ state: 'done', started: 'x', sight: forged }),
+    assert.match(validateRecord({ state: 'done', started: '2026-08-06T00:00:00.000Z', sight: forged }),
       /field "sight" claims the proof prefix/,
       'and a record carrying it is corrupt, not merely undeliverable');
   }
@@ -525,6 +578,43 @@ test('the process tree is walked from a table, without following a cycle', () =>
   assert.deepEqual(descendantsOf([99], loop), []);
 });
 
+test('a process older than its supposed parent is not its child, and is not adopted', () => {
+  // Windows leaves a dead parent's pid on its orphans, so when that number is
+  // reissued to the wrapper this runtime just spawned, an unrelated process from
+  // before appears in the table as our descendant — and then gets recorded in
+  // codexPids with its own current start time, which is what makes it pass the
+  // identity check at kill time. `taskkill /PID <n> /T /F` at a stranger's tree.
+  //
+  // The start times are injected, exactly as they are for the pid-reuse test: the
+  // OS reissuing a chosen number is not producible on demand, and what is under
+  // test is the ordering decision.
+  // Numbers no live process can hold, so the second half really does get "the OS
+  // would not say" rather than some unrelated process's real start time.
+  //   ...801 — the fresh wrapper           ...803 — an old process still naming it
+  //   ...802 — a real child of the wrapper ...804 — a real child of the stranger
+  const [wrapper, child, stranger, its] = [999999801, 999999802, 999999803, 999999804];
+  const table = new Map([[wrapper, 1], [child, wrapper], [stranger, wrapper], [its, stranger]]);
+  const at = (s) => `2026-08-06T00:00:${String(s).padStart(2, '0')}.000Z`;
+  const prior = process.env.CODEX_DISPATCH_TEST_START_TIME;
+  process.env.CODEX_DISPATCH_TEST_START_TIME =
+    `${wrapper}:${at(30)} ${child}:${at(31)} ${stranger}:${at(10)} ${its}:${at(11)}`;
+  const sorted = (a) => a.sort((x, y) => x - y);
+  try {
+    assert.deepEqual(sorted(descendantsOf([wrapper], table)), [child, stranger, its],
+      'the raw walk believes the ppid table, which is the defect');
+    assert.deepEqual(livingDescendantsOf([wrapper], table), [child],
+      'the stranger is dropped — and so is everything reachable only through it');
+
+    // No opinion is not a verdict: an unanswered start time leaves the walk alone.
+    process.env.CODEX_DISPATCH_TEST_START_TIME = `${wrapper}:${at(30)}`;
+    assert.deepEqual(sorted(livingDescendantsOf([wrapper], table)), [child, stranger, its],
+      'absence on either side is no opinion, and the check only ever subtracts what it can disprove');
+  } finally {
+    if (prior === undefined) delete process.env.CODEX_DISPATCH_TEST_START_TIME;
+    else process.env.CODEX_DISPATCH_TEST_START_TIME = prior;
+  }
+});
+
 test('containment is proved against the real path, not just a lexical one', () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-real-'));
   const outside = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-outside-'));
@@ -557,9 +647,18 @@ test('every reason the runtime writes is declared, and documented in commands/li
   // `cmdList` prints `state(reason)` for ANY reason, so the emittable set is a
   // contract with the operator. Generated from the source of truth rather than
   // remembered: a new reason that is not declared, or not documented, fails here.
+  //
+  // WHAT THIS SCAN CANNOT SEE, stated rather than left to be discovered: a reason
+  // assembled at runtime (`reason: \`x-${y}\``, a variable, a ternary, a value
+  // spread in from another object) is invisible to a source regex, and so is one
+  // written through a helper that does not spell the key. Those shapes are the
+  // reason the assertion below is a floor on the COUNT as well as a per-reason
+  // check — a scan that suddenly matches nothing must fail loudly rather than
+  // vacuously pass. All three quoting forms are matched so that merely changing a
+  // quote style cannot silently drop a reason out of the contract.
   const source = fs.readFileSync(new URL('../scripts/codex-dispatch.mjs', import.meta.url), 'utf8');
   const written = new Set();
-  for (const m of source.matchAll(/\breason:\s*'([a-z][a-z0-9-]*)'/g)) written.add(m[1]);
+  for (const m of source.matchAll(/\breason:\s*(['"`])([a-z][a-z0-9-]*)\1/g)) written.add(m[2]);
   assert.ok(written.size >= 8, `expected the runtime to write several reasons, found ${written.size}`);
   for (const reason of written) {
     assert.ok(JOB_REASONS.includes(reason),

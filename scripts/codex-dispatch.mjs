@@ -290,6 +290,23 @@ const PATTERN_FIELDS = [
   ['id', JOB_ID_RE, 'a job id (<role>-<epoch>-<pid>)'],
 ];
 
+// Three more fields the supervisor hands STRAIGHT TO CODEX — `--sandbox`,
+// `--model`, `-c model_reasoning_effort=` — and they were only ever type-checked.
+//
+// `sandbox` has a domain and it is two words wide: dispatch writes `read-only` or
+// `workspace-write` and nothing else, ever. A rewritten job.json saying
+// `danger-full-access` was a string, so it validated, so the supervisor launched
+// codex with no sandbox at all — on a record this runtime never wrote. Out of
+// domain is corruption, like every other semantic domain here.
+const SANDBOX_MODES = ['read-only', 'workspace-write'];
+// `model` and `effort` cannot have a domain: codex adds models, and a whitelist
+// written today refuses tomorrow's. So the SHAPE is constrained instead — the
+// charset every model and effort name has ever used — which is what keeps a
+// record from smuggling a second argument, a redirection or an expansion onto the
+// command line the supervisor builds. CMD_UNSAFE covers Windows only; this runs
+// on both, and this is the check that does.
+const ARGV_WORD_RE = /^[A-Za-z0-9._-]{1,80}$/;
+
 const typeName = (v) => (Array.isArray(v) ? 'array' : v === null ? 'null' : typeof v);
 
 // A proven sight is `cwd-file:<name>` where <name> is a FILE NAME — not a
@@ -383,6 +400,23 @@ export function validateRecord(parsed) {
     return `field "${key}" is not ${what}: ${JSON.stringify(clean(String(v)).slice(0, 80))}`;
   }
   // ---- semantic domains, not just types --------------------------------------
+  if (parsed.sandbox !== undefined && parsed.sandbox !== null && !SANDBOX_MODES.includes(parsed.sandbox)) {
+    return (
+      `field "sandbox" is not a sandbox mode ` +
+      `(${JSON.stringify(clean(String(parsed.sandbox)).slice(0, 80))}; this runtime dispatches ` +
+      `${SANDBOX_MODES.join(' or ')} and nothing else)`
+    );
+  }
+  for (const key of ['model', 'effort']) {
+    const v = parsed[key];
+    if (v === undefined || v === null) continue;
+    if (!ARGV_WORD_RE.test(v)) {
+      return (
+        `field "${key}" is not a name this runtime would put on a codex command line ` +
+        `(${JSON.stringify(clean(String(v)).slice(0, 80))}; ${ARGV_WORD_RE})`
+      );
+    }
+  }
   for (const key of PID_NUMBER_FIELDS) {
     const v = parsed[key];
     if (v === undefined || v === null) continue;
@@ -439,6 +473,18 @@ export function validateRecord(parsed) {
   }
   for (const key of REQUIRED_FIELDS) {
     if (!parsed[key]) return `field "${key}" is missing`;
+  }
+  // `started` is not decoration. `killWindow` measures the supervisor-registration
+  // window from it, and an unparseable one made `Number.isFinite(Date.parse(...))`
+  // false — which fell out of that expression as window `none`, so a cancel
+  // landing inside the window killed nothing, recorded `killed` and released the
+  // role while the supervisor it never touched went on to launch codex. That is
+  // the one failure this runtime exists to prevent, reached by a field nobody had
+  // given a domain. The validator is the spine: a time that is not a time is a
+  // record this runtime did not write, so it is corruption here rather than a
+  // fail-open guess in every reader.
+  if (!Number.isFinite(Date.parse(parsed.started))) {
+    return `field "started" is not a date (${JSON.stringify(clean(String(parsed.started)).slice(0, 80))})`;
   }
   return null;
 }
@@ -625,8 +671,23 @@ function withRecordLock(dir, fn) {
       if (age > RECORD_LOCK_STALE_MS) {
         // The holder died. Breaking the lock is safe in a way stealing a role
         // claim is not: the loser of this race rewrites from a fresh read.
-        try { fs.rmSync(lock, { recursive: true, force: true }); } catch { /* raced */ }
-        continue;
+        //
+        // But BREAKING IT MUST HAVE EXACTLY ONE WINNER, and `rmSync` has none.
+        // Two processes can both stat the same stale lock and both decide to
+        // break it; the second, descheduled after its stat, deleted the FRESH
+        // lock the first had already created and was writing under — which
+        // reopens the lost-update window this lock exists to close. So the break
+        // is a RENAME to a unique tombstone, the same atomic single-winner
+        // primitive the role claims use (see reclaimClaim), and only the process
+        // that won the rename removes what it moved. A rename that fails means
+        // somebody else broke it first — nothing to do but go round again.
+        const tomb = `${lock}.stale-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+        let broke = false;
+        try { fs.renameSync(lock, tomb); broke = true; } catch { /* another breaker won it */ }
+        if (broke) {
+          try { fs.rmSync(tomb, { recursive: true, force: true }); } catch { /* a tombstone; harmless */ }
+          continue;
+        }
       }
       if (Date.now() >= deadline) return { locked: false };
       sleepSync(20);
@@ -641,6 +702,9 @@ function withRecordLock(dir, fn) {
 // running" and have that mean it. Returns the new record, or null when the
 // record is corrupt, the precondition failed, or the lock could not be taken;
 // `updateRecordOutcome` gives callers the reason when they need to act on it.
+// `patch` may be a FUNCTION of the current record, for the callers whose patch is
+// itself a read-modify-write (see recordReapedPids): computing a merge from a read
+// taken outside the lock is the very race this lock exists to stop.
 function updateRecordOutcome(dir, patch, { expect } = {}) {
   const held = withRecordLock(dir, () => {
     const current = readRecord(dir);
@@ -654,7 +718,7 @@ function updateRecordOutcome(dir, patch, { expect } = {}) {
     if (isCorrupt(current)) return { ok: false, why: 'corrupt', current };
     if (expect && !expect(current)) return { ok: false, why: 'precondition', current };
     const generation = Number.isSafeInteger(current.generation) ? current.generation + 1 : 1;
-    const record = { ...current, ...patch, generation };
+    const record = { ...current, ...(typeof patch === 'function' ? patch(current) : patch), generation };
     writeRecord(dir, record);
     return { ok: true, record };
   });
@@ -1446,7 +1510,14 @@ function sightProbe(bin, cwd, jobDir) {
 // Returns { bin } or exits loudly. With CODEX_DISPATCH_BIN set the checks are
 // skipped: the override is trusted (that is its point, for tests and stand-ins).
 function preflight({ quiet } = {}) {
-  if (process.env.CODEX_DISPATCH_BIN) {
+  // TEST HOOK: the pin below is the whole of preflight when it is set, so every
+  // check this function exists to make — version, auth, the sandbox probe and the
+  // three warnings hanging off it — has never once executed under test. This
+  // forces them to run against the pinned bin. Only the SHORT-CIRCUIT is
+  // injected; each check below is the real one, posed at a stand-in that answers
+  // `--version` and `login status` the way codex-cli does, because a preflight
+  // that has never been run is a preflight nobody knows the shape of.
+  if (process.env.CODEX_DISPATCH_BIN && !process.env.CODEX_DISPATCH_TEST_PREFLIGHT_FULL) {
     if (!quiet) console.log(`preflight: using CODEX_DISPATCH_BIN override (${process.env.CODEX_DISPATCH_BIN})`);
     return { bin: process.env.CODEX_DISPATCH_BIN };
   }
@@ -1562,8 +1633,13 @@ export function parseClaimOwner(raw) {
   return { owner: text };
 }
 
+// A READ THAT FAILED AND A CLAIM THAT NAMED NOBODY are two different answers, and
+// they used to arrive as the same `{ owner: null }`. `unreadable` is what tells
+// them apart — see inspectClaim and releaseRole, both of which decide whether to
+// rename a live claim away on the strength of it.
 function readClaimOwner(lockDir) {
-  try { return parseClaimOwner(fs.readFileSync(claimOwnerPath(lockDir), 'utf8')); } catch { return { owner: null }; }
+  try { return parseClaimOwner(fs.readFileSync(claimOwnerPath(lockDir), 'utf8')); }
+  catch (err) { return { owner: null, unreadable: clean(err.code || err.message).slice(0, 40) }; }
 }
 
 function claimAge(lockDir) {
@@ -1695,10 +1771,15 @@ function releaseRole(root, role, jobId) {
   }
   const lockDir = roleLockDir(root, role);
   if (!fs.existsSync(lockDir)) return;
-  const { owner, invalid } = readClaimOwner(lockDir);
+  const { owner, invalid, unreadable } = readClaimOwner(lockDir);
   // An unreadable owner is not proof the claim is ours, and releasing it would
-  // hand the role away on a guess.
-  if (invalid !== undefined) return;
+  // hand the role away on a guess. That was only half true until `readClaimOwner`
+  // could say which kind of "no owner" it meant: a read that THREW arrived here as
+  // `{ owner: null }`, sailed past this line and past the ownership check below,
+  // and released the claim with no fence at all. Not releasing costs nothing —
+  // this job is terminal, so the next dispatch reclaims the role through
+  // `inspectClaim`, fence and all.
+  if (invalid !== undefined || unreadable !== undefined) return;
   if (owner && jobId && owner !== jobId) return;
   // Conditional on the owner still being the one just read — the release side of
   // the same ABA race as the reclaim side. `owner` may legitimately be null (a
@@ -1722,7 +1803,7 @@ function releaseRole(root, role, jobId) {
 // are alive, which is not the same as saying they are dead — so the role does not
 // change hands until they have been killed and the kill verified.
 function inspectClaim(root, lockDir) {
-  const { owner, invalid } = readClaimOwner(lockDir);
+  const { owner, invalid, unreadable } = readClaimOwner(lockDir);
   const age = claimAge(lockDir);
   // An owner that is not a job id is CORRUPT, not "an owner we will do our best
   // with". Nothing is derived from it, nothing is reaped, nothing is reclaimed:
@@ -1731,6 +1812,24 @@ function inspectClaim(root, lockDir) {
     return { status: 'corrupt', owner: null, invalid, lockDir, detail: 'the claim owner is not a job id' };
   }
   if (!owner) {
+    // An owner that could not be READ is not a claim standing there ownerless.
+    // The claim is built elsewhere and renamed into place with its owner file
+    // already inside (see tryClaim), so a failed read means the claim was caught
+    // mid-install, or vanished under this inspection and something else is in its
+    // place now. Answering `reclaimable` sent `reclaimClaim` in with
+    // `expected: undefined`, which skips the owner fence and renames away whatever
+    // holds the role at that moment — a live claim installed a millisecond ago,
+    // destroyed on a read error. The damage is bounded (its owner's verify fails
+    // and it refuses to launch rather than running unclaimed), and it is still a
+    // role taken from a job that had it.
+    //
+    // Time-boxed like every other "cannot tell yet" here: `claimAge` reads the
+    // lock directory, so this is only ever taken while something young is really
+    // there, and an owner file still unreadable past the grace window goes down
+    // the reclaimable path as before rather than blocking the role for ever.
+    if (unreadable !== undefined && age < CLAIM_GRACE_MS) {
+      return { status: 'live', owner: null, age, detail: `the claim owner could not be read (${unreadable})` };
+    }
     return age < CLAIM_GRACE_MS
       ? { status: 'live', owner: null, age }
       : { status: 'reclaimable', owner: null, detail: 'the claim never named an owner' };
@@ -1929,6 +2028,58 @@ export function descendantsOf(roots, table) {
   return [...out];
 }
 
+// A CHILD CANNOT PREDATE ITS PARENT, and that is the only thing standing between
+// the walk above and an adopted stranger.
+//
+// Windows leaves a dead parent's pid sitting in the ppid field of every surviving
+// child, and pid numbers are reissued. So the moment one of those numbers is
+// handed to the cmd.exe wrapper this runtime just spawned, some unrelated process
+// that outlived the ORIGINAL owner of that number appears in the table as our
+// descendant. It is then recorded in `codexPids` together with ITS OWN CURRENT
+// start time (see the supervisor's `startTimesFor`) — which is what makes the
+// forgery complete: the identity check at kill time compares that recorded start
+// time against itself and waves the stranger through. The runtime signs the
+// papers itself, and then fires `taskkill /PID <n> /T /F` at somebody else's tree.
+//
+// So an edge whose child started BEFORE its supposed parent is a lie, and it is
+// removed from the table before the walk is re-run — which drops the stranger and
+// everything reachable only through it, rather than just the one pid.
+//
+// NOTE THE DIRECTION. Everywhere else the start-time machinery only ever
+// SUBTRACTS from a kill list, and the file's rule is that it may only subtract
+// what it can DISPROVE. That rule holds here — the edge is subtracted only on
+// evidence that contradicts parentage outright, and absence of a start time on
+// either side is no opinion and leaves the edge standing. But the thing being
+// dropped is a KILL TARGET, so if this were ever wrong it would spare a real
+// descendant rather than spare a stranger. That trade is worth taking precisely
+// because the pids this can drop were never recorded by the job: a pid the job
+// wrote down is a target in its own right and never reaches this walk, so the
+// only thing at risk is a descendant found by inference — and inference from a
+// ppid field that the OS itself does not keep honest.
+export function livingDescendantsOf(roots, table) {
+  const kin = descendantsOf(roots, table);
+  if (!kin || !kin.length) return kin;
+  // One batched query: the candidates, and the parents the table claims for them.
+  const claimed = new Map(kin.map((pid) => [pid, table.get(pid)]));
+  const starts = pidStartTimes([...kin, ...claimed.values()].filter(isPid));
+  const lying = kin.filter((pid) => startedBefore(starts.get(pid), starts.get(claimed.get(pid))));
+  if (!lying.length) return kin;
+  const pruned = new Map(table);
+  for (const pid of lying) pruned.delete(pid);
+  return descendantsOf(roots, pruned);
+}
+
+// Strictly before, by more than the slop `sameStartTime` already allows: a parent
+// and the child it spawns a millisecond later cannot be ordered by this clock, and
+// "no opinion" is the only honest reading of two times that close. Unparseable or
+// absent on either side is no opinion too.
+function startedBefore(child, parent) {
+  const a = Date.parse(child ?? '');
+  const b = Date.parse(parent ?? '');
+  if (!Number.isFinite(a) || !Number.isFinite(b)) return false;
+  return a < b - START_TIME_SLOP_MS;
+}
+
 // The real process(es) behind a shell wrapper. Polled rather than read once,
 // because cmd.exe takes a moment to start what it was asked to start, and an
 // empty answer here is the difference between verifying codex and verifying a
@@ -1942,7 +2093,7 @@ function resolveWorkerPids(wrapperPid, { timeoutMs = WORKER_RESOLVE_MS } = {}) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
     const table = processTable();
-    const kin = descendantsOf([wrapperPid], table);
+    const kin = livingDescendantsOf([wrapperPid], table);
     if (kin && kin.length) return kin;
     if (!pidAlive(wrapperPid)) return kin || [];
     if (Date.now() >= deadline) return kin || [];
@@ -1994,7 +2145,7 @@ function killPids(pids, { rounds = 2 } = {}) {
     // Descendants are only meaningful for a parent that is alive: a dead pid's
     // recorded parentage is stale on Windows and can name a REUSED number.
     const live = targets.filter(pidAlive);
-    const kin = table ? (descendantsOf(live, table) || []) : [];
+    const kin = table ? (livingDescendantsOf(live, table) || []) : [];
     for (const pid of kin) fired.add(pid);
     for (const pid of [...fired]) killTree(pid);
     if (!waitGone([...fired]).length) break;
@@ -2006,7 +2157,7 @@ function killPids(pids, { rounds = 2 } = {}) {
   // cmd.exe wrapper.
   const after = processTable();
   if (!after) enumerated = false;
-  const leftovers = after ? (descendantsOf([...fired], after) || []) : [];
+  const leftovers = after ? (livingDescendantsOf([...fired], after) || []) : [];
   return {
     survivors: [...new Set([...alive, ...leftovers.filter(pidAlive)])],
     targets: [...fired],
@@ -2014,10 +2165,18 @@ function killPids(pids, { rounds = 2 } = {}) {
   };
 }
 
-// Pids recorded as plain files in the job dir, one or more per file. The
-// supervisor writes supervisor.pid/codex.pid; the tests' fake codex writes
-// child.pid. These are the only kill targets that survive a corrupt job.json.
-const PID_FILES = ['supervisor.pid', 'codex.pid', 'child.pid'];
+// Pids recorded as plain files in the job dir, one or more per file, both
+// written by this runtime. These are the only kill targets that survive a
+// corrupt job.json.
+//
+// `child.pid` used to be listed here and nothing this runtime ships has ever
+// written one — only the tests' fake codex does. That made the fake's grandchild
+// a DIRECT kill target, so the two Windows tree-kill tests passed without
+// `taskkill /T` having to traverse anything: the one thing they existed to prove
+// was the one thing they could not fail on. The POSIX group-kill test already
+// deleted the file before cancelling for exactly that reason. It is a test
+// artifact, and it is read by the tests, not by this.
+const PID_FILES = ['supervisor.pid', 'codex.pid'];
 // Mirrors job.json's `reapedPids` for the jobs whose record must NOT be rewritten
 // — a corrupt job.json is evidence and stays byte-for-byte — so the fact that a
 // number has already been fired at still has somewhere to live. Same relationship
@@ -2060,24 +2219,42 @@ function recordedPids(dir) {
 // Writing the numbers down is what actually makes a reap non-repeatable. The
 // rename below is the visible half and it can fail; this half cannot be defeated
 // by a locked file, an attribute, or a permission that changed underneath us.
+// BOTH copies are merged UNDER THE RECORD LOCK, and both merges are computed from
+// reads taken inside it. They used to be computed from reads taken before it, in
+// two separate read-modify-writes: two cancels reaping in parallel each wrote its
+// own list over the other's, and a lost entry is a spent pid number RE-ARMED —
+// fired at again, hours later, at whatever inherited it. The file is the record's
+// second copy, so the record's lock is the right one for both.
 function recordReapedPids(dir, pids) {
   const list = [...new Set(pids.filter((n) => Number.isInteger(n) && n > 0))];
   if (!list.length) return;
-  try {
-    const prior = readPidList(path.join(dir, REAPED_PIDS_FILE));
-    // Temp file and rename, exactly as job.json gets it. This file exists FOR the
-    // case where the record copy is unusable, so a reader catching it half-written
-    // — a process killed mid-write, a machine that lost power — would lose the one
-    // list that keeps a spent number from being fired at again. A rename is either
-    // done or not done.
-    const tmp = path.join(dir, `${REAPED_PIDS_FILE}.${process.pid}.tmp`);
-    fs.writeFileSync(tmp, [...new Set([...prior, ...list])].join('\n') + '\n');
-    renameWithRetry(tmp, path.join(dir, REAPED_PIDS_FILE));
-  } catch { /* best effort: the record copy below is the other half */ }
-  const current = readRecord(dir);
-  if (isCorrupt(current)) return; // evidence — never rewritten
-  const prior = Array.isArray(current.reapedPids) ? current.reapedPids : [];
-  updateRecord(dir, { reapedPids: [...new Set([...prior, ...list])] });
+  const mergeFile = () => {
+    try {
+      const prior = readPidList(path.join(dir, REAPED_PIDS_FILE));
+      // Temp file and rename, exactly as job.json gets it. This file exists FOR the
+      // case where the record copy is unusable, so a reader catching it half-written
+      // — a process killed mid-write, a machine that lost power — would lose the one
+      // list that keeps a spent number from being fired at again. A rename is either
+      // done or not done.
+      const tmp = path.join(dir, `${REAPED_PIDS_FILE}.${process.pid}.tmp`);
+      fs.writeFileSync(tmp, [...new Set([...prior, ...list])].join('\n') + '\n');
+      renameWithRetry(tmp, path.join(dir, REAPED_PIDS_FILE));
+    } catch { /* best effort: the record copy is the other half */ }
+  };
+  let merged = false;
+  updateRecordOutcome(dir, (current) => {
+    mergeFile();
+    merged = true;
+    const prior = Array.isArray(current.reapedPids) ? current.reapedPids : [];
+    return { reapedPids: [...new Set([...prior, ...list])] };
+  });
+  if (merged) return;
+  // The callback never ran: the record is corrupt (evidence, never rewritten) or
+  // the lock could not be taken. The FILE is the copy that exists precisely for
+  // those cases, so it is merged anyway — under the lock when one can be had, and
+  // unlocked rather than not at all when it cannot. A lost entry re-arms a spent
+  // number, which is the failure this file is here to prevent.
+  if (!withRecordLock(dir, mergeFile).locked) mergeFile();
 }
 
 // A pid file that has been acted on is spent. Renaming it is what stops a second
@@ -2205,30 +2382,64 @@ export function inRegistrationWindow(record, now = Date.now()) {
 // is NOT a kill: the job goes to `kill-failed`, keeps its role claim, and keeps
 // blocking dispatch — because whatever survived may still be codex, still billing.
 function killJob(job) {
-  const r = job.record;
-  const targets = [];
-  if (!isCorrupt(r)) {
-    if (r.supervisorPid) targets.push(r.supervisorPid);
-    if (r.codexPid) targets.push(r.codexPid);
-    // The pids resolved AFTER the spawn — on Windows the real codex worker behind
-    // the cmd.exe wrapper that `codexPid` names. This is the field a kill
-    // verification has to reach; `codexPid` alone was a proxy.
-    if (Array.isArray(r.codexPids)) targets.push(...r.codexPids);
+  // THE CALLER'S SNAPSHOT IS NOT THE RECORD. `job.record` was read at `getJob`
+  // time, and everything between there and here is slow: `effectiveState` and the
+  // identity check below each spend seconds in a shell. In that gap the
+  // supervisor can CAS `launch: 'exec-spawning'` and spawn codex — which off
+  // Windows leads its own process group and reparents to init the moment the
+  // supervisor dies. Deciding on the snapshot therefore read the window as
+  // `none` and the target list as "supervisor only": the kill verified, the
+  // leftover sweep found nothing descended from anything, and the job was
+  // recorded `killed` with its role released while codex went on billing.
+  //
+  // So the record is read HERE, and read again after the identity check — the
+  // one step long enough for the phase to move underneath it. Both the phase and
+  // the pids are re-gathered, because the two sides of that window differ in
+  // both: `exec-spawning` has no codex pid to kill, `exec` has one the snapshot
+  // never carried. One re-gather is the bound: the supervisor writes the phase
+  // and the pids on either side of the window, and a record still moving after
+  // that is one being rewritten in a loop, whose phase is the dangerous reading
+  // either way.
+  const gather = (record) => {
+    const targets = [];
+    if (!isCorrupt(record)) {
+      if (record.supervisorPid) targets.push(record.supervisorPid);
+      if (record.codexPid) targets.push(record.codexPid);
+      // The pids resolved AFTER the spawn — on Windows the real codex worker behind
+      // the cmd.exe wrapper that `codexPid` names. This is the field a kill
+      // verification has to reach; `codexPid` alone was a proxy.
+      if (Array.isArray(record.codexPids)) targets.push(...record.codexPids);
+    }
+    // When the supervisor is already dead — the stale case — codex has been
+    // reparented out of its tree, so /T on the supervisor reaches nothing. Hit the
+    // recorded pids directly: harmless when they are already gone, and the only
+    // thing that stops an orphan billing. (Non-Windows has no tree kill at all,
+    // so it always needed this.)
+    targets.push(...recordedPids(job.dir));
+    return [...new Set(targets.filter(isPid))];
+  };
+  let r, written, unique;
+  for (let pass = 0; ; pass++) {
+    r = readRecord(job.dir);
+    written = gather(r);
+    // IDENTITY BEFORE THE TRIGGER. These numbers were written down when the job
+    // started and may be firing hours later, by which time the OS can have reissued
+    // one of them — and `taskkill /PID <n> /T /F` at a reused number kills a
+    // stranger's process tree. A pid whose process no longer carries the start time
+    // this job recorded is treated as already dead: not fired at, not counted as a
+    // survivor. Pids with nothing recorded are unchanged (see `recordedProcesses`).
+    unique = recordedProcesses(r, written);
+    if (pass >= 1) break;
+    // TEST HOOK: stands in for the seconds the identity check above really spends
+    // in a shell. A scheduler gap of a chosen length is not producible on demand;
+    // what is under test is that the decision below is made on the record as it is
+    // NOW rather than as the caller read it. Never set outside the suite.
+    if (process.env.CODEX_DISPATCH_TEST_KILL_PAUSE_MS) {
+      sleepSync(Number(process.env.CODEX_DISPATCH_TEST_KILL_PAUSE_MS));
+    }
+    const after = readRecord(job.dir);
+    if (launchPhase(after) === launchPhase(r) && String(gather(after)) === String(written)) break;
   }
-  // When the supervisor is already dead — the stale case — codex has been
-  // reparented out of its tree, so /T on the supervisor reaches nothing. Hit the
-  // recorded pids directly: harmless when they are already gone, and the only
-  // thing that stops an orphan billing. (Non-Windows has no tree kill at all,
-  // so it always needed this.)
-  targets.push(...recordedPids(job.dir));
-  const written = [...new Set(targets.filter(isPid))];
-  // IDENTITY BEFORE THE TRIGGER. These numbers were written down when the job
-  // started and may be firing hours later, by which time the OS can have reissued
-  // one of them — and `taskkill /PID <n> /T /F` at a reused number kills a
-  // stranger's process tree. A pid whose process no longer carries the start time
-  // this job recorded is treated as already dead: not fired at, not counted as a
-  // survivor. Pids with nothing recorded are unchanged (see `recordedProcesses`).
-  const unique = recordedProcesses(r, written);
   const reissued = written.filter((pid) => !unique.includes(pid));
   if (reissued.length) {
     process.stderr.write(
@@ -2444,6 +2655,22 @@ function cmdDispatch(opts) {
   const cwd = path.resolve(opts.cd || process.cwd());
   const model = opts.model || DEFAULT_MODEL;
   const effort = opts.effort || DEFAULT_EFFORT;
+
+  // The same shape the READ boundary enforces (see ARGV_WORD_RE in
+  // validateRecord), applied where the value is typed — because a dispatch that
+  // writes a record it could not read back has produced a corrupt job that blocks
+  // its role, which is a worse answer than a refusal. Every platform, unlike the
+  // cmd.exe check below: argv arrays are not re-parsed, but a model name is still
+  // a word.
+  for (const [flag, value] of [['--model', model], ['--effort', effort]]) {
+    if (!ARGV_WORD_RE.test(value)) {
+      fail(
+        `dispatch: ${flag} ${JSON.stringify(value)} is not a name this runtime will put on a codex\n` +
+        `command line (${ARGV_WORD_RE}). Model and effort names are words; anything else is a\n` +
+        `second argument in a costume, so it is refused rather than passed on.`
+      );
+    }
+  }
 
   // Windows only, because only Windows builds a command line: elsewhere argv is
   // handed to spawn as an array and nothing re-parses it. See CMD_UNSAFE for why
