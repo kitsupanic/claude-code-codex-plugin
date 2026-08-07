@@ -192,8 +192,8 @@ the filesystem rather than to the record:
   `readRecord` now type-checks the fields the verbs consume and returns the same
   marker, naming the field: `corrupt job.json (field "started" is not a string
   (number))`.
-- **`cancel` on a corrupt job still reaps processes**, from the `supervisor.pid`,
-  `codex.pid` and `child.pid` files the job dir carries alongside the record — and
+- **`cancel` on a corrupt job still reaps processes**, from the `supervisor.pid`
+  and `codex.pid` files the job dir carries alongside the record — and
   leaves the corrupt `job.json` byte-for-byte intact, because it is the evidence.
   Such a job therefore keeps reading as `corrupt` after cancellation.
 - **A spent pid file is renamed, not left loaded.** After that reap, each consumed
@@ -201,7 +201,11 @@ the filesystem rather than to the record:
   corrupt job cannot be marked `killed` (its record is evidence and stays
   untouched), so without this a second `cancel` would fire the same numbers again
   — at whatever process now owns them. A second cancel instead reports
-  `already reaped: child.pid.reaped-…`, kills nothing, and changes nothing.
+  `already reaped: codex.pid.reaped-…`, kills nothing, and changes nothing.
+  The numbers are the anti-target, not the file names: every kill target, however
+  it was gathered — the pid files, `supervisorPid`, `codexPid`, `codexPids` — is
+  filtered through the reaped list, so a record that outlived a failed write
+  cannot re-arm a spent number either.
 - **Job ids are whitelisted, not sanitized**: `^[a-z]+-\d+-\d+$`, checked before
   the id is ever joined into a path. Roles are `^[a-z]+$` for the same reason, and
   the collision suffix extends the pid digits (`…-4844` → `…-48441`) rather than
@@ -255,12 +259,15 @@ dispatch (returns immediately)
   ├─ re-reads the claim's owner  ← taken over while we were starting up? abort, remove the dir
   ├─ records launch: spawning   ← from here on a supervisor may exist
   ├─ spawns (detached), THEN records its pid before returning
-  └─ re-reads the record  ← cancelled while we were spawning? kill it, verify, refuse
+  └─ re-reads the record  ← a CANCEL-shaped state? kill it, verify, refuse.
+       │                     any other verdict is the supervisor's: report, touch nothing
        supervisor  ← the kill target; taskkill /T /F here takes codex with it
          ├─ asserts recordVersion == this release's ← else failed / record-version-mismatch
          ├─ proves sight: codex sandbox cmd /c type <a file in the job's cwd>
          │    ├─ not proven, no --allow-unproven-sight? failed / sight-unproven, nothing spent
-         │    └─ probe would not RUN (after retries)?  failed / sight-probe-error — NOT blindness
+         │    └─ probe would not RUN or could not be POSED (transport, after retries;
+         │         a cwd that is gone; a bin path that will not quote)?
+         │         failed / sight-probe-error — NOT blindness
          ├─ re-checks: record still running? claim still ours?  ← else abort, nothing spent
          ├─ records launch: exec-spawning  ← the SECOND window opens; a cancel landing
          │                                   here kills NOTHING and records kill-pending
@@ -306,6 +313,23 @@ exist. The `launch` field records the phase alongside it (`pending` → `spawnin
 from "something was launched and has not registered": the first is safe to take the
 role from (that dispatch re-verifies its claim before spawning anything), the second
 is not.
+
+**And the re-read that follows the spawn only recognises a CANCEL.** The parent's
+last act is to read the record back, because a `cancel` may have landed while it
+was spawning; it used to treat *any* state other than `running` as that cancel,
+kill the supervisor, and write `killed` over what it found. But the supervisor can
+reach a terminal state before the parent gets there — a failed sight precheck lands
+about 250 ms in, and recording the supervisor's start time costs longer than that
+in a PowerShell — so the parent was overwriting a verdict it had never made: a
+`--cd` pointing at a directory that does not exist finished as
+`killed(sandbox-blind-precheck)`, a state/reason pair this document calls
+impossible, under a message about a cancel nobody ran, and a `claim-lost` takeover
+lost its evidence the same way. Only `kill-pending`, `killed` and `kill-failed` —
+the states a cancel writes — are read as a cancel now. Any other state is the
+supervisor's own account of a run the parent no longer owns: nothing is killed,
+nothing is rewritten, the outcome goes to stderr, and the dispatch still succeeds
+with the same handle, because an exit code that depends on which of two processes
+won a millisecond is not a fact about the job.
 
 **States**: `running` → `done` | `failed` | `killed` | `kill-pending` |
 `kill-failed` are the states this runtime writes, plus three readings it *derives*
@@ -365,9 +389,22 @@ A claim taken away underneath it is therefore detected, and the dispatch aborts 
 launching a second codex beside the job that legitimately took over.
 
 The claim is taken *before* the job directory exists, so a loser leaves nothing
-behind, and it is released on a terminal state by the process that owns it — a
-release checks the `owner` file first, so it can never hand away a claim it does
-not hold. A claim whose owner is terminal, corrupt or gone is reclaimable; one
+behind, and it is released by the process that owns it, on a terminal state that
+says everything the job owned is gone — `done`, `failed` or `killed`, and nothing
+else. A release checks the `owner` file first, so it can never hand away a claim it
+does not hold. **`kill-failed` is not a release, and neither is a record that
+cannot be read**: the supervisor's exit handler used to call `releaseRole`
+unconditionally, one line after correctly refusing to *rewrite* a record that had
+stopped saying `running` — so a job whose cancel killed codex and left the
+supervisor alive dropped the claim that is its whole point, and only the
+`findRoleConflict` backstop scan was still keeping the promise. Silence is not
+death here either: a corrupt or unreadable record at that moment keeps the claim
+too. That handler also **catches its own finalization**: `job.json` is written by
+temp-file-and-rename, that write can fail (a rename that exhausts its retries,
+ENOSPC), and an uncaught throw out of an exit handler ends the supervisor with the
+record still saying `running` — a job that reads `stale` for ever, holding its
+role, with a finished `out.txt` next to it that `result` refuses. The failure is
+reported into `run.log` and onto stderr instead. A claim whose owner is terminal, corrupt or gone is reclaimable; one
 whose owner is still live needs `--force`; one under 15 seconds old with no
 readable owner record is a dispatch mid-claim and is refused outright. The older
 scan of every job's record survives as a backstop for jobs that predate claims or
@@ -536,6 +573,13 @@ than opening nothing and claiming otherwise.
     there is no spelling that satisfies both. Windows paths cannot contain one, so
     refusing costs nothing real. (0.7.0 escaped it as `""`, and `a\"` did not
     round-trip.)
+
+  **What gets quoted is every command-token delimiter, not just the obvious
+  metacharacters.** cmd.exe ends a token on `,`, `;` and `=` exactly as it does on
+  whitespace, and those three were missing from the trigger while `& | < > ( ) ^`
+  were not — measured: a `.cmd` under `to,ols\`, `se;mi\` or `eq=al\` exits 1 with
+  "is not recognized" unquoted and runs when quoted. A resolved bin path silently
+  becoming a different one is the same failure class the refusals above exist for.
 
   Separately, a **trailing backslash** run turned `foo bar\` into `"foo bar\"`,
   which `CommandLineToArgvW` reads as an escaped quote: the argument lost its

@@ -194,13 +194,15 @@ every install was pinned to the first of them — the fix landed in the repo and
 nowhere else, silently, which is the same shape of failure as a blind answer:
 confident, and wrong in a way nothing surfaces.
 
-Current release: **0.7.1** — 0.7.0's Windows quoting fix, reviewed by a second
-dispatch and repaired. 0.7.0 checked the `--cd` you typed rather than the cwd it
-resolved, so dispatching from a directory with a `%` in its name skipped the gate
-and stranded the job; the check now runs on the resolved value and a refusal
-finalizes the record instead of leaving it to go stale. `"` and `!` join `%` as
-refused rather than escaped. 0.6.0 and 0.7.0 records remain deliverable. Full
-history, including the
+Current release: **0.7.3** — the fixes from another full-repo review. A dispatch
+that loses the race to its own supervisor no longer overwrites the verdict that
+supervisor reached; a probe that could not be POSED (a `--cd` that is not there,
+a bin path that cannot be quoted) is `sight-probe-error` rather than proven
+blindness, and a missing `--cd` is refused before anything is claimed or spawned;
+`cmdQuote` quotes `,`, `;` and `=`, which cmd.exe breaks a command token on; a
+`kill-failed` job keeps its role claim, as its contract always said; and a pid
+already fired at is never re-armed out of the record. 0.6.0 and later records
+remain deliverable. Full history, including the
 `RECORD_VERSION` 2 cutoff that makes 0.1–0.4 records undeliverable, in
 [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
@@ -230,7 +232,8 @@ node scripts/codex-dispatch.mjs status <job-id>   # one job: state, sight, deliv
   # sight: unproven (accepted by ...) ran only because --allow-unproven-sight was passed
   # (a job whose sight could be neither proven nor disproven, without that flag,
   #  never ran: state failed, reason sight-unproven — or sight-probe-error when the
-  #  probe could not be RUN at all, which is a transport failure, not blindness)
+  #  probe could not be RUN or POSED at all (transport, a cwd that is gone, a bin
+  #  path that will not quote), which is never a finding that codex is blind)
   # deliverable: yes (...)            printed for finished jobs — what earned the delivery
   # deliverable: NO - unvouched: ...  the record cannot vouch for the run; result will refuse
 node scripts/codex-dispatch.mjs result <job-id>   # the answer, verbatim, stdout only; nonzero + out: path unless the record says done AND vouches for it

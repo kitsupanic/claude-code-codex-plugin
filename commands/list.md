@@ -20,7 +20,7 @@ A job that records a reason is printed as `state(reason)`. This is the complete 
 
 - `failed(sandbox-blind-precheck)` — codex's sandbox was **shown** unable to read a file in the job's cwd. Nothing was billed; codex never ran.
 - `failed(sight-unproven)` — sight could be shown neither way (a CLI with no `sandbox` subcommand, or a cwd with nothing readable), and the dispatch did not pass `--allow-unproven-sight`.
-- `failed(sight-probe-error)` — the probe could not be **run**: the spawn failed or produced nothing to judge, after a bounded retry. This is a transport failure, **not** a finding that codex is blind, and the cure is different — re-dispatch, or run the probe by hand.
+- `failed(sight-probe-error)` — the probe could not be **run**, or could not be **posed**: the spawn failed or produced nothing to judge after a bounded retry, the job's cwd was not there, or the bin path could not be quoted. Codex was never asked, so this is **not** a finding that it is blind, and the cure is different — read the `probe:` line, then fix what it names, re-dispatch, or run the probe by hand.
 - `failed(supervisor-spawn-failed)` — the detached supervisor would not spawn. Nothing was billed.
 - `failed(codex-spawn-failed)` — the supervisor could not launch codex.
 - `failed(codex-argv-refused)` — a value bound for codex's command line carried a character cmd.exe expands or re-parses after quote stripping (`%`, `!`, `"`), so the launch was refused rather than mangled. Nothing was billed. Windows only.

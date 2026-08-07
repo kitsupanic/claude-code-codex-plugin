@@ -2550,3 +2550,264 @@ test('a refused argv finalizes the record instead of stranding the job',
 
     fs.rmSync(odd, { recursive: true, force: true });
   });
+
+test('a --cd that does not exist is refused before a role is claimed or a job dir made', () => {
+  // The characters of this path were checked long before anything checked that it
+  // EXISTS, so a typo'd --cd claimed the role, built a job dir, spawned a
+  // supervisor and only then failed the sight probe — a job dir and a blocked role
+  // bought by a one-line mistake. Worse, that failure is the one the post-spawn
+  // check used to overwrite: the reproduction in review was exactly this dispatch
+  // finishing as `killed(sandbox-blind-precheck)`.
+  const missing = path.join(os.tmpdir(), `codex-dispatch-no-such-dir-${process.pid}`);
+  assert.equal(fs.existsSync(missing), false, 'the fixture only works if the path really is absent');
+  const brief = writeBrief('briefnocd.md', 'quick');
+
+  const before = fs.readdirSync(JOBS);
+  const r = run(['dispatch', '--brief', brief, '--role', 'nocd', '--cd', missing]);
+  assert.notEqual(r.status, 0, 'a cwd that is not there must be refused, not dispatched into');
+  // JSON-quoted, as every path this runtime prints is: a bare one ending in a
+  // backslash is unreadable next to the prose around it.
+  assert.ok((r.stderr + r.stdout).includes(JSON.stringify(missing)),
+    `the refusal must name the path it could not find: ${r.stderr}`);
+  assert.match(r.stderr + r.stdout, /does not exist/);
+  assert.equal(r.stdout.includes('job: '), false, 'and hand out no job handle');
+  assert.deepEqual(fs.readdirSync(JOBS).sort(), before.sort(),
+    'nothing was created: no job dir, and no role lock');
+  assert.equal(fs.existsSync(path.join(JOBS, '.role-locks', 'nocd')), false,
+    'and no claim was taken, so the role is free for the corrected re-run');
+
+  // The other half of the same check: a path that exists and is not a directory.
+  // codex is handed it with --cd, so a file is as undispatchable as a hole.
+  const file = writeBrief('notadir.txt', 'this is a file, not a directory\n');
+  const f = run(['dispatch', '--brief', brief, '--role', 'nocd', '--cd', file]);
+  assert.notEqual(f.status, 0, 'a file is not somewhere codex can be run');
+  assert.ok((f.stderr + f.stdout).includes(JSON.stringify(file)), f.stderr);
+  assert.match(f.stderr + f.stdout, /is not a directory/);
+  assert.equal(fs.existsSync(path.join(JOBS, '.role-locks', 'nocd')), false);
+});
+
+test('a verdict the supervisor reached while dispatch was still starting is left alone', async () => {
+  // THE 0.7.2 CORRUPTION, reproduced from the other side. Between recording
+  // `launch: 'spawned'` and re-reading the record, the parent spends real time
+  // (`startTimesFor` is half a second of PowerShell on a warm machine) — and a
+  // supervisor whose sight precheck fails gets to a terminal state inside it. The
+  // check there fired on ANY non-running reading, so the parent killed a pid that
+  // was already gone and wrote `killed` over a verdict it never reached: the job
+  // finished as `killed(sandbox-blind-precheck)`, a pair the docs call impossible,
+  // under a message about a cancel nobody ran.
+  //
+  // The hold is injected because a real one of these windows is milliseconds wide
+  // and cannot be aimed at; the fast verdict is real, and is produced by a codex
+  // with no `sandbox` subcommand, which the precheck refuses in well under a
+  // second. What is under test is which state the parent treats as a cancel.
+  const brief = writeBrief('briefspawnrace.md', 'quick');
+  const r = run(['dispatch', '--brief', brief, '--role', 'spawnrace'], {
+    CODEX_DISPATCH_TEST_SPAWN_PAUSE_MS: '8000',
+    FAKE_CODEX_SANDBOX_UNAVAILABLE: '1',
+  });
+  assert.equal(r.status, 0,
+    `a race the parent lost is not a fact about the job, so the dispatch still succeeds: ${r.stderr}`);
+  const id = jobIdFrom(r.stdout);
+
+  const rec = record(id);
+  assert.equal(rec.state, 'failed', `the supervisor's own verdict stands: ${JSON.stringify(rec)}`);
+  assert.equal(rec.reason, 'sight-unproven', 'and the reason it wrote is still there, unpaired with a kill');
+  assert.equal(rec.killSurvivors, undefined, 'nothing was killed, so nothing survived a kill');
+  assert.equal(rec.exitCode, null, 'codex never ran');
+
+  // The note is the parent saying what it found and what it did NOT do about it.
+  assert.match(r.stderr, /is no longer "running"/);
+  assert.match(r.stderr, /its supervisor reached "failed" \(sight-unproven\)/,
+    'it names the verdict it deferred to, not a cancel');
+  assert.match(r.stderr, /nothing was killed/);
+  assert.equal(/was cancelled while it was starting/.test(r.stderr), false,
+    'and never reports a cancel nobody ran');
+
+  // Terminal and honestly recorded, so the role really is free again.
+  assert.match(run(['list']).stdout, new RegExp(`^${id}  failed\\(sight-unproven\\)`, 'm'));
+  const again = run(['dispatch', '--brief', brief, '--role', 'spawnrace']);
+  assert.equal(again.status, 0, `the role must have been released: ${again.stderr}`);
+  assert.ok(await poll(() => done(jobIdFrom(again.stdout))));
+});
+
+test('a kill-failed job keeps its role claim when its supervisor finally exits', async () => {
+  // The supervisor used to hand the role back unconditionally once codex exited.
+  // `kill-failed` means a cancel could not be verified — this supervisor survived
+  // it — and releasing there lets the next dispatch run beside whatever survived.
+  // Only `findRoleConflict`'s backstop scan was keeping that promise, so the claim
+  // itself is what is asserted here, not merely the refusal it produces.
+  const brief = writeBrief('briefkeepclaim.md', 'slow');
+  // Long enough that the cancel lands while codex is unmistakably alive, short
+  // enough that this test does not sit through a minute: the fake's own exit is
+  // what brings the supervisor to the handler under test.
+  const r = run(['dispatch', '--brief', brief, '--role', 'keepclaim'], { FAKE_CODEX_SLEEP_MS: '15000' });
+  assert.equal(r.status, 0, r.stderr);
+  const id = jobIdFrom(r.stdout);
+  assert.ok(await poll(() => record(id).codexPid), 'the fake must be up before it is cancelled');
+  const { supervisorPid } = record(id);
+
+  // A kill that reports success and changes nothing — the same injection the
+  // kill-failed tests use. Codex is untouched and runs to its own end, which is
+  // what brings the supervisor to the exit handler this test is about.
+  const c = run(['cancel', id], { CODEX_DISPATCH_TEST_NOKILL: '1' });
+  assert.notEqual(c.status, 0, `a kill that did not take must exit nonzero: ${c.stdout}${c.stderr}`);
+  assert.equal(record(id).state, 'kill-failed');
+
+  assert.ok(await poll(() => !pidAlive(supervisorPid), 40000),
+    'the supervisor must reach its exit handler, which is where the release decision is made');
+
+  const rec = record(id);
+  assert.equal(rec.state, 'kill-failed', 'the exit must not rewrite a verdict it did not reach');
+  const owner = path.join(JOBS, '.role-locks', 'keepclaim', 'owner');
+  assert.equal(fs.existsSync(owner), true, 'the role lock must still be there');
+  assert.equal(fs.readFileSync(owner, 'utf8').trim(), id, 'and must still name this job');
+  assert.match(fs.readFileSync(path.join(JOBS, id, 'supervisor.log'), 'utf8'),
+    /not releasing the "keepclaim" role/,
+    'and the supervisor says so where a human will look');
+
+  const refused = run(['dispatch', '--brief', brief, '--role', 'keepclaim']);
+  assert.notEqual(refused.status, 0, 'so a same-role dispatch is still refused');
+  assert.match(refused.stderr, /already kill-failed/);
+});
+
+test('a pid already reaped is never fired at again, even when the record still names it', async () => {
+  // The anti-target list applied to the pid FILES and the record fields walked
+  // straight past it — so a cancel whose kill worked and whose record write did
+  // not (the case the operator is explicitly told to retry) re-armed the very
+  // numbers the last one wrote down as spent. Pid numbers are reused; a replayed
+  // kill lands on whatever inherited them.
+  //
+  // CODEX_DISPATCH_TEST_NOKILL is what makes this decidable without racing a real
+  // kill: anything actually TARGETED survives the no-op kill and is reported as a
+  // survivor by name. A filtered pid produces a clean `killed`; an unfiltered one
+  // cannot.
+  const victims = [];
+  const spawnVictim = () => {
+    const v = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)'], {
+      stdio: 'ignore', detached: true,
+    });
+    v.unref();
+    victims.push(v.pid);
+    return v.pid;
+  };
+  const mk = (id, patch, extra = () => {}) => {
+    const dir = path.join(JOBS, id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+      recordVersion: RECORD_VERSION, id, role: id.split('-')[0], state: 'running',
+      // An hour ago, with no supervisor pid: past the registration window, so the
+      // cancel decides on the targets rather than answering `kill-pending`.
+      started: new Date(Date.now() - 3600000).toISOString(),
+      supervisorPid: null, codexPid: null, launch: 'exec', ...patch,
+    }));
+    extra(dir);
+    return id;
+  };
+
+  try {
+    // Both homes of the spent list: one pid written down in the record, one in the
+    // reaped.pids file that exists for records which must not be rewritten. Both
+    // are ALSO named by the record's own kill-target fields, which is the defect.
+    const inRecord = spawnVictim();
+    const inFile = spawnVictim();
+    const reaped = mk('reapfilter-1-99931',
+      { codexPid: inRecord, codexPids: [inRecord, inFile], reapedPids: [inRecord] },
+      (dir) => fs.writeFileSync(path.join(dir, 'reaped.pids'), `${inFile}\n`));
+
+    const c = run(['cancel', reaped], { CODEX_DISPATCH_TEST_NOKILL: '1' });
+    assert.equal(c.status, 0, `a cancel with nothing left to fire at must succeed: ${c.stderr}`);
+    assert.equal(record(reaped).state, 'killed');
+    for (const pid of [inRecord, inFile]) {
+      assert.equal((c.stdout + c.stderr).includes(String(pid)), false,
+        `pid ${pid} is spent, so it may not be named as a target or a survivor`);
+      assert.ok(pidAlive(pid), `pid ${pid} was fired at again — the record route bypassed the spent list`);
+    }
+
+    // The control, and the reason the assertions above can fail: the identical
+    // record with nothing recorded as spent DOES target its pid, and the no-op
+    // kill leaves it standing as a named survivor.
+    const live = spawnVictim();
+    const armed = mk('reaparmed-1-99930', { codexPid: live, codexPids: [live] });
+    const a = run(['cancel', armed], { CODEX_DISPATCH_TEST_NOKILL: '1' });
+    assert.notEqual(a.status, 0, 'an unreaped pid is a real target, so the no-op kill fails');
+    assert.match(a.stderr, /KILL FAILED/);
+    assert.ok(a.stderr.includes(String(live)), 'and it is named — which is what the spent list prevents');
+    assert.equal(record(armed).state, 'kill-failed');
+  } finally {
+    for (const pid of victims) { try { process.kill(pid); } catch { /* already gone */ } }
+  }
+});
+
+test('a bin path under a directory with a cmd.exe token separator still launches',
+  { skip: process.platform === 'win32' ? false : 'Windows-only: only Windows builds a command line' },
+  async () => {
+    // MEASURED IN REVIEW: cmd.exe ends a command token on `,`, `;` and `=` exactly
+    // as it does on whitespace, and cmdQuote quoted `& | < > ( ) ^` while leaving
+    // those three alone. A `.cmd` under `to,ols\` was therefore handed over
+    // unquoted and read as two tokens — "is not recognized", or worse, a resolved
+    // bin path silently becoming a different one.
+    //
+    // The .cmd shim is the only spawn path that builds a command line at all: a
+    // `.mjs` goes through node with an argv ARRAY and never touches cmdQuote.
+    const parent = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-sep-'));
+    const dir = path.join(parent, 'to,ols;x=y');
+    fs.mkdirSync(dir);
+    for (const name of ['fake-codex.cmd', 'fake-codex.mjs']) {
+      fs.copyFileSync(path.join(HERE, name), path.join(dir, name));
+    }
+    try {
+      const brief = writeBrief('briefsepdir.md', 'quick');
+      const r = run(['dispatch', '--brief', brief, '--role', 'sepdir'],
+        { CODEX_DISPATCH_BIN: path.join(dir, 'fake-codex.cmd') });
+      assert.equal(r.status, 0, r.stderr);
+      const id = jobIdFrom(r.stdout);
+      // Reaching `done` is the whole assertion: the sight probe and the exec both
+      // go through cmd.exe with this path on the command line, and an unquoted one
+      // never runs at all.
+      assert.ok(await poll(() => record(id).state !== 'running', 30000),
+        'the job must finish rather than hang');
+      assert.equal(record(id).state, 'done',
+        `a separator in the bin path must not change which binary runs: ${JSON.stringify(record(id))}`);
+      assert.equal(run(['result', id]).status, 0, 'and the answer is deliverable');
+    } finally {
+      fs.rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+test('every state/reason pair this suite put on disk is one the docs allow', () => {
+  // The record-level half of the pair contract (the source-level half is in
+  // tests/resolution.test.mjs). It reads the pairs this runtime ACTUALLY wrote
+  // while the tests above ran it through failed precheck, cancels inside both
+  // registration windows, kills that did not take, corrupt records and races — so
+  // a pair produced by one write setting `state` over another's `reason`, which no
+  // source scan can see, fails here. `killed(sandbox-blind-precheck)` was exactly
+  // that shape, and it is what this sweep exists to catch coming back.
+  //
+  // Deliberately last in the file: node:test runs a file's top-level tests in
+  // order, so by here every job the suite created is on disk.
+  const doc = fs.readFileSync(path.join(REPO, 'commands', 'list.md'), 'utf8');
+  const documented = new Set(
+    [...doc.matchAll(/`([a-z][a-z-]*)\(([a-z][a-z0-9-]*)\)`/g)].map((m) => `${m[1]}(${m[2]})`)
+  );
+  assert.ok(documented.size >= 10, 'the documented pairs must be readable, or this sweep proves nothing');
+
+  const seen = new Set();
+  for (const name of fs.readdirSync(JOBS)) {
+    const file = path.join(JOBS, name, 'job.json');
+    let rec;
+    try { rec = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { continue; }
+    if (!rec || typeof rec !== 'object' || typeof rec.reason !== 'string') continue;
+    // Only the pairs this runtime writes: a corrupt-record fixture's reason is a
+    // string somebody put there by hand, and `state(reason)` only means anything
+    // for a state this release actually writes.
+    if (typeof rec.state !== 'string') continue;
+    seen.add(`${rec.state}(${rec.reason})`);
+  }
+  // A sweep that saw nothing must fail rather than pass vacuously: several tests
+  // above finish jobs with a reason on the record.
+  assert.ok(seen.size >= 2, `expected the suite to have produced several state/reason pairs, saw ${seen.size}`);
+  for (const pair of seen) {
+    assert.ok(documented.has(pair),
+      `this suite produced ${pair} on disk, which commands/list.md documents as impossible`);
+  }
+});

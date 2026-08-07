@@ -13,6 +13,7 @@ import path from 'node:path';
 import {
   ACCEPTED_SIGHT,
   BLIND_SIGNATURES,
+  CANCEL_STATES,
   CMD_UNSAFE,
   JOB_ID_RE,
   JOB_REASONS,
@@ -24,6 +25,7 @@ import {
   PROVEN_SIGHT_PREFIX,
   RECORD_VERSION,
   ROLE_RE,
+  ROLE_RELEASE_STATES,
   binCandidates,
   canonicalState,
   cmdQuote,
@@ -219,6 +221,27 @@ test('cmdQuote: a trailing backslash cannot eat the closing quote', () => {
   assert.equal(cmdQuote(`C:${bs}Program Files${bs}x`), `"C:${bs}Program Files${bs}x"`);
 });
 
+test('cmdQuote: , ; and = end a cmd.exe token exactly as a space does', () => {
+  // The gap (Codex review, 2026-08-07): `& | < > ( ) ^` were quoted and the three
+  // characters cmd.exe treats as ordinary ARGUMENT SEPARATORS were not. A resolved
+  // bin path under a directory called `to,ols` was therefore handed over unquoted
+  // and cmd.exe read it as two tokens — the launch failing with "is not recognized"
+  // is the good case; a resolved path silently becoming a different one is the
+  // failure this function exists to refuse.
+  const bs = String.fromCharCode(92);
+  for (const sep of [',', ';', '=']) {
+    assert.equal(cmdQuote(`D:${bs}to${sep}ols${bs}codex.cmd`), `"D:${bs}to${sep}ols${bs}codex.cmd"`,
+      `${sep} splits a command token, so a path containing one must be quoted`);
+    assert.equal(cmdQuote(sep), `"${sep}"`, 'even alone, with nothing else to need quoting');
+  }
+  // All three at once, and the trailing-backslash rule still applies over the top:
+  // the run against the closing quote is doubled so the delimiter survives
+  // CommandLineToArgvW.
+  assert.equal(cmdQuote(`C:${bs}a,b;c=d${bs}`), `"C:${bs}a,b;c=d${bs}${bs}"`);
+  // And the cheap path stays cheap: a path with none of them is still untouched.
+  assert.equal(cmdQuote(`D:${bs}github${bs}repo${bs}codex.cmd`), `D:${bs}github${bs}repo${bs}codex.cmd`);
+});
+
 test('cmdQuote: % ! and " are refused, because no escaping on a command line reaches them', () => {
   // `%` and `!` are expanded by cmd.exe AFTER quote stripping, so `"%PATH%"`
   // expands exactly like `%PATH%` — quoting is not a defence and no in-band escape
@@ -364,6 +387,51 @@ test('the states that may still own processes are the ones that block a role', (
     'a cancel that killed nothing leaves a job that may still own processes');
   assert.ok(LIVE_STATES.includes('unknown'),
     'a state this release cannot reason about is a job it cannot call finished');
+});
+
+test('only a state a CANCEL writes counts as "this job was cancelled while it was starting"', () => {
+  // The window: a dispatch has just registered its supervisor's pid and re-reads
+  // the record. It used to treat ANY non-running reading there as a cancel — and
+  // the supervisor reaches a terminal state faster than the parent gets back to
+  // that line, so a `failed` verdict the supervisor had already reached was killed
+  // and overwritten with `killed`. Reproduced in review as
+  // `killed(sandbox-blind-precheck)`: a state/reason pair the docs call impossible,
+  // under a message about a cancel nobody ran. Membership is the whole fix, so
+  // membership is what is pinned.
+  assert.deepEqual(CANCEL_STATES, ['kill-pending', 'killed', 'kill-failed']);
+  for (const written of ['failed', 'done', 'running']) {
+    assert.equal(CANCEL_STATES.includes(written), false,
+      `${written} is a verdict the SUPERVISOR reaches, and no cancel ever writes it`);
+  }
+  for (const derived of ['unknown', 'corrupt', 'stale']) {
+    assert.equal(CANCEL_STATES.includes(derived), false,
+      `${derived} is a reading, not a state a cancel wrote`);
+  }
+  for (const state of CANCEL_STATES) {
+    assert.ok(KNOWN_STATES.includes(state), `${state} must be a state this release actually writes`);
+  }
+});
+
+test('a role is released only from a terminal state, and a survived kill is not one', () => {
+  // The supervisor used to hand the role back unconditionally once codex exited —
+  // including for `kill-failed`, whose entire contract is that a cancel killed
+  // codex, this supervisor SURVIVED it, and the job goes on blocking dispatch
+  // (DESIGN.md, "Kills are verified"). Releasing there is a claim that everything
+  // the job owned is gone, made about a process demonstrably still alive.
+  assert.deepEqual(ROLE_RELEASE_STATES, ['done', 'failed', 'killed']);
+  for (const live of LIVE_STATES) {
+    assert.equal(ROLE_RELEASE_STATES.includes(live), false,
+      `${live} may still own processes, so it must not release the role`);
+  }
+  assert.equal(ROLE_RELEASE_STATES.includes('kill-failed'), false,
+    'a cancel that did not take keeps its claim');
+  assert.equal(ROLE_RELEASE_STATES.includes('kill-pending'), false,
+    'a cancel nothing has landed yet has killed nothing');
+  assert.equal(ROLE_RELEASE_STATES.includes('corrupt'), false,
+    'an unreadable record is silence, and silence is not death');
+  for (const state of ROLE_RELEASE_STATES) {
+    assert.ok(KNOWN_STATES.includes(state), `${state} must be a state this release actually writes`);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -668,6 +736,91 @@ test('every reason the runtime writes is declared, and documented in commands/li
   for (const reason of JOB_REASONS) {
     assert.ok(doc.includes(reason), `commands/list.md does not document the reason "${reason}"`);
   }
+});
+
+test('every state/reason PAIR the runtime writes is one commands/list.md documents', () => {
+  // The reason scan above checks the reasons one at a time; this is the other
+  // dimension, and it is the one the 0.7.2 corruption lived in. `killed` and
+  // `sandbox-blind-precheck` are each perfectly legal on their own —
+  // `killed(sandbox-blind-precheck)` is a job that was both cancelled and never
+  // launched, which cannot happen, and it is exactly what the post-spawn check
+  // produced by writing `killed` over a verdict the supervisor had already reached.
+  //
+  // WHAT THIS SCAN CANNOT SEE, stated rather than left to be discovered: it pairs
+  // the literals written TOGETHER in one object, so a write that sets `state`
+  // while leaving an earlier `reason` in place — which is precisely how the 0.7.2
+  // pair was produced — is invisible here. The record-level sweep at the end of
+  // tests/dispatch.test.mjs is the half that catches those, by reading the pairs
+  // this runtime actually put on disk. Both are needed; neither replaces the other.
+  const source = fs.readFileSync(new URL('../scripts/codex-dispatch.mjs', import.meta.url), 'utf8');
+  const states = [...source.matchAll(/\bstate:\s*(['"`])([a-z][a-z-]*)\1/g)].map((m) => [m.index, m[2]]);
+  assert.ok(states.length >= 8, `expected the runtime to write several states, found ${states.length}`);
+
+  const pairs = new Set();
+  const statesByReason = new Map();
+  for (const m of source.matchAll(/\breason:\s*(['"`])([a-z][a-z0-9-]*)\1/g)) {
+    let owner = null;
+    for (const entry of states) {
+      if (entry[0] > m.index) break;
+      owner = entry;
+    }
+    // The pairing is by proximity, so it has to be able to REFUSE rather than
+    // guess: a reason written far from any state, or across an object boundary,
+    // fails here instead of being silently attributed to the wrong state.
+    assert.ok(owner, `the runtime writes reason "${m[2]}" with no state written before it`);
+    const between = source.slice(owner[0], m.index);
+    assert.ok(m.index - owner[0] < 200 && !between.includes('}'),
+      `reason "${m[2]}" is not written alongside a state this scan can attribute it to; ` +
+      'the pair dimension is unchecked until that is fixed');
+    pairs.add(`${owner[1]}(${m[2]})`);
+    if (!statesByReason.has(m[2])) statesByReason.set(m[2], new Set());
+    statesByReason.get(m[2]).add(owner[1]);
+  }
+  // A scan that matched nothing must fail loudly rather than vacuously pass, and
+  // every declared reason has to turn up in a pair or the contract has a hole.
+  for (const reason of JOB_REASONS) {
+    assert.ok(statesByReason.has(reason),
+      `JOB_REASONS declares "${reason}" but no state/reason pair for it was found in the source`);
+  }
+
+  // The documented pairs, read out of the operator-facing contract rather than
+  // remembered here. `commands/list.md` spells each one as `state(reason)`.
+  const doc = fs.readFileSync(new URL('../commands/list.md', import.meta.url), 'utf8');
+  const documented = new Set(
+    [...doc.matchAll(/`([a-z][a-z-]*)\(([a-z][a-z0-9-]*)\)`/g)].map((m) => `${m[1]}(${m[2]})`)
+  );
+  assert.ok(documented.size >= JOB_REASONS.length,
+    `commands/list.md must document a pair per reason, found ${documented.size}`);
+  for (const pair of pairs) {
+    assert.ok(documented.has(pair),
+      `the runtime can write ${pair}, which commands/list.md does not document as possible`);
+  }
+
+  // And the two invariants the documentation states, applied to every pair either
+  // side knows about — so neither the runtime nor the doc can start allowing one.
+  const CANCEL_REASONS = ['cancelled-during-registration', 'cancelled-during-exec'];
+  const NEVER_CANCELLED = [
+    'sandbox-blind-precheck', 'sight-unproven', 'sight-probe-error', 'claim-lost',
+    'record-version-mismatch', 'codex-argv-refused',
+  ];
+  for (const pair of new Set([...pairs, ...documented])) {
+    const [, state, reason] = pair.match(/^([a-z-]+)\(([a-z0-9-]+)\)$/);
+    if (state === 'killed') {
+      assert.ok(CANCEL_REASONS.includes(reason),
+        `${pair}: "killed" is what a CANCEL leaves, and ${reason} is not a cancel`);
+    }
+    if (NEVER_CANCELLED.includes(reason)) {
+      assert.equal(state, 'failed',
+        `${pair}: ${reason} is a refusal reached before or instead of a run — the only state that ` +
+        'can carry it is "failed"');
+    }
+  }
+  // `kill-failed(cancelled-during-exec)` is the one non-`killed` cancel pair, and
+  // it is documented: a cancel that reached codex and could not be verified.
+  assert.ok(documented.has('kill-failed(cancelled-during-exec)'));
+  assert.equal(documented.has('killed(sight-unproven)'), false);
+  assert.equal(documented.has('killed(sandbox-blind-precheck)'), false,
+    'the pair the post-spawn check used to produce is documented as impossible');
 });
 
 test('deliverability needs the stamp, a clean exit, and proof or a recorded opt-in', () => {

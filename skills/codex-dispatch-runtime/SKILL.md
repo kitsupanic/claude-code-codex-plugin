@@ -43,11 +43,13 @@ Runtime: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" <verb>`
      anything is spent, also refused. This is NOT a defect to route around; it
      names its cure (usually `npm install -g @openai/codex`, or a `--cd` pointed at
      the directory the model actually has to read). Fix it and re-dispatch.
-   - **Never asked** — the probe process would not launch, or produced nothing to
-     judge, after a bounded retry: `failed / sight-probe-error`. This is a transport
-     failure, **not** a finding that codex is blind, and it must not be relayed as
-     one. Re-dispatch first; a transport failure that does not repeat costs one
-     retry.
+   - **Never asked** — the probe could not be run or even posed: the process would
+     not launch or produced nothing to judge after a bounded retry, the job's cwd
+     was not there, or the bin path could not be quoted. `failed /
+     sight-probe-error`. Codex was never asked anything, so this is **not** a
+     finding that it is blind and must not be relayed as one. Read the `probe:`
+     line — it names the fault. Re-dispatch first; a transport failure that does
+     not repeat costs one retry.
    - **Unprovable, accepted** — `--allow-unproven-sight` on the dispatch. Only then
      does an unprovable job run; the record carries
      `sight: unproven (accepted by caller)`, and `result` delivers the bytes with

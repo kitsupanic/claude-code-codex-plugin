@@ -57,8 +57,10 @@ Refusals are the product, not obstacles:
   ran, nothing was billed. Relay the cure the refusal names (usually
   `npm install -g @openai/codex`, or a `--cd` pointed at a directory with
   readable files). Do not re-dispatch with `--allow-unproven-sight`.
-- `failed / sight-probe-error` — a transport failure, not blindness. One
-  re-dispatch is fine; if it repeats, report it.
+- `failed / sight-probe-error` — the probe never asked codex anything (a transport
+  failure, a cwd that was not there, a bin path that would not quote), not
+  blindness. One re-dispatch is fine; if it repeats, report what the `probe:` line
+  names.
 - A same-role job still alive, `kill-failed`, `unvouched`, `corrupt` — relay
   the refusal as-is. Do not read `out.txt` and present its contents; a refused,
   sourceless answer delivered anyway is the failure this runtime exists to

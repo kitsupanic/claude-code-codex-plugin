@@ -3,6 +3,80 @@
 Versioning rule: **a push that changes behavior MUST bump the version** — see
 [README → Releases and versioning](../README.md#releases-and-versioning) for why.
 
+## 0.7.3
+
+A fresh single-arm review of 0.7.2, its two lead findings reproduced before
+they were reported. The core held — containment, claims, the record lock, the
+kill machinery and the delivery gate all came back sound. What gave was the
+seam where the parent and the supervisor both hold a pen over one verdict, and
+the seam where a probe that never ran was still spelled as one that found
+something.
+
+**Only a cancel-shaped state is a cancel.** Dispatch's post-spawn check fired
+on any non-`running` record — and the supervisor reaches a terminal verdict
+faster than the parent gets there, because the parent spends half a second in
+PowerShell on pid start times. Lose that race and dispatch killed a pid that
+was already gone and wrote `killed` over the supervisor's real verdict:
+reproduced as `killed(sandbox-blind-precheck)`, a state/reason pair the docs
+call impossible, under a message about a cancel nobody ran — and a
+`claim-lost` lost its takeover evidence the same way. The check now fires only
+on `kill-pending` / `killed` / `kill-failed` (`CANCEL_STATES`); any other
+verdict is the supervisor's own, reported on stderr and left exactly as
+written, and the dispatch still exits 0 — an exit code that depends on who won
+a millisecond race is not a fact about the job.
+
+**A probe that could not be POSED is not a probe that found blindness.**
+0.5.0 drew that line inside `sandboxRead` and left both outer entry points on
+the old classification: a job cwd that does not exist, and any throw inside
+the probe wrapper (an unquotable `CODEX_DISPATCH_BIN` lands there), were
+recorded as `sandbox-blind-precheck` — a typo'd `--cd` told the user to
+reinstall codex. Both now record `sight-probe-error` naming the actual fault,
+and dispatch refuses a missing or non-directory `--cd` up front, before
+preflight, the claim or any spawn.
+
+**`,` `;` and `=` end a cmd.exe token exactly as a space does.** `cmdQuote`'s
+trigger set did not include them, so a codex binary under `D:\tools\codex,v2\`
+failed every invocation — measured, status 1, "not recognized" — and via the
+old probe classification that spelled itself as proven blindness. The three
+delimiters now trigger quoting; argument position was never affected.
+
+**Releasing the role is a claim about what is alive.** The supervisor's exit
+handler refused to rewrite a record that had stopped saying `running` — and
+then released the role anyway, including for `kill-failed`, whose whole
+contract is that the job keeps blocking dispatch. Only `findRoleConflict`'s
+backstop was keeping that promise. Release now happens only from `done` /
+`failed` / `killed` (`ROLE_RELEASE_STATES`); a survived kill, a pending one
+and an unreadable record all keep the claim — silence is not death. And the
+finalization write in that handler is caught rather than trusted: a record
+that could not be written is reported into `run.log` and stderr instead of
+taking the whole handler down with it.
+
+**A reaped pid is never a target again — wherever the number comes from.**
+`killJob` filtered the pid-file targets through the reaped list and pushed the
+record's own `supervisorPid` / `codexPid` / `codexPids` straight in, so the
+documented "re-run this cancel, it will not fire at anything again" was false
+whenever the reap succeeded and the record write did not. The whole gathered
+set is filtered now.
+
+**Docs caught up where they had drifted.** The README's release-discipline
+paragraph — the one whose subject is keeping the version honest — still said
+0.7.1; DESIGN.md still described the `child.pid` kill surface 0.7.2 removed;
+TESTS.md counted nine test knobs when there were twelve; and `cancel.md`
+listed four live states on the one page where a user decides whether a
+`kill-pending` job is cancellable. It is, and now the page says so.
+
+**Tests: 111 → 121, and the seams are covered.** A new
+`CODEX_DISPATCH_TEST_SPAWN_PAUSE_MS` knob holds the parent in exactly the
+window the race lived in, and a test proves the supervisor's verdict survives
+it. State/reason *pairs* are enforced two ways — a source-level scan of what
+the runtime writes, and a sweep of every record the suite put on disk, because
+the reproduced corruption was made by two writes and no single literal. A
+nonexistent `--cd` is refused without a job directory or a claim; the three
+cmd.exe delimiters round-trip end to end through a real `.cmd` under
+`to,ols;x=y`; a `kill-failed` job is shown keeping its claim after its
+supervisor exits; and a pid on the reaped list is never fired at again even
+when the record still names it.
+
 ## 0.7.2
 
 A full-repo review — runtime, tests and docs each read by its own reviewer —

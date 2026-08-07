@@ -133,7 +133,41 @@ conditions could exist at all:
 - plus the **deliverability matrix**, extended with the previous release's stamp,
   the four malformed-sight shapes, two unknown states and two bad pids.
 
-**Nine test-only knobs live in the runtime**, each standing in for a condition
+The 0.7.3 additions pin the five fixes of the full-repo review, and two of them
+close gaps the review named rather than defects it found:
+
+- **a verdict the supervisor reached is not a cancel** — the window between
+  recording `launch: 'spawned'` and re-reading the record, held open with
+  `CODEX_DISPATCH_TEST_SPAWN_PAUSE_MS` while a codex with no `sandbox` subcommand
+  makes the precheck fail inside it. The job keeps `failed(sight-unproven)`, the
+  dispatch still exits 0 with the same handle, nothing is killed, and the note on
+  stderr says whose verdict it deferred to. Only a *cancel-shaped* state is a
+  cancel, which is asserted directly on `CANCEL_STATES` as well;
+- **the state/reason PAIR is a contract, in both directions** — a source scan
+  pairs each written reason with the state written beside it and checks the pair
+  against `commands/list.md`, and a sweep at the end of the lifecycle file reads
+  the pairs the suite actually put on disk. The source half cannot see a pair made
+  by one write setting `state` over another's `reason` — which is exactly how
+  `killed(sandbox-blind-precheck)` was produced — so the record half exists for
+  those, and neither replaces the other;
+- **a `--cd` that is not there is refused before anything is spent** — a missing
+  path and a file, each named in the refusal, with no job directory and no role
+  claim left behind;
+- **`,` `;` and `=` end a cmd.exe token** — asserted on `cmdQuote` directly, and
+  end to end by dispatching against a `.cmd` copied into a directory called
+  `to,ols;x=y`: the shell branch is the only one that builds a command line, and
+  an unquoted path there never runs at all;
+- **a `kill-failed` job keeps its role claim when its supervisor exits** — the
+  claim itself is asserted, not the refusal it produces, because
+  `findRoleConflict`'s backstop scan produces that refusal either way;
+- **a reaped pid is never fired at again through the record** — the anti-target
+  list applied to the pid files while `supervisorPid`/`codexPid`/`codexPids` walked
+  past it. Both homes of the spent list are covered (the record's `reapedPids` and
+  `reaped.pids`), with `CODEX_DISPATCH_TEST_NOKILL` making the question decidable:
+  a pid that IS targeted survives the no-op kill and is reported by name, so the
+  control job fails exactly where the filtered one passes.
+
+**Thirteen test-only knobs live in the runtime**, each standing in for a condition
 that cannot be produced on demand in CI, on both platforms, from both shells. What
 is under test in every case is the runtime's *decision*, never the mechanism that
 would have caused the condition:
@@ -166,6 +200,22 @@ would have caused the condition:
   teardown does. This is the one that separates "the sandbox said no" from "the
   probe never ran", and both halves — the retry absorbing a flake, and a persistent
   failure being refused as `sight-probe-error` rather than as blindness — need it.
+- `CODEX_DISPATCH_TEST_SPAWN_PAUSE_MS=<ms>` — the dispatch is held between
+  registering its supervisor's pid and re-reading the record, which is the window
+  a fast supervisor finishes inside. Real ones are milliseconds wide and cannot be
+  aimed at; the decision under test is that a verdict the supervisor reached is
+  neither killed nor overwritten by the parent.
+- `CODEX_DISPATCH_TEST_KILL_PAUSE_MS=<ms>` — a cancel is descheduled between
+  gathering its targets and deciding on them, standing in for the seconds the pid
+  identity check really spends in a shell: the decision has to be made on the
+  record as it is now, not as the caller read it.
+- `CODEX_DISPATCH_TEST_START_TIME=<pid>:<start>[,<pid>:<start>]` — the OS start time
+  answered for those pids, so pid reuse (a number reissued to something else) can
+  be posed without waiting for an OS to reissue one.
+- `CODEX_DISPATCH_TEST_PREFLIGHT_FULL=1` — `CODEX_DISPATCH_BIN` stops
+  short-circuiting `preflight`, so the version, auth and sandbox checks it exists
+  to make actually run — against a stand-in that answers the way codex-cli does.
+  Only the short-circuit is injected; every check below it is the real one.
 
 They are all injections of a *condition*, never of an *answer*: every one of them
 makes the world behave a certain way and then asserts what the runtime decides

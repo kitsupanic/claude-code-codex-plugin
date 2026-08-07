@@ -353,7 +353,15 @@ Things the brief left open, decided here:
   because a genuine spawn failure repeats and a flake does not. It sits in the
   UNPROVEN class rather than the BROKEN one, which is what makes
   `--allow-unproven-sight` the right escape hatch for it: nothing was disproven,
-  nothing was asked.
+  nothing was asked. **The distinction applies at every entrance to the probe, not
+  just inside it.** It was made where the spawn happens and skipped at the two
+  outer edges, which both still answered `broken`: a job cwd that does not exist,
+  and any exception thrown by the probe wrapper (`cmdQuote` refusing an unquotable
+  `CODEX_DISPATCH_BIN`, a directory that will not list). Both are probes that could
+  not be POSED — codex was never asked anything — and both printed "reinstall
+  codex" at an operator whose real fault was a typo. A missing `--cd` is now also
+  refused by `dispatch` itself, before a role is claimed or a supervisor spawned:
+  the cheapest place to say it is where it was typed.
 - **`stdin` is NUL on every synchronous spawn.** `spawnSync`'s default hands the
   child a pipe and closes the write end immediately, and a grandchild that inherits
   the handle — `cmd /c type` does — can fail its launch with ERROR_NO_DATA. Nothing
