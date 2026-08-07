@@ -257,7 +257,7 @@ node scripts/codex-dispatch.mjs preflight         # install / auth / functional-
 - Jobs root: `%LOCALAPPDATA%\codex-dispatch\jobs\`, overridable via
   `CODEX_DISPATCH_JOBS`. Job records survive reboots; `list`/`status` mark jobs
   whose recorded pids no longer exist as `stale`.
-- `CODEX_DISPATCH_BIN` overrides the codex binary (a `.mjs`/`.js` path is run
+- `CODEX_DISPATCH_BIN` overrides the codex binary (a `.mjs`/`.cjs`/`.js` path is run
   via node — this is how the tests substitute a fake codex).
 - `watch` is a human affordance and Windows-only in this release; agents poll
   `result`. Details in [docs/DESIGN.md → Watching a job](docs/DESIGN.md#watching-a-job).

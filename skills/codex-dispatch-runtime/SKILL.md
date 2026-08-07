@@ -76,8 +76,11 @@ Runtime: `node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" <verb>`
 
 - `dispatch --brief <file> [--role <stem>] [--cd <dir>] [--model <m>] [--effort <e>] [--write] [--force] [--watch] [--allow-unproven-sight]`
   — returns immediately with `job: <id>`, `bin: <codex binary>` and `out: <path>`.
-  Refuses if a job with the same role may still have live processes (running,
-  stale, or kill-failed); `--force` kills that job's tree first **and verifies it
+  Refuses if a job with the same role may still have live processes — `running`,
+  `kill-pending`, `stale`, `kill-failed` or `unknown`, the five states in which
+  processes may still be alive — and a **corrupt** record blocks its role too,
+  until its recorded pids are proven dead; `--force` kills that job's tree first
+  **and verifies it
   died** — if anything survived, the new job is refused rather than launched
   beside it. `--role` must be lowercase letters only (`^[a-z]+$`), and the role is
   claimed atomically, so of two dispatches racing for one role exactly one wins.

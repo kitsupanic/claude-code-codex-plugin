@@ -6,7 +6,7 @@ allowed-tools: Bash(node:*)
 
 !`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" list`
 
-Present the command output to the user unchanged — one line per job, `<id>  <state>  out: <path>`, newest first.
+Present the command output to the user unchanged — one line per job, `<id>  <state>  out: <path>`, newest first, with a trailing `  warning: <text>` when the record carries one.
 
 ## States
 

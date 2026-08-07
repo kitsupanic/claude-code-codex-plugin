@@ -7,7 +7,7 @@ allowed-tools: Bash(node:*)
 
 !`node "${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch.mjs" cancel $ARGUMENTS`
 
-Present the command output to the user unchanged, including the `out:` line. A running, stale or kill-failed job is tree-killed, **the kill is then verified**, and only then is it marked `killed`. If anything survived, the command exits nonzero, lists the surviving pids, and the job becomes `kill-failed` rather than `killed` — the role stays blocked, deliberately, because a surviving codex is a billing codex. Report that loudly; the fix is `taskkill /PID <pid> /T /F` by hand.
+Present the command output to the user unchanged, including the `out:` line. A job in any of the live states — `running`, `stale`, `kill-failed` or `unknown` — is tree-killed, **the kill is then verified**, and only then is it marked `killed`. If anything survived, the command exits nonzero, lists the surviving pids, and the job becomes `kill-failed` rather than `killed` — the role stays blocked, deliberately, because a surviving codex is a billing codex. Report that loudly; the fix is `taskkill /PID <pid> /T /F` by hand.
 
 A cancel that arrives before the job has registered anything to kill exits nonzero as `KILL PENDING` and the job becomes `kill-pending`, not `killed`: killing nothing is not killing it, and its supervisor may be starting Codex at that very moment. The cure is to re-run the same cancel in a moment — relay that rather than treating it as a failure.
 
