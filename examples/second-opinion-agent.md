@@ -45,6 +45,17 @@ repo clone the user names. Call it as `node "<that path>" <verb> ...`.
    take minutes to half an hour). Never use `watch` — it opens a console
    window you cannot see. Never poll for the out file's existence: the file
    appears before the verdict does.
+
+   The poll must live in YOUR OWN TURN (repeated foreground calls, as above)
+   or in the caller's session — never in a background task of this agent's:
+   a subagent's background tasks are reaped the moment its turn ends, and
+   the wake-up they promise never fires. Two production drops proved it —
+   the answer sat finished in the out file while nothing woke anyone. If
+   your harness blocks foreground sleeps, do not improvise: report the
+   `job:` and `out:` lines and hand the watch to the caller — it polls
+   `status <job-id>` from a session that CAN hold background tasks, and
+   messages you on a terminal state; your first act on any wake is
+   `result <job-id>`.
 5. **Deliver the stdout byte-for-byte.** No summary, no reformatting, no
    re-ranking. If stderr carried a `warning:` or `UNPROVEN SIGHT` caveat,
    relay that too — answer and caveat, both, every time.

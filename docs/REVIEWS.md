@@ -554,5 +554,10 @@ control fixture.
 The operational note repeats verbatim from the round above, which is the
 point: the relay's wake-up chain dropped again, the answer sat finished in the
 `out:` file, and a nudge — any message; the relay's first act on waking is
-`result` — delivered it. The contract held twice. The relay's polling loop
-still lives outside this repo, and still needs the fix.
+`result` — delivered it. The contract held twice. The second drop bought the
+root cause: the relay's background wait was never alive at all — a subagent's
+background tasks are reaped the moment its turn ends, so the wake-up it
+promised ran on a mechanism that does not exist. Fixed the same day, outside
+this repo where the relay lives: the caller owns the watch now, and the
+example agent file in this repo carries the warning so nobody rebuilds the
+broken shape from the template.
