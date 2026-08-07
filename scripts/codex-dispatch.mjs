@@ -653,6 +653,20 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
+// The suite's pause hooks, read as a number that can only ever be a pause.
+// `Atomics.wait` treats NaN as no timeout at all — it waits FOR EVER — so
+// `Number(env)` on an unset-adjacent value (a typo, a shell that exported the
+// name empty) turned a test hook into a wedged process with no output. Anything
+// that is not a finite non-negative number is the same answer as unset: zero,
+// inert. The ceiling is read at call time (RECORD_LOCK_WAIT_MS is declared
+// below) and is a test hook's, not a policy: no window under test is wider than
+// the record lock's own patience.
+function testPauseMs(name) {
+  const n = Number(process.env[name]);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(n, RECORD_LOCK_WAIT_MS);
+}
+
 // Atomic: a half-written job.json is exactly the corruption this guards against,
 // and the supervisor writes it while status/list may be reading. On Windows a
 // replace-rename can transiently lose to a concurrent reader, so retry briefly
@@ -722,9 +736,26 @@ const RECORD_LOCK_STALE_MS = 5000;
 //
 // So the holder writes its pid inside the lock, and a breaker must be able to
 // PROVE that holder is gone — `pidAlive` says no — before the age matters at
-// all. An unreadable or missing holder file past the stale age keeps the old
-// age-only behaviour: a process that died between the mkdir and this write must
-// not wedge the job for ever.
+// all.
+//
+// A VISIBLE LOCK ALWAYS HAS A HOLDER, and that is what makes the proof
+// meaningful. `mkdir` then write is two steps, and the gap between them is a
+// lock that exists with nothing inside it: a second writer stats it past the
+// stale age, finds no holder to prove alive, and breaks in — while the creator,
+// merely descheduled, resumes and writes its pid into the BREAKER's fresh
+// directory at the same path. Two writers in the critical section, which is the
+// interleaving above, reintroduced by the acquisition itself. So the lock is
+// assembled out of sight and made visible in one atomic step: the holder file is
+// written inside a staging directory, and a rename of that directory onto the
+// lock path is the acquisition (see tryClaim, which claims roles the same way).
+// A holderless lock is therefore not a live acquirer any more — it is a
+// pre-upgrade artifact or a corrupt directory — and past the stale age it is
+// still broken, because neither may wedge a job for ever. Below that age it is
+// left alone, which is only sound while every holderless lock in reach is an
+// artifact: an OLD release still acquires by bare `mkdir`, so one of its
+// mid-gap locks is a live acquirer that this test cannot see. That is the
+// mixed-version residual the staging rename narrows and DESIGN.md states; it is
+// the same domain as a record-version mismatch, which refuses on sight.
 //
 // A PID AND NOTHING ELSE, DELIBERATELY. The obvious strengthening is to record
 // the OS start time beside it, the way `pidStarts` does for kill targets, so a
@@ -744,6 +775,9 @@ const RECORD_LOCK_STALE_MS = 5000;
 // rather than silently losing an update. That is the direction this runtime
 // always takes.
 const RECORD_LOCK_HOLDER = 'holder';
+// A suffix on the lock's own name, so the staging directories sort beside it and
+// can never be confused with it: the lock is one exact path, and this is not it.
+const RECORD_LOCK_STAGING = '.staging-';
 
 const lockHolderLine = () => `${process.pid}\n`;
 
@@ -759,48 +793,117 @@ function lockHolderLives(lock) {
   return pidAlive(pid);
 }
 
+// Ours — the one question release may ask. `lockHolderLives` answers a different
+// one (is SOMEBODY there) and says true for any live pid, which is no evidence of
+// ownership at all.
+function lockHolderIsSelf(lock) {
+  let text;
+  try { text = fs.readFileSync(path.join(lock, RECORD_LOCK_HOLDER), 'utf8'); } catch { return false; }
+  const m = String(text).trim().match(/^(\d+)/);
+  return !!m && Number(m[1]) === process.pid;
+}
+
+// Assemble out of sight, publish in one step. The rename IS the acquisition: it
+// lands a directory that already contains the holder file, so no reader can ever
+// see a lock without an owner. Failing it means somebody else holds the path —
+// the answer EEXIST on `mkdir` used to give — and the staging directory goes,
+// because a crashed acquirer's leftovers must never outlive the attempt.
+function stageRecordLock(dir, lock) {
+  const stage = path.join(dir, `${RECORD_LOCK}${RECORD_LOCK_STAGING}${process.pid}-${Math.random().toString(36).slice(2, 8)}`);
+  try { fs.mkdirSync(stage, { recursive: false }); } catch (err) { return { acquired: false, error: err }; }
+  try {
+    // temp + rename inside the staging directory, so the holder file is whole
+    // before the directory it lives in is anything anyone can see.
+    const tmp = path.join(stage, `${RECORD_LOCK_HOLDER}.tmp`);
+    fs.writeFileSync(tmp, lockHolderLine());
+    fs.renameSync(tmp, path.join(stage, RECORD_LOCK_HOLDER));
+  } catch (err) {
+    try { fs.rmSync(stage, { recursive: true, force: true }); } catch { /* best effort */ }
+    return { acquired: false, error: err };
+  }
+  // A NARROWING, NOT A PROOF. `rename(2)` on POSIX atomically REPLACES a target
+  // that is an existing EMPTY directory, where Windows fails; every lock this
+  // release publishes is non-empty, but an OLD release's bare `mkdir` acquirer,
+  // caught between its mkdir and its holder write, leaves an empty one — and
+  // replacing that at age zero would step straight past the stale-age discipline
+  // for the one case it is needed. Existence is therefore contention, the same
+  // answer the rename failure gives on Windows. The check-to-rename gap cannot be
+  // closed with rename semantics; only mixed-version POSIX concurrency on one job
+  // directory can thread it, and that is stated with the other residuals.
+  if (fs.existsSync(lock)) {
+    try { fs.rmSync(stage, { recursive: true, force: true }); } catch { /* best effort */ }
+    return { acquired: false };
+  }
+  try { fs.renameSync(stage, lock); return { acquired: true }; } catch { /* held by someone else */ }
+  try { fs.rmSync(stage, { recursive: true, force: true }); } catch { /* best effort */ }
+  return { acquired: false };
+}
+
+// Orphans of acquirers that died mid-stage. They are never mistaken for the lock
+// — the lock is one exact path — so they cost nothing but a directory, and they
+// are only swept once they are older than any acquisition in flight could be.
+function sweepStaleStaging(dir) {
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return; }
+  for (const name of names) {
+    if (!name.startsWith(`${RECORD_LOCK}${RECORD_LOCK_STAGING}`)) continue;
+    const p = path.join(dir, name);
+    try {
+      if (Date.now() - fs.statSync(p).mtimeMs <= RECORD_LOCK_STALE_MS) continue;
+      fs.rmSync(p, { recursive: true, force: true });
+    } catch { /* best effort */ }
+  }
+}
+
 function withRecordLock(dir, fn) {
   const lock = path.join(dir, RECORD_LOCK);
   const deadline = Date.now() + RECORD_LOCK_WAIT_MS;
   for (;;) {
-    try {
-      fs.mkdirSync(lock);
-      // Best effort, and the break path treats a missing one as "no evidence":
-      // a lock nobody can be proved to hold still ages out.
-      try { fs.writeFileSync(path.join(lock, RECORD_LOCK_HOLDER), lockHolderLine()); } catch { /* best effort */ }
-      break;
-    } catch (err) {
-      if (err.code !== 'EEXIST') return { locked: false, error: err };
-      let age = Infinity;
-      try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { age = Infinity; }
-      if (age > RECORD_LOCK_STALE_MS && lockHolderLives(lock) !== true) {
-        // The holder died — PROVED (see lockHolderLives), not assumed from the
-        // clock. Breaking the lock is safe in a way stealing a role claim is
-        // not: the loser of this race rewrites from a fresh read.
-        //
-        // But BREAKING IT MUST HAVE EXACTLY ONE WINNER, and `rmSync` has none.
-        // Two processes can both stat the same stale lock and both decide to
-        // break it; the second, descheduled after its stat, deleted the FRESH
-        // lock the first had already created and was writing under — which
-        // reopens the lost-update window this lock exists to close. So the break
-        // is a RENAME to a unique tombstone, the same atomic single-winner
-        // primitive the role claims use (see reclaimClaim), and only the process
-        // that won the rename removes what it moved. A rename that fails means
-        // somebody else broke it first — nothing to do but go round again.
-        const tomb = `${lock}.stale-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
-        let broke = false;
-        try { fs.renameSync(lock, tomb); broke = true; } catch { /* another breaker won it */ }
-        if (broke) {
-          try { fs.rmSync(tomb, { recursive: true, force: true }); } catch { /* a tombstone; harmless */ }
-          continue;
-        }
+    const staged = stageRecordLock(dir, lock);
+    if (staged.acquired) break;
+    // Staging itself failing is this process's own problem, not contention:
+    // there is nothing to wait for, so it is reported like the old non-EEXIST
+    // `mkdir` failure was.
+    if (staged.error) return { locked: false, error: staged.error };
+    let age = Infinity;
+    try { age = Date.now() - fs.statSync(lock).mtimeMs; } catch { age = Infinity; }
+    if (age > RECORD_LOCK_STALE_MS && lockHolderLives(lock) !== true) {
+      // The holder died — PROVED (see lockHolderLives), not assumed from the
+      // clock; or there is no holder at all, which since acquisition became
+      // atomic can only be an artifact or a corrupt directory. Breaking the
+      // lock is safe in a way stealing a role claim is not: the loser of this
+      // race rewrites from a fresh read.
+      //
+      // But BREAKING IT MUST HAVE EXACTLY ONE WINNER, and `rmSync` has none.
+      // Two processes can both stat the same stale lock and both decide to
+      // break it; the second, descheduled after its stat, deleted the FRESH
+      // lock the first had already created and was writing under — which
+      // reopens the lost-update window this lock exists to close. So the break
+      // is a RENAME to a unique tombstone, the same atomic single-winner
+      // primitive the role claims use (see reclaimClaim), and only the process
+      // that won the rename removes what it moved. A rename that fails means
+      // somebody else broke it first — nothing to do but go round again.
+      const tomb = `${lock}.stale-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+      let broke = false;
+      try { fs.renameSync(lock, tomb); broke = true; } catch { /* another breaker won it */ }
+      sweepStaleStaging(dir);
+      if (broke) {
+        try { fs.rmSync(tomb, { recursive: true, force: true }); } catch { /* a tombstone; harmless */ }
+        continue;
       }
-      if (Date.now() >= deadline) return { locked: false };
-      sleepSync(20);
     }
+    if (Date.now() >= deadline) return { locked: false };
+    sleepSync(20);
   }
   try { return { locked: true, value: fn() }; }
-  finally { try { fs.rmSync(lock, { recursive: true, force: true }); } catch { /* best effort */ } }
+  // RELEASE BY IDENTITY, NOT BY PATH. `rmSync` on the path removes whatever is
+  // there, and after a stale break that is somebody else's lock — the finisher
+  // deletes the directory another writer is still working under. A lock this
+  // process no longer owns is left exactly where it is: it is not ours to remove,
+  // and its own holder will release it or age out.
+  finally {
+    try { if (lockHolderIsSelf(lock)) fs.rmSync(lock, { recursive: true, force: true }); } catch { /* best effort */ }
+  }
 }
 
 // Compare-and-swap on the record. `expect` is the precondition, evaluated on the
@@ -818,9 +921,7 @@ function updateRecordOutcome(dir, patch, { expect } = {}) {
     // the write — the window in which another writer's verdict used to be lost. A
     // scheduler gap of a chosen length is not producible on demand; the runtime's
     // decision (the other writer's value survives) is what is under test.
-    if (process.env.CODEX_DISPATCH_TEST_RECORD_PAUSE_MS) {
-      sleepSync(Number(process.env.CODEX_DISPATCH_TEST_RECORD_PAUSE_MS));
-    }
+    sleepSync(testPauseMs('CODEX_DISPATCH_TEST_RECORD_PAUSE_MS'));
     if (isCorrupt(current)) return { ok: false, why: 'corrupt', current };
     if (expect && !expect(current)) return { ok: false, why: 'precondition', current };
     const generation = Number.isSafeInteger(current.generation) ? current.generation + 1 : 1;
@@ -2021,7 +2122,7 @@ function claimRole(root, role, jobId, { force } = {}) {
       // and the reclaim below takes it. The one thing that must not happen is
       // this force reporting a kill it never made.
       if (killed.terminal) {
-        console.log(`previous job finished on its own: ${claim.job.id} (${killed.terminal}) — nothing was killed`);
+        console.log(terminalKillNote(claim.job.id, killed));
       } else if (!killed.ok) {
         return {
           ok: false,
@@ -2438,14 +2539,27 @@ function recordReapedPids(dir, pids) {
 // the operator believing they had been unloaded, which is the worse half. So the
 // failure is returned to be reported, and the pids are written down as reaped
 // first — the list, not the filename, is what the next reap consults.
+//
+// ONLY A FILE WHOSE NUMBERS WERE ACTUALLY FIRED AT IS SPENT. This renamed every
+// pid file regardless of which pids the kill had targeted, and the file it can
+// destroy that way is the only recorded target an orphan has: a `codex.pid` the
+// supervisor wrote moments before it died is renamed out of the way by a cancel
+// that never signalled anything in it, and the next cancel finds nothing to fire
+// at. So a file is consumed only when every number in it is either in the fired
+// set or already recorded as spent; anything else stays loaded and stays a target.
 function consumePidFiles(dir, pids = []) {
   const stamp = new Date().toISOString().replace(/[:.]/g, '-');
   const consumed = [];
   const failed = [];
   recordReapedPids(dir, pids);
+  // Read back after the write above, so the durable half of "already fired at"
+  // counts here too — a number this caller never aimed at because an earlier
+  // cancel had already spent it must not keep its file loaded for ever.
+  const fired = new Set([...pids.filter(isPid), ...reapedPids(dir)]);
   for (const name of PID_FILES) {
     const from = path.join(dir, name);
     if (!fs.existsSync(from)) continue;
+    if (!readPidList(from).every((n) => fired.has(n))) continue;
     const to = path.join(dir, `${name}.reaped-${stamp}`);
     try {
       // Test-only: a rename that fails on demand. Locking a file hard enough to
@@ -2642,9 +2756,7 @@ function killJob(job) {
     // in a shell. A scheduler gap of a chosen length is not producible on demand;
     // what is under test is that the decision below is made on the record as it is
     // NOW rather than as the caller read it. Never set outside the suite.
-    if (process.env.CODEX_DISPATCH_TEST_KILL_PAUSE_MS) {
-      sleepSync(Number(process.env.CODEX_DISPATCH_TEST_KILL_PAUSE_MS));
-    }
+    sleepSync(testPauseMs('CODEX_DISPATCH_TEST_KILL_PAUSE_MS'));
     const after = readRecord(job.dir);
     // THE STATE IS PART OF "IT MOVED". This compared the phase and the pid list
     // only, so a record whose STATE went from `running` to a terminal verdict in
@@ -2721,11 +2833,14 @@ function killJob(job) {
     }
     return null;
   };
-  const window = killWindow(r, Date.now(), {
-    supervisorDead:
-      !isCorrupt(r) && Boolean(r.supervisorPid) &&
-      (!pidAlive(r.supervisorPid) || !unique.includes(r.supervisorPid)),
-  });
+  // A supervisor is gone when its number is dead OR when the identity check above
+  // refused it: a reissued number is not the supervisor this job spawned. Stated
+  // once because the window is read twice — before the kill, and again behind the
+  // fence below, on a record that may have moved.
+  const supervisorGone = (rec) =>
+    !isCorrupt(rec) && Boolean(rec.supervisorPid) &&
+    (!pidAlive(rec.supervisorPid) || !unique.includes(rec.supervisorPid));
+  const window = killWindow(r, Date.now(), { supervisorDead: supervisorGone(r) });
   // INSIDE THE CODEX-EXEC WINDOW, KILL NOTHING. codex exists and its pid is
   // written down nowhere; the supervisor is the one process that has it, and
   // killing the supervisor is exactly how that knowledge is lost — which is what
@@ -2747,15 +2862,76 @@ function killJob(job) {
     if (blocked) return blocked;
     return { ok: false, pending: true, survivors: [], targets: [], window };
   }
+  // THE RECORD HAS TO SPEAK FOR THIS CANCEL WHILE THE PROCESS TABLE IS BEING
+  // READ. The `none` window is the one that kills, and it used to leave the state
+  // saying `running` for the whole kill — so nothing fenced the supervisor's
+  // `launch: 'exec-spawning'` CAS, whose precondition is exactly that state. A
+  // supervisor reaching it between killPids' process-table snapshot and the
+  // signal spends money this kill can no longer reach: off Windows codex is
+  // detached, leads its own group and reparents to init the moment the supervisor
+  // dies, so the leftover sweep finds nothing descended from anything and the
+  // pre-kill `r` carries no `codexPgid` to check it by. The kill then verified,
+  // the role was released, and a billed orphan was left with no recorded target.
+  // `kill-pending` is in LIVE_STATES, so it costs the CAS writes below nothing —
+  // every one of them expects `stillCancellable`, which this state satisfies.
+  //
+  // A corrupt record is excluded on purpose: it is evidence and is never
+  // rewritten, its pid files are the only targets it has, and refusing to kill
+  // because a fence could not be written would spare exactly the orphan the fence
+  // exists to catch.
+  if (window === 'none' && !isCorrupt(r)) {
+    const blocked = markPending();
+    if (blocked) return blocked;
+    // THE LOCK TOTALLY ORDERS THE TWO WRITERS, and one of the two orders is the
+    // supervisor getting past its CAS before this mark landed. That order is only
+    // visible here, in a read taken after the fence: a phase that has become
+    // `exec-spawning` under a live supervisor IS the codex-exec window, so it is
+    // reported rather than declared dead, and the supervisor — the one process
+    // that knows what it just spawned — lands the pending cancel itself.
+    const fenced = readRecord(job.dir);
+    if (killWindow(fenced, Date.now(), { supervisorDead: supervisorGone(fenced) }) === 'exec') {
+      return { ok: false, pending: true, survivors: [], targets: [], window: 'exec' };
+    }
+  }
   const killed = killPids(unique);
   const survivors = killed.survivors;
   const finished = new Date().toISOString();
   const priorWarning = isCorrupt(r) ? undefined : r.warning;
-  // POSIX: codex leads its own process group, and an empty group is part of the
-  // proof that the group kill reached everything in it.
-  if (!survivors.length && !isCorrupt(r) && groupAlive(r.codexPgid)) {
-    survivors.push(r.codexPgid);
+  // AND THE SURVIVOR CHECK READS THE RECORD AGAIN. `r` is the record as it was
+  // BEFORE the kill, so a supervisor that registered codex DURING it — the pgid
+  // and the pids it writes a moment after the exec — was invisible to every check
+  // below, and its codex was declared dead by a check that never held its number.
+  // A fresh read that comes back corrupt says nothing about what is alive, so the
+  // stale one still stands: this may add targets to look at, never subtract them.
+  const post = readRecord(job.dir);
+  const witnesses = [r, post].filter((rec) => rec && !isCorrupt(rec));
+  if (!survivors.length) {
+    // POSIX: codex leads its own process group, and an empty group is part of the
+    // proof that the group kill reached everything in it.
+    for (const pgid of new Set(witnesses.map((rec) => rec.codexPgid).filter(isPid))) {
+      if (groupAlive(pgid)) survivors.push(pgid);
+    }
+    // Pids the kill never fired at because nothing had written them down when it
+    // gathered its targets — which means the ones the FRESH read added, and only
+    // those: everything `gather` already saw was either fired at or refused by the
+    // identity check, and a number refused as reissued belongs to somebody else
+    // and is nobody's survivor. The spent list applies here as it does to every
+    // other source, and the start-time identity is asked about the new numbers.
+    const spent = reapedPids(job.dir);
+    const late = [];
+    for (const rec of witnesses) {
+      for (const pid of [rec.codexPid, ...(Array.isArray(rec.codexPids) ? rec.codexPids : [])]) {
+        if (isPid(pid) && !written.includes(pid) && !spent.has(pid) && !late.includes(pid)) late.push(pid);
+      }
+    }
+    if (late.length) survivors.push(...recordedProcesses(post, late).filter(pidAlive));
   }
+  // TEST HOOK: stands in for this process being descheduled between the kill and
+  // the write that records it — the gap in which another writer's verdict lands,
+  // and the one the compare-and-swaps below exist for. The pauses above sit
+  // BEFORE the trigger, where the pre-trigger bail already answers, so neither of
+  // them can pose this interleaving. Never set outside the suite.
+  sleepSync(testPauseMs('CODEX_DISPATCH_TEST_VERDICT_PAUSE_MS'));
   // A kill with nothing left standing is only a kill if something LOOKED. An
   // unreadable process table is a failed verification, not a clean sweep (see
   // UNENUMERATED_KILL), so it lands in the same state a survivor does.
@@ -2791,7 +2967,13 @@ function killJob(job) {
         `taskkill /PID <pid> /T /F\n`
       );
     }
-    return { ok: false, survivors, targets: unique, unverified };
+    // AND THE ANSWER IS THE VERDICT, NOT THE FAILED WRITE. `terminal` was left off
+    // here alone, so a kill that lost this swap came back looking like a plain
+    // kill-failed: `cancel` announced "state: kill-failed (NOT killed)" for a
+    // record saying `done`, and `--force` treated a job that had finished as an
+    // unresolved conflict and refused to launch. The survivor list rides along
+    // either way — the state is somebody else's, the pids are still real.
+    return { ok: false, ...(verdict ? { terminal: verdict } : {}), survivors, targets: unique, unverified };
   }
   const spent = consumePidFiles(job.dir, unique);
   const renameWarning = spent.failed.length
@@ -2914,6 +3096,23 @@ function uncontainedJobMessage(role, conflict) {
     `prove the role is free. It stays blocked.\n` +
     `Look at that entry yourself and remove or rename it, or dispatch under another --role.`
   );
+}
+
+// A kill that LOST to a verdict, said honestly. Two shapes, and the second one
+// must not borrow the first's sentence: an ordinary loss killed nothing because
+// the job had already finished, while a loss behind survivors or an unreadable
+// process table happened AFTER the signals went out — "nothing was killed" there
+// is a claim about processes this cancel really did fire at.
+function terminalKillNote(jobId, killed) {
+  if (killed.survivors.length || killed.unverified) {
+    return (
+      `previous job finished as ${clean(killed.terminal)} while the kill was verifying: ${jobId}\n` +
+      (killed.survivors.length
+        ? `pids ${killed.survivors.join(', ')} survived it — that verdict stands and was not overwritten`
+        : `the kill could not be verified — that verdict stands and was not overwritten`)
+    );
+  }
+  return `previous job finished on its own: ${jobId} (${clean(killed.terminal)}) — nothing was killed`;
 }
 
 function killFailedMessage(job, killed) {
@@ -3119,7 +3318,7 @@ function cmdDispatch(opts) {
       // nothing to kill, nothing to refuse, and — above all — nothing of its
       // verdict to overwrite. The claim below is taken the ordinary way.
       if (killed.terminal) {
-        console.log(`previous job finished on its own: ${conflict.id} (${killed.terminal}) — nothing was killed`);
+        console.log(terminalKillNote(conflict.id, killed));
       } else if (!killed.ok) {
         if (killed.unrecorded) fail(unrecordedKillMessage(role, conflict.id, killed));
         fail(killed.pending ? killPendingMessage(conflict, role) : killFailedMessage(conflict, killed));
@@ -3187,9 +3386,7 @@ function cmdDispatch(opts) {
     // TEST HOOK: stands in for this dispatch being descheduled between winning the
     // claim and launching — the window a reclaimer can use. Never set outside the
     // suite; finding a real scheduler pause on demand is not portable.
-    if (process.env.CODEX_DISPATCH_TEST_CLAIM_PAUSE_MS) {
-      sleepSync(Number(process.env.CODEX_DISPATCH_TEST_CLAIM_PAUSE_MS));
-    }
+    sleepSync(testPauseMs('CODEX_DISPATCH_TEST_CLAIM_PAUSE_MS'));
     // Verify-own-claim, immediately before the launch it authorizes. Everything
     // above this line is reversible; a spawned supervisor is not.
     if (!verifyClaim(roleLockDir(root, role), id)) {
@@ -3270,9 +3467,7 @@ function cmdDispatch(opts) {
     // A real one of those is milliseconds wide and cannot be aimed at; what is
     // under test is the decision made about what is found there. Never set
     // outside the suite.
-    if (process.env.CODEX_DISPATCH_TEST_SPAWN_PAUSE_MS) {
-      sleepSync(Number(process.env.CODEX_DISPATCH_TEST_SPAWN_PAUSE_MS));
-    }
+    sleepSync(testPauseMs('CODEX_DISPATCH_TEST_SPAWN_PAUSE_MS'));
 
     // A cancel that landed while this dispatch was spawning has now been serialized
     // behind that write, and it wrote a state this job must honour rather than
@@ -3451,6 +3646,70 @@ function cmdSupervise(dir) {
   const root = path.dirname(dir);
   const id = path.basename(dir);
 
+  // EVERY PRE-LAUNCH VERDICT IS A COMPARE-AND-SWAP, like every other writer in
+  // the kill seam. These seven wrote unconditionally, and everything between the
+  // record read above and them is slow — a sight probe is seconds of shell — so a
+  // cancel that reached a verdict inside that gap had it overwritten by a
+  // `failed` about a launch that never happened, and its role handed away
+  // underneath it. `killed(sight-unproven)` and a `kill-failed` whose role went
+  // free are both reachable that way; both are pairs this repo documents as
+  // impossible.
+  //
+  // A LOST PRECONDITION IS A FOUND VERDICT: it is left exactly as its writer left
+  // it and nothing is released here, because whoever wrote it owns the release
+  // decision too — `kill-failed` above all, whose whole contract is that it goes
+  // on blocking the role (DESIGN.md, "Kills are verified"). This is the exec
+  // landing's rule, one step earlier.
+  //
+  // A write that could not be made AT ALL is a different answer: it found no
+  // verdict, and on every one of these paths codex was never launched and this
+  // supervisor is about to exit, so the claim it holds is still its own to give
+  // back, and it gives it back exactly as it did before.
+  //
+  // A CANCEL-AUTHORED STATE IS THE CANCEL'S TO RESOLVE. `stillCancellable` alone
+  // was not that line: `kill-pending` and `kill-failed` are LIVE states — they
+  // have to be, so a second cancel can retry them — so a refusal satisfied the
+  // precondition and wrote `failed(<reason>)` straight over a cancel's verdict,
+  // releasing the role that `kill-failed` exists to keep blocked, after `cancel`
+  // had already told the operator survivors exist and the role stays blocked. So
+  // a refusal that finds one stands down: it overwrites nothing, releases
+  // nothing, says what it found, and lets the cancel's own compare-and-swap
+  // finish the story — the live cancel will write its verdict over
+  // `kill-pending`, and a `kill-failed` already says what the operator needs.
+  // `CANCEL_STATES` is the list this repo already draws (0.7.3); its third
+  // member, `killed`, is terminal and `stillCancellable` refuses it a step
+  // earlier, so naming all three keeps one list and adds nothing.
+  //
+  // The kill-pending HONOUR path below is the exception and passes its own
+  // precondition: it is not overwriting that cancel, it is carrying it out.
+  const notCancelAuthored = (rec) =>
+    stillCancellable(rec) && !CANCEL_STATES.includes(canonicalState(rec));
+  const refuseBeforeLaunch = (patch, { expect = notCancelAuthored } = {}) => {
+    const written = updateRecordOutcome(dir, {
+      ...patch,
+      // The state, the reason and the survivor list travel as ONE. The record this
+      // lands on may be a `kill-failed` carrying an earlier cancel's
+      // `killSurvivors`, and a `failed` that kept it would report survivors of a
+      // kill its own state never mentions.
+      killSurvivors: undefined,
+      finished: new Date().toISOString(),
+    }, { expect });
+    if (written.ok) {
+      releaseRole(root, record.role, id);
+      return;
+    }
+    const msg = written.why === 'precondition'
+      ? `supervisor: the record had already reached "${clean(canonicalState(written.current))}" before this\n` +
+        `refusal could be written, so that verdict has NOT been overwritten and no role claim was\n` +
+        `released — whoever wrote it owns that decision. See it: status ${id}`
+      : `supervisor: this refusal could not be written to the record (${clean(written.why)}), so the record\n` +
+        `still says what it said. Nothing was launched; the "${clean(record.role)}" role claim has been\n` +
+        `released. Look at the job: status ${id}`;
+    try { fs.appendFileSync(runLogPath(dir), msg + '\n'); } catch { /* best effort */ }
+    process.stderr.write(msg + '\n');
+    if (written.why !== 'precondition') releaseRole(root, record.role, id);
+  };
+
   // ASSERT THE SCHEMA VERSION OF THE RECORD THIS SUPERVISOR PICKED UP. Two copies
   // of this runtime can be installed at once — a plugin install and a clone, an
   // old shell and a new one — and dispatch and `_supervise` are separate
@@ -3471,12 +3730,7 @@ function cmdSupervise(dir) {
       `Fix: use one runtime. Re-dispatch with the same copy that will supervise it.`;
     try { fs.appendFileSync(runLogPath(dir), msg + '\n'); } catch { /* best effort */ }
     process.stderr.write(msg + '\n');
-    updateRecord(dir, {
-      state: 'failed',
-      reason: 'record-version-mismatch',
-      finished: new Date().toISOString(),
-    });
-    releaseRole(root, record.role, id);
+    refuseBeforeLaunch({ state: 'failed', reason: 'record-version-mismatch' });
     process.exit(1);
   }
 
@@ -3503,7 +3757,7 @@ function cmdSupervise(dir) {
       BLIND_EXPLANATION;
     try { fs.appendFileSync(runLogPath(dir), msg + '\n'); } catch { /* best effort */ }
     process.stderr.write(msg + '\n');
-    updateRecord(dir, {
+    refuseBeforeLaunch({
       state: 'failed',
       reason: 'sandbox-blind-precheck',
       // NOT `${sight.mode} FAILED: ...`. That began with `cwd-file:`, which is the
@@ -3511,9 +3765,7 @@ function cmdSupervise(dir) {
       // that looked like evidence of a proven one. The label leads with the
       // verdict now, and `sightVerdict` will not accept a prefix either way.
       sight: `FAILED ${sight.mode}: ${sight.detail}`,
-      finished: new Date().toISOString(),
     });
-    releaseRole(root, record.role, id);
     process.exit(1);
   }
   // THE PROBE NEVER RAN. Not blindness — an absence of evidence, which is the
@@ -3539,13 +3791,11 @@ function cmdSupervise(dir) {
     try { fs.appendFileSync(runLogPath(dir), msg + '\n'); } catch { /* best effort */ }
     if (!record.allowUnprovenSight) {
       process.stderr.write(msg + '\n');
-      updateRecord(dir, {
+      refuseBeforeLaunch({
         state: 'failed',
         reason: 'sight-probe-error',
         sight: `unproven: the probe could not be run (${sight.detail})`,
-        finished: new Date().toISOString(),
       });
-      releaseRole(root, record.role, id);
       process.exit(1);
     }
   }
@@ -3587,13 +3837,11 @@ function cmdSupervise(dir) {
         UNPROVEN_EXPLANATION;
       try { fs.appendFileSync(runLogPath(dir), msg + '\n'); } catch { /* best effort */ }
       process.stderr.write(msg + '\n');
-      updateRecord(dir, {
+      refuseBeforeLaunch({
         state: 'failed',
         reason: 'sight-unproven',
         sight: `unproven: ${detail}`,
-        finished: new Date().toISOString(),
       });
-      releaseRole(root, record.role, id);
       process.exit(1);
     }
     warning = `sight not proven, accepted by caller (--allow-unproven-sight): ${detail}`;
@@ -3615,13 +3863,20 @@ function cmdSupervise(dir) {
   }
   if (canonicalState(now) !== 'running') {
     if (now.state === 'kill-pending') {
-      // The cancel could not reach us then; it can be honoured now, by us.
-      updateRecord(dir, {
-        state: 'killed',
-        reason: 'cancelled-during-registration',
-        finished: new Date().toISOString(),
-      });
-      releaseRole(root, record.role, id);
+      // The cancel could not reach us then; it can be honoured now, by us. This
+      // is the one refusal that MAY land on a cancel-authored state, because it
+      // is not overwriting that cancel — it is completing it. Its precondition is
+      // therefore exactly the state it read and nothing wider: `stillCancellable`
+      // also accepts `kill-failed`, so a live cancel that reached that verdict
+      // between this read and this write would have it replaced by
+      // `killed(cancelled-during-registration)` — survivors cleared, role
+      // released — which is the overwrite the six siblings forbid. Losing it is a
+      // found verdict and stands down through the same path they do. Exactly as
+      // the exec landing's honour path does one step later.
+      refuseBeforeLaunch(
+        { state: 'killed', reason: 'cancelled-during-registration' },
+        { expect: (rec) => canonicalState(rec) === 'kill-pending' },
+      );
     }
     abortSupervisor(dir, `the record says "${clean(now.state)}", not "running" — this job was cancelled before codex was launched`);
   }
@@ -3657,6 +3912,13 @@ function cmdSupervise(dir) {
   // supervisor, verify the targets it knew about, mark the job `killed` and
   // release the role, while codex ran on and billed. `launch: 'exec-spawning'` is
   // what lets `killJob` refuse to call that a death.
+  // TEST HOOK: holds this supervisor immediately BEFORE the mark below, which is
+  // the last thing standing between a cancel's fence and a codex nobody wrote
+  // down. The real gap between the pre-launch read above and this compare-and-swap
+  // is shell time measured in milliseconds and cannot be aimed at; what is under
+  // test is that a `kill-pending` written while the kill runs costs this
+  // supervisor its precondition. Never set outside the suite.
+  sleepSync(testPauseMs('CODEX_DISPATCH_TEST_PRELAUNCH_PAUSE_MS'));
   const marked = updateRecord(dir, { launch: 'exec-spawning' }, {
     expect: (r) => canonicalState(r) === 'running',
   });
@@ -3687,18 +3949,12 @@ function cmdSupervise(dir) {
     const msg = `supervisor: refusing to launch codex: ${clean(err.message)}`;
     try { fs.appendFileSync(runLogPath(dir), msg + '\n'); } catch { /* best effort */ }
     console.error(msg);
-    updateRecord(dir, {
-      state: 'failed', reason: 'codex-argv-refused', exitCode: -1, finished: new Date().toISOString(),
-    });
-    releaseRole(root, record.role, id);
+    refuseBeforeLaunch({ state: 'failed', reason: 'codex-argv-refused', exitCode: -1 });
     process.exit(1);
   }
   child.on('error', (err) => {
     fs.appendFileSync(runLogPath(dir), `supervisor: spawn failed: ${clean(err.message)}\n`);
-    updateRecord(dir, {
-      state: 'failed', reason: 'codex-spawn-failed', exitCode: -1, finished: new Date().toISOString(),
-    });
-    releaseRole(root, record.role, id);
+    refuseBeforeLaunch({ state: 'failed', reason: 'codex-spawn-failed', exitCode: -1 });
     process.exit(1);
   });
 
@@ -3706,9 +3962,7 @@ function cmdSupervise(dir) {
   // between codex existing and its pids being written down. A real one of those
   // lasts milliseconds and cannot be aimed at on demand; what is under test is the
   // runtime's DECISION, that nothing landing in it may record a death.
-  if (process.env.CODEX_DISPATCH_TEST_EXEC_PAUSE_MS) {
-    sleepSync(Number(process.env.CODEX_DISPATCH_TEST_EXEC_PAUSE_MS));
-  }
+  sleepSync(testPauseMs('CODEX_DISPATCH_TEST_EXEC_PAUSE_MS'));
 
   // WHAT WAS ACTUALLY SPAWNED. `child.pid` is codex only when codex was spawned
   // directly. Through the Windows shell — which is the path the supported npm
@@ -4075,13 +4329,6 @@ function cmdCancel(id) {
     const reaped = killPids(pids);
     const survivors = reaped.survivors;
     console.log(`killed recorded pids: ${pids.join(', ')} (job.json left untouched for inspection)`);
-    if (!reaped.enumerated) {
-      process.stderr.write(
-        `WARNING: job ${id} — the process table could not be read, so only the recorded pids were\n` +
-        `verified. A descendant of theirs could have survived unseen. Check by hand if this job may\n` +
-        `have had a codex under it.\n`
-      );
-    }
     if (survivors.length) {
       // Survivors keep their pid files: those numbers are demonstrably still
       // theirs, so a later cancel must be able to fire at them again.
@@ -4089,6 +4336,25 @@ function cmdCancel(id) {
       process.stderr.write(
         `KILL FAILED: job ${id} — these pids survived: ${survivors.join(', ')}\n` +
         `Kill them yourself: taskkill /PID <pid> /T /F\n`
+      );
+      process.exit(1);
+    }
+    // AN UNENUMERATED KILL IS A FAILED VERIFICATION HERE TOO. This branch used to
+    // warn and then consume the pid files anyway — spending the only kill targets a
+    // corrupt record has on a sweep nothing witnessed, and exiting 0 — so the retry
+    // the warning asked for found "already reaped" and fired at nothing. Every other
+    // writer in the kill seam already treats `enumerated: false` as failure
+    // (`killJob` lands kill-failed, `reapUnvouchedJob` refuses the takeover and
+    // leaves the pid files loaded); a corrupt record, which has no state to move,
+    // keeps its targets instead.
+    if (!reaped.enumerated) {
+      console.log(`out: ${outPath(job.dir)}`);
+      process.stderr.write(
+        `KILL NOT VERIFIED: job ${id} — the signals were sent to the recorded pids, and the process\n` +
+        `table could not be read afterwards, so nothing enumerated the tree behind them. A descendant\n` +
+        `of theirs — a codex, if this job had one — could have survived unseen.\n` +
+        `pid files stay loaded; re-run cancel when the process table answers.\n` +
+        UNENUMERATED_ADVICE + '\n'
       );
       process.exit(1);
     }
@@ -4123,8 +4389,13 @@ function cmdCancel(id) {
   if (killed.terminal) {
     // It finished between the state read above and the write below — its own
     // verdict, left exactly as written. Reported the way cancelling any other
-    // finished job is reported, because that is what this is.
-    console.log(`job ${id} is already ${killed.terminal}, nothing to kill`);
+    // finished job is reported, because that is what this is: a verdict that was
+    // reached is not this cancel's failure, so the exit code is the finished-job
+    // one even when the signals had already gone out. What DID happen behind them
+    // is on stderr, written by the kill itself.
+    console.log(killed.survivors.length || killed.unverified
+      ? `job ${id} finished as ${killed.terminal} while the kill was verifying, and that verdict stands`
+      : `job ${id} is already ${killed.terminal}, nothing to kill`);
     console.log(`out: ${outPath(job.dir)}`);
     return;
   }
@@ -4345,8 +4616,7 @@ function cmdClean(opts) {
 //
 // `job.json.lock` is skipped in the loop for the same reason from the other end:
 // this process is holding it, and removing it while the record is still there
-// would let another writer take the lock mid-removal. The final recursive rm
-// takes it, once there is no longer a record to write.
+// would let another writer take the lock mid-removal.
 //
 // `recursive` unlinks a link rather than following it, and the caller has already
 // proved this path is inside the real jobs root, so neither half can walk out.
@@ -4359,6 +4629,17 @@ function cmdClean(opts) {
 // The record's bytes are therefore held in hand across that last removal and put
 // straight back if it throws. A restore that itself fails is reported loudly,
 // because it is the one case where a job really has become unlistable.
+//
+// AND THE PUT-BACK IS A WRITE TO job.json, so it happens UNDER THE LOCK like
+// every other one. `fs.rmSync(dir, { recursive: true })` removes the children
+// first — the lock this removal is holding among them — and only then fails on
+// the directory itself, so the restore below used to write a lock-governed file
+// with no lock in existence at all. The order is therefore fixed: the record goes
+// while the lock is still held, the lock is handed back next (this function is
+// called holding it and returns it itself), and a restore RE-ACQUIRES it through
+// the ordinary path. A restore that cannot take the lock writes NOTHING and says
+// so — an unlistable job is recoverable by hand, an unlocked write over a record
+// another writer is holding is not.
 function removeJobDir(dir) {
   for (const name of fs.readdirSync(dir)) {
     if (name === 'job.json' || name === RECORD_LOCK) continue;
@@ -4367,17 +4648,26 @@ function removeJobDir(dir) {
   let raw = null;
   try { raw = fs.readFileSync(recordPath(dir)); } catch { /* already gone: nothing to put back */ }
   fs.rmSync(recordPath(dir), { force: true });
+  // Ours to give back, and only ours: released by the same identity test
+  // `withRecordLock` releases by, because a lock this process no longer holds is
+  // somebody else's and is not this removal's to delete.
+  const lock = path.join(dir, RECORD_LOCK);
+  try { if (lockHolderIsSelf(lock)) fs.rmSync(lock, { recursive: true, force: true }); } catch { /* best effort */ }
   try {
     fs.rmSync(dir, { recursive: true, force: true });
   } catch (err) {
     if (raw !== null) {
-      try {
-        fs.writeFileSync(recordPath(dir), raw);
-      } catch (restoreErr) {
+      let restoreErr = null;
+      const held = withRecordLock(dir, () => {
+        try { fs.writeFileSync(recordPath(dir), raw); return true; } catch (e) { restoreErr = e; return false; }
+      });
+      if (!held.locked || !held.value) {
         process.stderr.write(
           `WARNING: job directory ${dir} could not be removed (${clean(err.code || err.message)}), and its\n` +
-          `job.json could not be put back (${clean(restoreErr.code || restoreErr.message)}). Without a record\n` +
-          `that directory is invisible to list, status and clean — remove it by hand.\n`
+          `job.json could not be put back (${restoreErr
+            ? clean(restoreErr.code || restoreErr.message)
+            : 'its record lock could not be re-acquired, and nothing writes that file without it'}). ` +
+          `Without a record\nthat directory is invisible to list, status and clean — remove it by hand.\n`
         );
       }
     }

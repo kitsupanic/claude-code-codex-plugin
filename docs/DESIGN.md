@@ -212,7 +212,12 @@ the filesystem rather than to the record:
   The numbers are the anti-target, not the file names: every kill target, however
   it was gathered — the pid files, `supervisorPid`, `codexPid`, `codexPids` — is
   filtered through the reaped list, so a record that outlived a failed write
-  cannot re-arm a spent number either.
+  cannot re-arm a spent number either. **A file is consumed only when every number
+  in it was fired at** (or was already recorded as spent). Renaming all of them
+  regardless destroyed targets nothing had shot at: a `codex.pid` written by a
+  supervisor moments before it died is the only recorded target its orphan has,
+  and a cancel that killed the supervisor alone used to rename it away — leaving
+  the next cancel with nothing to fire.
 - **Job ids are whitelisted, not sanitized**: `^[a-z]+-\d+-\d+$`, checked before
   the id is ever joined into a path. Roles are `^[a-z]+$` for the same reason, and
   the collision suffix extends the pid digits (`…-4844` → `…-48441`) rather than
@@ -312,10 +317,31 @@ mark, and then wrote from its pre-break read over whatever the breaker had
 written in between: a cancel's `kill-pending` vanishing by way of the mechanism
 that stops a crash from wedging a job. So the holder writes its **pid** inside
 the lock, and a breaker needs both the age AND a holder it can show is gone.
-A holder file that is missing or unreadable past the stale age keeps the
-age-only behaviour, because a process that died between the `mkdir` and that
-write must not wedge the job either. The break itself is unchanged: one atomic
-rename to a tombstone, so exactly one breaker can win.
+
+**A visible lock always has a holder**, which is what makes that proof worth
+anything. `mkdir` followed by a write is two steps, and between them sits a lock
+with nothing inside it: a second writer stats it past the stale age, finds no
+holder to prove alive, breaks in — and the first, merely descheduled, resumes and
+writes its pid into the breaker's fresh directory at the same path. Both then run
+the critical section, which is the lost-update window reintroduced by the
+acquisition itself. So the lock is assembled out of sight and published in one
+step, the way role claims are: the holder file is written into a staging
+directory beside the lock, and the **rename of that directory onto the lock path
+is the acquisition**. A failed rename is "someone else has it", the answer
+`EEXIST` used to give, and the staging directory is removed; orphans left by an
+acquirer that died mid-stage are swept once they age past the stale mark, and are
+never mistaken for the lock, which is one exact path. A holderless lock is
+consequently no longer a live acquirer — it is a pre-upgrade artifact or a
+corrupt directory — and past the stale age it is still broken, because neither
+may wedge a job for ever. The break itself is unchanged: one atomic rename to a
+tombstone, so exactly one breaker can win.
+
+Release is **by identity, not by path**. `rmSync` on the lock path removes
+whatever is there, and after a legitimate stale break that is somebody else's
+lock — the writer that finishes first deletes the directory the other still
+believes it holds. So a releaser reads the holder file back and removes the lock
+only while it still names its own pid; a lock that has changed hands is left
+exactly where it is, for its own holder to release or to age out.
 
 **A pid and nothing else**, which is a decision rather than an omission. The
 start time could go beside it, as it does for every kill target — but reading it
@@ -349,7 +375,14 @@ loses that precondition did not lose data — it *found a verdict*. Nothing is
 overwritten, nothing is killed (the re-read bails before the trigger too), the
 role is not released, and the answer is the state that is really there: `cancel`
 reports `job <id> is already <state>, nothing to kill` and exits 0, exactly as it
-always has for a job that finished before the cancel arrived. `--force` gets the
+always has for a job that finished before the cancel arrived. A verdict found by
+the `kill-failed` write — the one that lands *after* the signals went out — is the
+same answer and is now reported as one: it says `finished as <state> while the
+kill was verifying`, because "nothing to kill" would be a claim about processes
+this cancel really did fire at, and the survivors (or the unreadable process
+table) stay on stderr where the kill wrote them. It used to come back with no
+verdict at all, so `cancel` announced `state: kill-failed (NOT killed)` for a
+record saying `done` and exited nonzero. `--force` gets the
 same answer and treats it correctly — a terminal job is not a conflict, so the
 force takes the role rather than refusing, and it does not print a kill it never
 made.
@@ -380,6 +413,40 @@ It is a compare-and-swap on `stillCancellable` too, and a write that loses it
 reports into the job's own `run.log` and releases nothing — a second release
 could hand away a claim a new dispatch has taken since. Same rule, both
 directions: whoever's write landed owns the verdict *and* the release.
+
+**And the supervisor's seven pre-launch refusals are the last of them.** A record
+version mismatch, a blind sandbox, a probe that could not be run, sight left
+unproven, an argv `cmdQuote` refuses, a spawn that fails, and the honouring of a
+`kill-pending` all write a verdict before codex exists — and all seven wrote it
+unconditionally, with a sight probe's seconds of shell sitting between the record
+they read and the write. A cancel that reached a verdict inside that gap was
+overwritten by a `failed` about a launch that never happened, and its role handed
+away underneath it: `killed(sight-unproven)` from one direction, a `kill-failed`
+whose role went free from the other. They are compare-and-swap too, on a
+precondition one notch tighter than `stillCancellable`: six of the seven require a
+live state that is **not cancel-authored** — `stillCancellable(rec) &&
+!CANCEL_STATES.includes(canonicalState(rec))` — because `kill-pending` and
+`kill-failed` are live states (they must be: a second cancel has to be able to
+retry them), so `stillCancellable` alone still let a refusal write
+`failed(<reason>)` over a cancel's verdict and hand its role away. A
+cancel-authored state is the *cancel's* to resolve: the refusal that finds one
+stands down, overwrites nothing and releases nothing, and the cancel's own
+compare-and-swap finishes the story — for `kill-pending` the live cancel writes
+its verdict, and a `kill-failed` **keeps both its record and its claim** against
+every one of these writes, which is the whole contract of that state ("Kills are
+verified"). The seventh, the honour path, is the exception in the other
+direction: it expects **exactly `kill-pending`**, the state it read, because it
+is not overwriting that cancel but carrying it out — and `stillCancellable`,
+which it used to carry, also accepts `kill-failed`, so a cancel reaching that
+verdict inside the gap would have been replaced by
+`killed(cancelled-during-registration)` with its survivors cleared and its role
+released, the very overwrite the other six forbid. It stands down on a lost
+precondition exactly as they do. All seven clear `killSurvivors` so a `failed` never inherits an
+earlier cancel's survivor list, and a lost precondition releases nothing.
+A write that could not be made *at all* is the one place these differ
+from the landings above: it found no verdict, and on every one of these paths
+codex was never launched and the supervisor is exiting, so the claim it holds is
+still its own to give back.
 
 **Dispatch records the supervisor's pid itself, at spawn time, before it returns.**
 The supervisor used to write its own, which left a window — record says `running`,
@@ -434,6 +501,26 @@ just started, so killing it is precisely how that knowledge is lost — which is
 at `kill-pending` and lets the supervisor land it. The one exception: if the
 recorded supervisor is itself provably dead, nobody can ever land it, and the
 window closes so the job is not stuck for ever.
+
+**And the window that DOES kill is fenced with the same state.** Outside both
+windows a cancel has targets, and the kill spends seconds reading the process
+table — during which the record used to go on saying `running`, which is exactly
+the precondition the supervisor's `exec-spawning` mark asks for. A supervisor
+reaching it in that gap spawns a codex the kill can no longer reach: off Windows
+it is detached, leads its own group and reparents to init the moment the
+supervisor dies, so nothing descended from the targets is left for the leftover
+sweep and the pre-kill record carries no `codexPgid` to check it by — a verified
+kill, a released role, and a billed orphan with no recorded target. So
+`kill-pending` is written **before** the kill there too. The record lock then
+totally orders the two writers: either the supervisor's mark loses its
+precondition against `kill-pending` and it aborts before spending anything, or it
+won first — and the re-read taken behind the fence sees `exec-spawning` and
+answers with the codex window instead. The kill's own `killed`/`kill-failed`
+write is unaffected, because `kill-pending` is a live state and every write in
+this seam asks only for that. The post-kill survivor check re-reads the record
+for the same reason: a pgid or a codex pid registered *during* the kill is a
+target it must look at, and a fresh read that comes back corrupt leaves the stale
+one standing rather than subtracting anything.
 
 **The record is authoritative, and it has to vouch.** `result` prints only when the
 record says `done` **and** `deliverability()` holds: this release's `recordVersion`
@@ -538,8 +625,12 @@ seam) with the unreadable table named in the record's `warning`, the role stays
 claimed, no pid file is consumed, and the caller is told to re-run once the table
 can be read; the reap of an unvouched-for job refuses the takeover instead of
 taking the role, and leaves the corrupt record and the loaded pid files exactly
-as it found them. `cancel` keeps its warning for the corrupt-record path, whose
-record may never be rewritten in the first place. Off Windows the process group is the other half
+as it found them. `cancel`'s corrupt-record branch, which may never rewrite that
+record at all, does the one thing left to it: it **does not consume the pid
+files** and exits non-zero, so the retry it asks for still has numbers to fire at.
+It used to warn and reap them anyway, which spent the only kill targets a corrupt
+job has on a sweep nothing had witnessed — and the retry then read "already
+reaped". Off Windows the process group is the other half
 of the same proof: `codexPgid` is recorded, and a group that still has members
 after the kill counts as a survivor.
 
@@ -619,6 +710,16 @@ the failure is then reported as a `kept:` line and a stderr warning, and a retry
 takes the job once whatever was sitting in it has moved. A restore that itself
 fails is reported on its own, because that is the one case where a job really has
 become unlistable.
+
+**And the put-back is a write to `job.json`, so it happens under the lock like
+every other one.** A recursive `rmSync` removes the children first — the held
+`job.json.lock` among them — and only *then* fails on the directory, so the
+restore was an unlocked write over a lock-governed file. The order is fixed
+instead: the record is removed while the lock is still held, the lock is handed
+back next (the removal is called holding it and returns it itself), and a restore
+re-acquires it through the ordinary `withRecordLock` path. A restore that cannot
+take the lock writes **nothing** and says so — a job nobody can list is
+recoverable by hand; a record two writers wrote at once is not.
 
 ## Watching a job
 
@@ -749,6 +850,17 @@ than opening nothing and claiming otherwise.
   record could not be locked and to re-run, rather than writing over somebody.
   `cancel`, `--force` and `clean` all report it. Removing the `job.json.lock`
   directory by hand is the manual cure, and it is safe once nothing is running.
+- **The staged-lock rename narrows a POSIX replace, it does not close it.**
+  `rename(2)` replaces an existing *empty* directory where Windows refuses, so
+  an acquisition could land on a lock at age zero and skip the stale-age
+  discipline — but only on a lock that is empty, and every lock this release
+  publishes already contains its holder. The one empty lock in reach is an
+  **old** release's, caught between its bare `mkdir` and its holder write. The
+  acquirer now treats the lock path merely existing as contention, which leaves
+  the check-to-rename gap and nothing wider; the precondition is POSIX plus two
+  different releases writing the same job directory at the same time, which is
+  already the record-version-mismatch domain — a mismatch a supervisor refuses
+  on sight. One runtime per jobs root is the cure, and it is the rule anyway.
 - **Windows `shell: true` quoting refuses what it cannot escape.** `codex.cmd`
   needs a shell, so `spawnCodex`/`runCodexSync` join argv into one command line
   with `cmdQuote`. Three characters cannot survive that command line and are

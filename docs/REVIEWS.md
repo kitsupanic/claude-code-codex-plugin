@@ -2,8 +2,8 @@
 
 Every constraint in the runtime traces to an entry here. The catalog records the
 production failures this design answers; the review sections record the dual
-frontier reviews of 0.3.0, 0.4.0 and 0.8.0 and the 0.7.3 full-repo review,
-whose findings became 0.4.0, 0.5.0, 0.8.0 and 0.8.1.
+frontier reviews of 0.3.0, 0.4.0, 0.8.0 and 0.8.1 and the 0.7.3 full-repo
+review, whose findings became 0.4.0, 0.5.0, 0.8.0, 0.8.1 and 0.8.2.
 
 ## The failure catalog behind the design (2026-08-05/06, all seen in production)
 
@@ -486,3 +486,73 @@ relay's wake-up chain dropped — the same dropped-notification failure that
 motivated the `out:` line in the first place, caught this time by the fallback
 it exists to provide. The contract held; the relay's polling loop is the thing
 to fix, and it lives outside this repo.
+
+### The 0.8.1 dual review (2026-08-07) — both arms wrong somewhere, and adjudication decides both ways
+
+The range `5f9f292..HEAD` — 0.7.2 through 0.8.1, the work layered on the last
+round's fixes — went to two arms again: Claude Fable 5 with fresh context and
+the suite green beside it, GPT-5.6-sol as the second opinion. Both said the
+range was substantive; each was wrong somewhere the other was right, and this
+time the errors were **symmetric**. The Claude arm pronounced the record-lock
+holder liveness "fail directions all correct" and the killJob verdict race
+"closed, not narrowed"; the Codex arm's two High findings contested exactly
+those clean bills. Adjudication — one fresh arm per contested finding, tracing
+interleavings against the source — decided both ways at once: the lock finding
+**CONFIRMED and slightly worse than claimed** (the resumed acquirer's holder
+write does not fail, it lands *inside the breaker's fresh lock*), the exec-race
+finding **PARTIAL** — real at the seam named, but tens of milliseconds wide
+rather than the whole refresh-to-kill span, because the pre-kill descendant
+sweep and the re-read loop close everything before the table snapshot. A High
+demoted to Medium with the maximal consequence intact is not a refutation; it
+is the width of the fix.
+
+- **The mkdir-then-write acquisition was the unproved-liveness break the 0.8.1
+  entry above praised the code for eliminating** — one window to the left. A
+  holderless lock past the stale age was broken on age alone, live creator or
+  not, and the creator resumed into the breaker's directory. → Staged
+  acquisition (holder inside, rename publishes), release by identity; the
+  mixed-version POSIX empty-directory replace narrowed and recorded as a
+  residual, not claimed closed.
+- **The `'none'` kill window carried no fence** — `kill-pending` was written
+  for the exec window and the empty window, and not for the one that actually
+  kills, so the record said `running` for exactly the seconds the supervisor's
+  `exec-spawning` CAS needed it to. → The mark is unconditional before
+  `killPids`; the re-read behind it defers to the one process that knows what
+  it just spawned.
+- **Converged, both arms independently: the two headline cancel/verdict tests
+  never reached the writes they pinned.** The fixed 1.5-second timer landed
+  the verdict before the first record read, so the pre-existing early-out —
+  which the unfixed runtime also passed — was the only path exercised;
+  deleting the CAS preconditions failed nothing. → Reworked around a pause at
+  the verdict write itself, plus the missing hook, and every new test in the
+  round was verified to fail against a scratch-broken guard before it counted.
+- The arms' non-contested findings all held under implementation: the
+  corrupt-record cancel spending unenumerated targets (Claude), the
+  unpreconditioned pre-launch refusals (Claude), the `kill-failed` loss
+  reported as a win (Codex), `clean`'s restore written over its own deleted
+  lock (Claude).
+
+**The round's own test pass then found the fix under the fix**: the refusal
+CAS the implementation landed used `stillCancellable`, and `kill-failed` is a
+live state — it must be, a second cancel has to be able to retry it — so the
+probe showed a refusal still overwriting a cancel's verdict and freeing its
+role, with the DESIGN sentence claiming otherwise already written. The line is
+`CANCEL_STATES`, not liveness: a cancel-authored state is the cancel's to
+resolve. And the final gate on the whole diff caught the same shape one seam
+smaller — the honour path's precondition also accepted `kill-failed`, when
+the state it honours is exactly `kill-pending` — plus the POSIX rename
+residual stated above and seven test hooks that would wait forever on
+`Atomics.wait(…, NaN)` from a typo'd env value.
+
+Twelve tests went in with the fixes (137 → 149). What held, probed by both
+arms and the adjudicators: the three verdict CASes under the record lock, the
+0.7.3 `CANCEL_STATES` gate on dispatch's post-spawn branch, the supervisor's
+exec-landing CAS and release-by-ownership, the `reclaimClaim` ownerless fence,
+the cmd.exe quoting gates, and the reaped-pid anti-target list with its
+control fixture.
+
+The operational note repeats verbatim from the round above, which is the
+point: the relay's wake-up chain dropped again, the answer sat finished in the
+`out:` file, and a nudge — any message; the relay's first act on waking is
+`result` — delivered it. The contract held twice. The relay's polling loop
+still lives outside this repo, and still needs the fix.
