@@ -786,8 +786,27 @@ const RECORD_LOCK_STAGING = '.staging-';
 // swept prefix can ever match the lock — which is one exact path.
 const RECORD_LOCK_TOMB = '.stale-';
 
-const lockHolderLine = () => `${process.pid}\n`;
-const lockTombPath = (lock) => `${lock}${RECORD_LOCK_TOMB}${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+// A PID AND A NONCE. The pid is the liveness question every reader asks (see
+// `lockHolderLives`, which parses the leading digits and nothing else); the nonce
+// is IDENTITY, and it is what `tombIsCondemned` compares. Per ACQUISITION, never
+// per process: one process acquires this lock many times in a run — cancel writes
+// twice, a supervisor a dozen times — and two of its own acquisitions must not
+// match each other, or a breaker that condemned holder text "1234" can find
+// "1234" in its tombstone and call a LATER lock of the same process the one it
+// proved dead. Sixty-four bits from the OS CSPRNG, for the same reason the mtime
+// is checked beside it: the comparison is only worth what its collision odds are.
+const lockHolderLine = () => `${process.pid} ${randomBytes(8).toString('hex')}\n`;
+// Unique per rename, and it has to be: two tombstones cut in the same
+// millisecond by the same process for two different locks that then collided
+// would put one lock's verification against another's cargo. Three independent
+// components — a per-process monotonic counter (never repeats in this process),
+// the clock (separates processes that share a pid across time), and randomness
+// (separates processes alive at once) — over the `.stale-` prefix and the pid the
+// sweep and the tests match on.
+let lockTombSeq = 0;
+const lockTombPath = (lock) =>
+  `${lock}${RECORD_LOCK_TOMB}${process.pid}-${Date.now().toString(36)}-${(++lockTombSeq).toString(36)}`
+  + `-${Math.random().toString(36).slice(2, 8)}`;
 
 // The holder file as EVIDENCE, not as a verdict: read once, so the breaker below
 // can judge and then condemn the same bytes rather than two different readings of
@@ -825,6 +844,52 @@ function lockHolderIsSelf(lock) {
   try { text = fs.readFileSync(path.join(lock, RECORD_LOCK_HOLDER), 'utf8'); } catch { return false; }
   const m = String(text).trim().match(/^(\d+)/);
   return !!m && Number(m[1]) === process.pid;
+}
+
+// A LIVE LOCK STRANDED IN A TOMBSTONE WHILE THE CANONICAL PATH STANDS FREE IS
+// ONE TERMINAL STATE BEHIND THREE DOORS, and this is the guard that closes the
+// room. A breaker crashing between its rename and its restore; a restore that
+// failed because a third writer took the path; a probe that read the tombstone
+// wrongly — all three end in the same place: somebody's live lock sitting in a
+// `.stale-*` directory, and `job.json.lock` free. Acquisition consults only the
+// canonical path, so the next writer takes it and the stranded holder is in a
+// silent double-hold: two writers under one record, which is the exact thing this
+// mechanism exists to prevent, arrived at by the mechanism itself.
+//
+// So the room is closed at the point of harm. Before staging, and before a job
+// directory is removed, the job dir is read and any tombstone whose holder is
+// ALIVE — or unreadable, fail-closed like every other reading in this seam —
+// blocks. Blocking is a refusal, never a break: the caller waits out its deadline
+// and says loudly that the lock could not be taken, which is the direction this
+// runtime always takes over writing on top of somebody.
+//
+// ONLY LIVE-OR-UNREADABLE BLOCKS, AND THE BLOCK IS THE MECHANISM — not a holding
+// pattern until some repair arrives. A tombstone whose holder is dead or absent is
+// litter awaiting the sweep, and blocking on it would wedge every acquisition in
+// the job behind a corpse nothing will ever come back for. So the wedge lasts
+// exactly as long as the stranded HOLDER'S PROCESS: while it runs, every acquirer
+// of this job is refused loudly at its own deadline (which is correct — that
+// process still believes it holds the record); when it exits, the tombstone reads
+// dead, stops blocking, and is collected by a later sweep. The one exception is a
+// tombstone whose holder file cannot be READ: it never reads as dead, so it blocks
+// until somebody repairs it by hand. That is deliberate — fail-closed, loud at
+// every deadline, and the refusal names the path to act on.
+//
+// The two repairs behind this guard are redundancy, not the cure. A stranded
+// BREAKER that survived heals itself in milliseconds by retrying its own restore
+// (see `withRecordLock`), and `sweepStaleStaging`'s restore of an aged live-holder
+// tombstone is defense-in-depth: with the guard in place the only way to reach a
+// strand this process did not cut itself is the guard-to-stage TOCTOU, the
+// three-writer microsecond race stated with the residuals.
+function liveLockTomb(dir) {
+  let names;
+  try { names = fs.readdirSync(dir); } catch { return null; }
+  for (const name of names) {
+    if (!name.startsWith(`${RECORD_LOCK}${RECORD_LOCK_TOMB}`)) continue;
+    const p = path.join(dir, name);
+    if (lockHolderLives(lockHolderEvidence(p)) === true) return p;
+  }
+  return null;
 }
 
 // Assemble out of sight, publish in one step. The rename IS the acquisition: it
@@ -885,18 +950,52 @@ function stageRecordLock(dir, lock) {
 // what this process moved is removed, and a removal interrupted halfway strands
 // an empty tombstone — never anything on a stage or a lock path.
 //
-// AND AN AGED TOMBSTONE IS NOT COLLECTED WHILE ITS HOLDER LIVES. Age alone is
-// evidence enough for a STAGING orphan — its holder never published, so nothing
+// AND AN AGED TOMBSTONE WHOSE HOLDER LIVES IS PUT BACK, NOT COLLECTED. Age alone
+// is evidence enough for a STAGING orphan — its holder never published, so nothing
 // depends on it — but a tombstone can hold a LIVE lock: a slow holder past five
 // seconds has an aged lock, a mismatch-bound breaker condemns it, and what is
 // standing in the tombstone until the restore runs is that holder's own lock,
-// carrying its own mtime. A second condemner sweeping it by age would delete a
-// live holder's lock, the one path in this whole mechanism where a live lock is
-// removed rather than stranded. So a tombstone with a live holder is a mid-flight
-// restore's cargo, not litter, and it is left alone — for the restore, or for a
-// later sweep once the holder is genuinely dead. An unreadable holder is skipped
-// too, fail-closed in the same direction as the break; an absent one is swept,
-// because a hollow tombstone is litter and nothing else.
+// carrying its own mtime. Collecting that by age would delete a live holder's
+// lock, the one path in this whole mechanism where a live lock is removed rather
+// than stranded. Leaving it alone is therefore the floor, and the sweep goes one
+// step further and RESTORES it — one `renameSync` back onto the lock path,
+// single-winner like every other move here, and a failure (the path occupied,
+// another hand faster) leaves the tombstone exactly where it was. Never a removal
+// either way.
+//
+// THIS RESTORE IS DEFENSE-IN-DEPTH, NOT THE HEAL. What makes a strand safe is the
+// acquisition guard (see `liveLockTomb`): nobody stages past a live-holder
+// tombstone, so there is no silent double-hold to race the sweep for, and the
+// strand ends when its holder's process does. The strand this restore could find
+// is one the guard let through by the guard-to-stage TOCTOU, or one cut by a
+// process that has since died — both microsecond-window states with no in-process
+// trigger path. It is kept because putting a live lock back where it belongs is
+// strictly better than leaving it in a directory nobody acquires from, not because
+// anything depends on it running.
+//
+// THE AGE GATE IS WHAT KEEPS THIS OFF A MID-FLIGHT RESTORE, mostly, and where it
+// does not the restore is the right move anyway. The gate stats the TOMBSTONE,
+// and a tombstone cut from a live successor carries that successor's own mtime —
+// fresh, because a lock's mtime is its acquisition time and is never refreshed —
+// so the ordinary ABA window (condemn, move, put back, microseconds) is excluded
+// before the holder is ever read. The exception is a successor that has itself
+// held for more than five seconds while its breaker stayed descheduled: then this
+// sweep gets there first and restores the victim's lock to the path it was taken
+// from, which is precisely what the breaker was about to do. The breaker's own
+// restore then fails with ENOENT and reads it as another hand having acted, which
+// it was.
+//
+// AND THE WINNER OF A TOMB RENAME PROVES ITS CARGO IS DEAD BEFORE REMOVING IT.
+// The holder read above and the directory removed below are two different moments
+// on two different paths, and the source-path ABA — this tombstone collected by
+// another sweeper and a new one appearing under the same name — is astronomically
+// unlikely and not zero. So the holder is re-read on the tombstone THIS process
+// won, and anything live is put back rather than removed: onto the lock path if
+// it is free, because a live lock belongs there; onto its old name if it is not,
+// because a tombstone standing where the acquisition guard reads it still holds
+// the record against every acquirer, where a deleted one holds nothing. Never
+// deleted. Like the restore above, this is a last line rather than a heal — the
+// state it catches is the source-path ABA, which nothing in-process can produce.
 function sweepStaleStaging(dir) {
   const lock = path.join(dir, RECORD_LOCK);
   let names;
@@ -907,7 +1006,15 @@ function sweepStaleStaging(dir) {
     const p = path.join(dir, name);
     try {
       if (Date.now() - fs.statSync(p).mtimeMs <= RECORD_LOCK_STALE_MS) continue;
-      if (isTomb && lockHolderLives(lockHolderEvidence(p)) === true) continue;
+      if (isTomb && lockHolderLives(lockHolderEvidence(p)) === true) {
+        try {
+          fs.renameSync(p, lock);
+          process.stderr.write(
+            `NOTE: a live record lock was stranded in ${p} and has been put back at\n`
+            + `${lock}. Its holder never lost the lock; a breaker or a sweeper died holding it.\n`);
+        } catch { /* the path is taken, or another hand was faster: leave it standing */ }
+        continue;
+      }
       const tomb = lockTombPath(lock);
       fs.renameSync(p, tomb);
       // TEST HOOK: stands in for this process dying (or being descheduled) between
@@ -915,6 +1022,16 @@ function sweepStaleStaging(dir) {
       // under test is the state visible from outside in that window: the orphan
       // gone from its own path, and nothing but a tombstone to show for it.
       sleepSync(testPauseMs('CODEX_DISPATCH_TEST_SWEEP_PAUSE_MS'));
+      if (isTomb && lockHolderLives(lockHolderEvidence(tomb)) === true) {
+        let back = null;
+        try { fs.renameSync(tomb, lock); back = lock; }
+        catch { try { fs.renameSync(tomb, p); back = p; } catch { /* left where it is */ } }
+        process.stderr.write(
+          `WARNING: the tombstone this sweep won at ${p} holds a LIVE holder's lock, which the\n`
+          + `read before the move said it did not. It was ${back ? `put back at ${back}` : `left in ${tomb}`}`
+          + ` and NOT removed.\n`);
+        continue;
+      }
       fs.rmSync(tomb, { recursive: true, force: true });
     } catch { /* held, already swept, or gone: not ours to touch */ }
   }
@@ -946,8 +1063,68 @@ function tombIsCondemned(tomb, mtimeMs, condemned) {
 
 function withRecordLock(dir, fn) {
   const lock = path.join(dir, RECORD_LOCK);
-  const deadline = Date.now() + RECORD_LOCK_WAIT_MS;
+  // MONOTONIC, BECAUSE THE WAIT BOUND IS A PROMISE THE WALL CLOCK MUST NOT BE
+  // ABLE TO BREAK. `Date.now()` is steppable — NTP, a manual set, a VM resume, a
+  // DST-adjacent correction — and a step backwards turns fifteen seconds into
+  // however long the step was, inside a loop a caller is blocked in. This
+  // deadline is compared only against readings taken in this same process, so
+  // `performance.now()` is the right clock for it; the AGES below stay on the
+  // wall clock, because a file's mtime is a wall-clock fact and nothing else can
+  // be compared with it.
+  const deadline = performance.now() + RECORD_LOCK_WAIT_MS;
+  // A tombstone this process cut, failed to put back, and has not given up on.
+  // See the restore branch below: while it stands, this process must not stage —
+  // it would be the second writer under a lock it stranded itself.
+  let stranded = null;
+  // The refusal names the tombstone, because "could not be locked; re-run" is
+  // useless advice against a live lock sitting in a directory nobody will look in.
+  const refuse = (tomb) => {
+    if (tomb) {
+      process.stderr.write(
+        `WARNING: the record lock at ${lock} could not be taken: a lock whose holder is still ALIVE\n`
+        + `— or whose holder file cannot be READ, which is treated the same — is stranded in\n`
+        + `${tomb}\n`
+        + `That holder still believes it has this record, so taking the lock path would put two writers\n`
+        + `under it; this refuses instead. The block lasts as long as that holder's PROCESS does: once\n`
+        + `it exits the tombstone reads as dead, stops blocking, and a later sweep collects it. If the\n`
+        + `holder file is UNREADABLE it can never read as dead and nothing lifts this on its own —\n`
+        + `inspect that directory and, once nothing is running under this job, remove it by hand.\n`);
+    }
+    return { locked: false };
+  };
   for (;;) {
+    // THE HEAL, AND IT IS THIS ONE: a breaker that survives its own failed restore
+    // fixes the strand in milliseconds, here, and never leaves the wait. A restore
+    // that failed because a third writer took the path can succeed a moment later,
+    // once that writer releases — so it is retried at every turn of the wait rather
+    // than abandoned to the next process that happens along. (The sweep's restore
+    // is behind the guard, for the strands whose breaker did not survive.) ENOENT
+    // means the
+    // tombstone has gone: another hand collected it or put it back, and there is
+    // nothing left to repair.
+    if (stranded) {
+      let err = null;
+      try { fs.renameSync(stranded, lock); } catch (e) { err = e; }
+      if (!err) {
+        process.stderr.write(
+          `NOTE: the lock stranded in ${stranded} was restored on retry to ${lock}.\n`);
+        stranded = null;
+      } else if (err.code === 'ENOENT') {
+        stranded = null;
+      }
+    }
+    // THE ACQUISITION GUARD (see `liveLockTomb` for the room it closes): a live
+    // holder's lock stranded in a tombstone holds the record just as much as one
+    // standing at the canonical path, and staging past it is a silent double-hold.
+    // A dead-or-absent holder's tombstone is litter and blocks nothing. This is
+    // one `readdirSync` of a small directory every 20ms of contention, which is
+    // cheaper than the state it prevents by any measure that matters.
+    const blocker = stranded || liveLockTomb(dir);
+    if (blocker) {
+      if (performance.now() >= deadline) return refuse(blocker);
+      sleepSync(20);
+      continue;
+    }
     const staged = stageRecordLock(dir, lock);
     if (staged.acquired) break;
     // Staging itself failing is this process's own problem, not contention:
@@ -968,7 +1145,7 @@ function withRecordLock(dir, fn) {
     try { const st = fs.statSync(lock); mtimeMs = st.mtimeMs; age = Date.now() - st.mtimeMs; }
     catch (err) { vanished = !!err && err.code === 'ENOENT'; }
     if (vanished) {
-      if (Date.now() >= deadline) return { locked: false };
+      if (performance.now() >= deadline) return refuse(null);
       continue;
     }
     // The holder is read ONCE, and what is read is kept: the verdict below and the
@@ -1017,11 +1194,20 @@ function withRecordLock(dir, fn) {
       if (broke) {
         // Gone already: a sweeper collected what we condemned, which is the same
         // outcome by another hand. Nothing to prove and nothing to remove — and
-        // silence is right by construction now that the sweep skips a tombstone
-        // whose holder is alive: what a sweeper can collect out from under this
-        // verification is a tombstone whose holder was dead or absent, which is
+        // silence is right by construction, because a sweep that collects rather
+        // than restores has itself proved the holder dead or absent, which is
         // exactly what this break condemned it for.
-        if (!fs.existsSync(tomb)) continue;
+        //
+        // ENOENT ALONE IS "GONE", the same discipline the holder read follows.
+        // `existsSync` answers false for a directory that is THERE and could not
+        // be statted (EPERM, EBUSY, an ACL, a cloud filter), and reading that as
+        // collected would skip the verification below and leave whatever is in
+        // the tombstone unexamined. Unproven is present: anything but ENOENT
+        // falls through to `tombIsCondemned`, whose own fail-closed answer (no
+        // proof, no removal) then takes over.
+        let tombGone = false;
+        try { fs.statSync(tomb); } catch (err) { tombGone = !!err && err.code === 'ENOENT'; }
+        if (tombGone) continue;
         if (tombIsCondemned(tomb, mtimeMs, condemned)) {
           try { fs.rmSync(tomb, { recursive: true, force: true }); } catch { /* a tombstone; harmless */ }
           continue;
@@ -1033,37 +1219,59 @@ function withRecordLock(dir, fn) {
         // third writer publishing into it makes the restore fail and strands the
         // victim's lock in the tombstone, where it is left to be inspected rather
         // than deleted. It is not treated as a won break either way.
-        let restored = true;
-        try { fs.renameSync(tomb, lock); } catch { restored = false; }
-        // A FAILED RESTORE HAS TWO CAUSES AND THEY ARE NOT THE SAME NEWS. The loud
-        // one is the lock path being occupied — a third writer published into the
-        // microseconds the restore needed — and then somebody's lock really is
-        // stranded in a tombstone and its holder really has lost mutual exclusion.
-        // The other is the TOMBSTONE having gone: a concurrent sweeper collected it
-        // mid-verification, and warning about a directory to inspect that no longer
-        // exists is a false alarm. It is also the calmer truth, because the sweep
-        // will not collect a tombstone whose holder is alive: one it did collect
-        // held a dead or absent holder, which is what this break condemned.
-        if (restored) {
+        // THE RESTORE'S OWN ERRNO IS THE EVIDENCE, not a second probe. Asking
+        // `existsSync(tomb)` afterwards asks a different question at a later
+        // moment, and on Windows it cannot tell the two failures apart anyway:
+        // both a target that is occupied and a source that is pinned come back
+        // EPERM, and either can look present. So the rename's own error decides.
+        // ENOENT is the source having gone — another hand had the tombstone —
+        // and everything else is a move that failed with the tombstone still
+        // there, which is the loud case.
+        // TEST HOOK: stands in for this process being descheduled between moving a
+        // successor into its tombstone and putting it back — the window in which a
+        // third writer can take the freed lock path and make the restore fail. What
+        // is under test is the retry: the tombstone stays in hand, nothing stages
+        // past it, and the restore lands once the path comes free again. A window of
+        // a chosen length there is not producible on demand.
+        sleepSync(testPauseMs('CODEX_DISPATCH_TEST_RESTORE_PAUSE_MS'));
+        let restoreErr = null;
+        try { fs.renameSync(tomb, lock); } catch (err) { restoreErr = err; }
+        if (!restoreErr) {
           process.stderr.write(
             `WARNING: the record lock at ${lock} changed hands between the decision to break it as\n`
             + `stale and the break itself. The successor was moved back and NOT removed.\n`);
-        } else if (!fs.existsSync(tomb)) {
+        } else if (restoreErr.code === 'ENOENT') {
+          // THE CALM ONE, AND IT NO LONGER CLAIMS THE HOLDER WAS DEAD. A sweeper
+          // that COLLECTS a tombstone has proved that (it restores a live one
+          // instead), but a sweeper that RESTORED this one to the lock path is
+          // now the other way the tombstone can vanish from under this
+          // verification — and that one's holder was alive. Both end the same
+          // way for this process: it moved nothing, removed nothing, and what
+          // stands at the lock path is the other hand's business.
           process.stderr.write(
             `WARNING: the record lock at ${lock} changed hands between the decision to break it as\n`
-            + `stale and the break itself, and the condemned tombstone was collected by a concurrent\n`
-            + `sweeper before it could be put back. Its holder was dead or absent — nothing live was\n`
-            + `removed — and the lock path is free for the next acquirer.\n`);
+            + `stale and the break itself, and the condemned tombstone was gone before it could be put\n`
+            + `back — collected by a sweeper that proved its holder dead, or put back on the lock path\n`
+            + `by one that found it alive. Nothing was removed here.\n`);
         } else {
+          // A live lock stranded in a tombstone while the lock path stands free
+          // (or is somebody else's) — the state `liveLockTomb` refuses to stage
+          // past. It is kept in hand: the loop retries the restore at every turn,
+          // and until it lands this process will not take the lock either.
+          let taken = true;
+          try { fs.statSync(lock); } catch (err) { taken = !(err && err.code === 'ENOENT'); }
+          stranded = tomb;
           process.stderr.write(
             `WARNING: the record lock at ${lock} changed hands between the decision to break it as\n`
-            + `stale and the break itself, and it could not be moved back — another writer took the\n`
-            + `path first. It is left in ${tomb} rather than removed, so it can be inspected. Its\n`
-            + `holder has lost mutual exclusion: stop what is writing this job before touching it.\n`);
+            + `stale and the break itself, and it could not be moved back (${clean(restoreErr.code || restoreErr.message)}`
+            + ` — ${taken ? 'another writer took the path first' : 'the path is free, so this is not contention'}).\n`
+            + `It is left in ${tomb} rather than removed, so it can be inspected, and the restore is\n`
+            + `retried until this writer gives up. Its holder has lost mutual exclusion: stop what is\n`
+            + `writing this job before touching it.\n`);
         }
       }
     }
-    if (Date.now() >= deadline) return { locked: false };
+    if (performance.now() >= deadline) return refuse(stranded);
     sleepSync(20);
   }
   try { return { locked: true, value: fn() }; }
@@ -2513,13 +2721,15 @@ const WORKER_POLL_MS = 200;
 
 function resolveWorkerPids(wrapperPid, { timeoutMs = WORKER_RESOLVE_MS } = {}) {
   if (!isPid(wrapperPid)) return [];
-  const deadline = Date.now() + timeoutMs;
+  // Monotonic, like every other in-process wait bound here: a wall-clock step
+  // must not be able to shorten or extend a poll a caller is blocked in.
+  const deadline = performance.now() + timeoutMs;
   for (;;) {
     const table = processTable();
     const kin = livingDescendantsOf([wrapperPid], table);
     if (kin && kin.length) return kin;
     if (!pidAlive(wrapperPid)) return kin || [];
-    if (Date.now() >= deadline) return kin || [];
+    if (performance.now() >= deadline) return kin || [];
     sleepSync(WORKER_POLL_MS);
   }
 }
@@ -2536,9 +2746,9 @@ function groupAlive(pgid) {
 // "process not found" and failure for children it already reaped with the tree),
 // so the kill is verified by asking the OS afterwards, not by trusting the tool.
 function waitGone(pids, ms = KILL_VERIFY_MS) {
-  const deadline = Date.now() + ms;
+  const deadline = performance.now() + ms;
   let alive = pids.filter(pidAlive);
-  while (alive.length && Date.now() < deadline) {
+  while (alive.length && performance.now() < deadline) {
     sleepSync(50);
     alive = alive.filter(pidAlive);
   }
@@ -4811,7 +5021,22 @@ function cmdClean(opts) {
 // the ordinary path. A restore that cannot take the lock writes NOTHING and says
 // so — an unlistable job is recoverable by hand, an unlocked write over a record
 // another writer is holding is not.
+// AND A STRANDED LIVE LOCK IS NOT LITTER TO SWEEP UP WITH THE JOB. The loop
+// below removes everything but the record and the lock, tombstones included —
+// and a `.stale-*` tombstone can hold a LIVE holder's lock (see `liveLockTomb`),
+// so removing it blind is the one deletion of a live lock this runtime would
+// perform, by way of the verb that is supposed to be tidying up. The whole job
+// is refused instead, loudly and by job, which the caller already handles: one
+// stuck job does not end a clean run, it lists, and a later clean takes it once
+// whatever is holding that lock is gone. A dead-or-absent holder's tombstone
+// goes with the job as before.
 function removeJobDir(dir) {
+  const live = liveLockTomb(dir);
+  if (live) {
+    throw new Error(
+      `a record lock whose holder is still alive is stranded in ${path.basename(live)}`
+      + ' — removing this job would delete a live lock');
+  }
   for (const name of fs.readdirSync(dir)) {
     if (name === 'job.json' || name === RECORD_LOCK) continue;
     fs.rmSync(path.join(dir, name), { recursive: true, force: true });

@@ -3,8 +3,8 @@
 Every constraint in the runtime traces to an entry here. The catalog records the
 production failures this design answers; the review sections record the dual
 frontier reviews of 0.3.0, 0.4.0, 0.8.0 and 0.8.1, the 0.7.3 full-repo
-review, and the 0.8.2 single-seam review, whose findings became 0.4.0,
-0.5.0, 0.8.0, 0.8.1, 0.8.2 and 0.8.3.
+review, and the 0.8.2 and 0.8.3 single-seam reviews, whose findings became
+0.4.0, 0.5.0, 0.8.0, 0.8.1, 0.8.2, 0.8.3 and 0.8.4.
 
 ## The failure catalog behind the design (2026-08-05/06, all seen in production)
 
@@ -634,3 +634,61 @@ inability to construct the lock path. The lesson this round adds to the
 catalog: a seam reviewed and fixed is not a seam proved — 0.8.2's staged
 acquisition was correct, and the two-writer window it closed was still open
 two syscalls to the right, in the break that guards it.
+
+### The 0.8.3 single-seam review (2026-08-07/08) — six findings, six adjudications, one room
+
+The second dispatch under the caller-owned watch went back to the same seam
+one release later: 0.8.3's identity-bound break protocol, with the guards it
+had just gained named in the brief and an unrestricted adversarial model —
+any interleaving, crashes at every syscall boundary, hostile clocks, pid
+reuse, single-operation filter-driver faults. GPT-5.6-sol answered that the
+documented residuals were not complete, and produced six findings, four
+rated High. All six were adjudicated, one arm each: **five CONFIRMED, one
+PARTIAL** — and the two Highs that survived intact were both confirmed by
+measurement on the development machine, not by argument. The recalibrations
+cut the other way too: the fingerprint-collision finding's probability story
+was refuted outright (an mtime collision across the 5-second age gate is
+impossible without a ≥5s backward clock step — the finding is the hostile
+clock wearing three extra coincidences), and the sweep's source-path ABA
+was priced at roughly twelve orders of magnitude below its sibling.
+
+What the adjudications converged on was not six defects but one state: **a
+live lock stranded in a `.stale-` tombstone while the canonical path stands
+free.** Three of the six findings — a breaker crashing after its rename, an
+existence probe that reads any error as absence, a transient restore
+failure that nothing remembers — were three doors into that one room, and
+acquisition, which consulted only the canonical path, would then complete a
+silent double-hold whose colliding generation numbers left no forensic
+trace at all. Reproduced: a real `cancel` acquired past a hand-built strand
+in eighty milliseconds with empty stderr. Measured: both restore-failure
+causes are EPERM on Windows (target occupied and source pinned are
+indistinguishable by errno), and Defender's on-access scan is summoned by
+the break rename itself — the code's own filesystem event invites the
+interference that pins its next syscall. Demonstrated: `existsSync` returns
+false for an existing directory whose attributes cannot be read.
+
+→ 0.8.4 closes the room at the point of harm rather than patching doors:
+no writer stages while a tombstone holds a live-or-unreadable holder (the
+guard is the mechanism, and its costs are stated in the residuals rather
+than implied away — the wedge lasts the stranded holder's process lifetime,
+loud at every deadline); a surviving breaker retries its own restore before
+it may stage and heals in milliseconds; the sweep restores what it used to
+skip and verifies after winning, both as defense-in-depth behind the guard;
+ENOENT alone is absence at every observation in the seam, and the restore's
+diagnosis rests on its own captured errno instead of a second racing probe;
+the holder line carries a per-acquisition nonce, so condemnation compares
+identity rather than a fingerprint; and the wait bound moved to a monotonic
+clock, because a promise the wall clock can break is not a bound. Five
+tests went in (154 → 159), the room-closure test's scratch-broken control
+reproducing the pre-fix silent double-hold in sixty milliseconds.
+
+The round's lesson for the catalog is the reviewer's asymmetry: the arm
+that wrote 0.8.3 probed the break it had just built and pronounced the
+residuals complete; the outside arm, handed the same guards by name, went
+looking for the state the guards left standing rather than the operations
+they fixed. A seam's own author checks its moves; the adversary checks its
+rooms. And the pre-commit gate found the last word anyway — the fix's own
+prose still told the previous design's healing story, promising a sweep
+that the new guard makes unreachable in exactly the states that trigger
+it. The destroyer must prove what it destroys; the healer must admit what
+it heals.

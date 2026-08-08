@@ -4116,7 +4116,10 @@ test('a record lock that changed hands is not removed by the writer that finishe
     assert.ok(await poll(() => fs.existsSync(holder), 20000),
       'the cancel must be holding the lock before it is taken from it');
     const mine = `${process.pid}\n`;
-    assert.notEqual(fs.readFileSync(holder, 'utf8').trim(), String(process.pid),
+    // The PID, not the whole line: a holder is `pid nonce` now (see the holder-line
+    // test below), so comparing the trimmed line against a bare pid could never
+    // match and the check stopped discriminating anything the day the nonce landed.
+    assert.notEqual(fs.readFileSync(holder, 'utf8').trim().split(' ')[0], String(process.pid),
       'the lock it took names ITS pid — otherwise this test proves nothing');
     fs.writeFileSync(holder, mine);
 
@@ -4398,6 +4401,251 @@ test('a sweep interrupted after its rename strands a tombstone, never a hollowed
   } finally {
     child.kill('SIGKILL');
     fs.rmSync(lock, { recursive: true, force: true });
+  }
+});
+
+// A holder line as this release writes one: a pid, a space, sixteen hex digits.
+// Fabricated tombstones carry the same shape as the real thing, so a reader that
+// only ever coped with a bare pid would be caught by the fixtures too.
+const holderText = (pid, nonce = '0123456789abcdef') => `${pid} ${nonce}`;
+
+test('a live lock stranded in a tombstone is not staged past: the room is closed', async () => {
+  // THE CRASH-STRAND, fabricated as the state itself rather than raced into: the
+  // canonical lock path stands FREE and a live holder's lock is sitting in a
+  // `.stale-*` tombstone, which is where a breaker that died between its rename
+  // and its restore leaves it. Acquisition consults one path, so before the guard
+  // the next writer simply took the free one and the stranded holder was in a
+  // silent double-hold — two writers under one record, arrived at by the very
+  // mechanism that exists to prevent them.
+  //
+  // The holder named is this test runner, so it cannot die out from under the
+  // assertions; the tombstone is aged past the stale age so that nothing about
+  // this depends on the sweep being slow.
+  const id = 'lockstrand-1-99966';
+  const dir = lockJob(id, 'lockstrand');
+  const tomb = aged(lockLike(path.join(dir, 'job.json.lock.stale-424242-strand'),
+    holderText(process.pid)));
+  const lock = lockPathOf(dir);
+  try {
+    const t0 = Date.now();
+    const c = run(['cancel', id]);
+    // Non-vacuity (observed): with `liveLockTomb` forced to return null AND the
+    // sweep's restore branch reverted to `continue`, this cancel takes the free
+    // lock path in 80ms, says nothing at all, and writes `kill-pending` under a
+    // record a live holder still believes it owns — every assertion below fails
+    // except the ones about the tombstone's bytes, which survive because nothing
+    // in that shape looks at it.
+    assert.notEqual(c.status, 0, 'a lock held in a tombstone is still held');
+    assert.match(c.stderr, /KILL NOT RECORDED/);
+    assert.match(c.stderr, /could not be taken: a lock whose holder is still ALIVE/,
+      'the refusal is loud, and it is a refusal rather than a break');
+    assert.ok(c.stderr.includes(tomb),
+      'and it names the tombstone: "re-run in a moment" is useless advice against this state');
+    assert.ok(Date.now() - t0 > 10000,
+      'it waited its whole deadline out rather than staging past the strand');
+    assert.equal(record(id).state, 'running', 'nothing was written under a lock never taken');
+    assert.equal(fs.existsSync(lock), false,
+      'and the lock path is left exactly as free as it was found: this refuses, it does not repair');
+    assert.equal(fs.readFileSync(holderOf(tomb), 'utf8'), `${holderText(process.pid)}\n`,
+      "the stranded lock's cargo survives byte for byte — nothing here is deleted");
+  } finally {
+    fs.rmSync(tomb, { recursive: true, force: true });
+  }
+});
+
+test('a tombstone whose holder is DEAD blocks nothing', () => {
+  // The other half of the same guard, and the half that keeps it from being a
+  // wedge: a tombstone with a dead holder is litter awaiting the sweep, and
+  // blocking on it would put every acquisition in the job behind a corpse nobody
+  // is ever coming back for. Same fabrication as the test above, one pid apart.
+  const id = 'lockdead-1-99967';
+  const dir = lockJob(id, 'lockdead', {
+    started: new Date(Date.now() - 3600000).toISOString(), launch: 'exec',
+  });
+  const tomb = aged(lockLike(path.join(dir, 'job.json.lock.stale-424242-corpse'),
+    holderText(DEAD_PID)));
+  const t0 = Date.now();
+  const c = run(['cancel', id]);
+  // Non-vacuity (observed): with `liveLockTomb`'s liveness test widened to block
+  // on any tombstone at all, this cancel waits out fifteen seconds and records
+  // nothing — the timing assertion and the state assertion both fail.
+  assert.equal(c.status, 0, `a dead holder's tombstone must not wedge the job: ${c.stderr}`);
+  assert.ok(Date.now() - t0 < 12000, 'and it must not wait a deadline out for a corpse');
+  assert.equal(record(id).state, 'killed', 'the write went through the lock it took at once');
+  assert.equal(/could not be taken/.test(c.stderr), false,
+    'nothing is refused: there is no live holder anywhere in this job');
+  assert.equal(fs.existsSync(lockPathOf(dir)), false, 'and the lock it took is released behind it');
+});
+
+test('a restore that lost the path is retried, and lands when the path comes free', async () => {
+  // THE OTHER REPAIR (the sweep is one; this is the breaker's own). A breaker that
+  // condemns a lock, finds a live successor in its tombstone and cannot put it
+  // back — a third writer took the freed path in between — used to abandon it:
+  // the successor stayed stranded and the next acquirer staged past it. Now the
+  // tombstone is kept in hand, retried at every turn of the wait, and until it
+  // lands this process refuses to stage either.
+  //
+  // Both windows are posed rather than raced. The break pause holds the breaker
+  // between condemning and moving, where this test plays breaker B and publishes
+  // the live successor L1; the restore pause holds it between moving and putting
+  // back, where this test plays the third writer C and takes the path with L2.
+  // Then C releases, and what must follow is the restore landing.
+  const id = 'lockretry-1-99968';
+  const dir = lockJob(id, 'lockretry');
+  const lock = lockPathOf(dir);
+  const l0 = aged(lockLike(lock, DEAD_PID));
+  const orphan = aged(lockLike(path.join(dir, 'job.json.lock.staging-424242-abcdef'), process.pid));
+  const child = spawn(process.execPath, [RUNTIME, 'cancel', id], {
+    env: {
+      ...baseEnv,
+      CODEX_DISPATCH_TEST_BREAK_PAUSE_MS: '5000',
+      CODEX_DISPATCH_TEST_RESTORE_PAUSE_MS: '4000',
+    },
+    cwd: REPO,
+  });
+  let stdout = '', stderr = '';
+  child.stdout.on('data', (d) => { stdout += d; });
+  child.stderr.on('data', (d) => { stderr += d; });
+  const closed = new Promise((r) => child.on('close', r));
+  try {
+    // The aged staging orphan is the signal, exactly as in the ABA test: the sweep
+    // runs immediately before the break pause, so its disappearance means the lock
+    // has been condemned and not yet moved.
+    assert.ok(await poll(() => !fs.existsSync(orphan), 20000),
+      'the cancel must have condemned the lock and be waiting to move it');
+    fs.renameSync(l0, path.join(dir, 'l0-taken-by-b'));
+    const mine = `${holderText(process.pid, 'deadbeefdeadbeef')}\n`;
+    const stage = lockLike(path.join(dir, 'b-stage'), holderText(process.pid, 'deadbeefdeadbeef'));
+    fs.renameSync(stage, lock);
+
+    // The breaker now moves L1 into its tombstone and pauses before putting it
+    // back. Writer C takes the freed path in that window.
+    assert.ok(await poll(() => tombsIn(dir).length === 1 && !fs.existsSync(lock), 20000, 20),
+      'mid-break: the successor is in a tombstone and the lock path stands free');
+    const c2 = lockLike(path.join(dir, 'c-stage'), holderText(process.pid, 'cccccccccccccccc'));
+    fs.renameSync(c2, lock);
+
+    assert.ok(await poll(() => /could not be moved back/.test(stderr), 20000, 20),
+      'the restore fails against an occupied path, and says so');
+    assert.match(stderr, /could not be moved back \((EPERM|EACCES|ENOTEMPTY|EEXIST)/,
+      "the rename's own errno is the evidence, and it is not the calm ENOENT branch");
+    assert.match(stderr, /It is left in .*job\.json\.lock\.stale-/,
+      'and the tombstone it is left in is named, because that is where somebody has to look');
+    assert.match(stderr, /retried until this writer gives up/);
+
+    // C releases. Non-vacuity (observed): with the `stranded` retry block deleted
+    // from the top of the wait loop, no NOTE ever arrives, the tombstone is still
+    // standing when the cancel gives up, and the lock path is left empty — the
+    // stranded state this whole pass exists to end.
+    fs.rmSync(lock, { recursive: true, force: true });
+    assert.ok(await poll(() => /restored on retry/.test(stderr), 20000, 20),
+      'the restore is retried once the path comes free, and lands');
+
+    const code = await closed;
+    assert.equal(fs.existsSync(lock), true, 'L1 is back where its holder left it');
+    assert.equal(fs.readFileSync(holderOf(lock), 'utf8'), mine,
+      'byte for byte: a mismatched tombstone is somebody\'s lock, not a tombstone');
+    assert.deepEqual(tombsIn(dir), [], 'and nothing is stranded behind it');
+    assert.notEqual(code, 0, 'the breaker itself never acquired: it refuses loudly instead');
+    assert.match(stderr, /KILL NOT RECORDED/);
+    assert.equal(record(id).state, 'running', 'a failed break is not an acquisition');
+    assert.equal(/^killed:/m.test(stdout), false, 'and it claims nothing it did not do');
+  } finally {
+    child.kill('SIGKILL');
+    fs.rmSync(lock, { recursive: true, force: true });
+  }
+});
+
+test('a holder line is a pid AND a nonce, minted per ACQUISITION', async () => {
+  // IDENTITY, NOT JUST LIVENESS. `tombIsCondemned` compares holder bytes to decide
+  // whether the directory it is about to delete is the one it condemned, and a
+  // holder that was only a pid made that comparison blind to the one case it is
+  // for: a process acquires this lock many times in a run — this cancel does it
+  // twice — so a breaker that condemned "1234" could find "1234" in its tombstone
+  // and delete a LATER lock of the same process as the one it proved dead.
+  //
+  // The two acquisitions are the cancel's own: the kill-pending fence and the
+  // verdict, each held open by the record pause long enough to be read from here.
+  const id = 'locknonce-1-99969';
+  const dir = lockJob(id, 'locknonce', {
+    started: new Date(Date.now() - 3600000).toISOString(), launch: 'exec',
+  });
+  const holder = holderOf(lockPathOf(dir));
+  const c = cancelling(id, { CODEX_DISPATCH_TEST_RECORD_PAUSE_MS: '2500' });
+  const seen = new Set();
+  const sampler = setInterval(() => {
+    try { seen.add(fs.readFileSync(holder, 'utf8')); } catch { /* between acquisitions */ }
+  }, 20);
+  let done;
+  try { done = await c; } finally { clearInterval(sampler); }
+  assert.equal(done.code, 0, done.stderr);
+
+  const lines = [...seen];
+  // Non-vacuity (observed): with `lockHolderLine` reverted to `${process.pid}\n`,
+  // the format assertion fails on the first line and the two acquisitions collapse
+  // to one identical string, which the count assertion catches.
+  assert.ok(lines.length >= 2,
+    `the cancel writes under the lock twice; saw ${lines.length} distinct holder line(s)`);
+  for (const line of lines) {
+    assert.match(line, /^\d+ [0-9a-f]{16}\n$/,
+      'a holder is a pid the liveness check parses and a nonce the identity check compares');
+  }
+  const pids = new Set(lines.map((l) => l.split(' ')[0]));
+  assert.equal(pids.size, 1, 'one process took both locks — the pid half is the same');
+  assert.equal(new Set(lines.map((l) => l.split(' ')[1])).size, lines.length,
+    'and the nonce half is not: two acquisitions of one process must never match each other');
+});
+
+test('a clean refuses a job whose directory holds a live stranded lock', async () => {
+  // `removeJobDir` deletes everything but the record and the lock — tombstones
+  // included — so a `.stale-*` directory holding a LIVE holder's lock made the
+  // tidying-up verb the one place in this runtime that deletes a live lock. The
+  // job is refused instead, by job and loudly: one stuck job does not end the run,
+  // it still lists, and a later clean takes it once the strand is gone.
+  const room = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-dispatch-strand-'));
+  const env = { CODEX_DISPATCH_JOBS: room };
+  const finished = (id) => ({
+    recordVersion: RECORD_VERSION, id, role: 'cleanstrand', state: 'done', exitCode: 0,
+    sight: 'cwd-file:LICENSE', started: new Date(Date.now() - 10 * 86400000).toISOString(),
+    finished: new Date(Date.now() - 9 * 86400000).toISOString(),
+  });
+  const plant = (id, holderPid) => {
+    const dir = path.join(room, id);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify(finished(id)));
+    fs.writeFileSync(path.join(dir, 'out.txt'), 'answer\n');
+    aged(lockLike(path.join(dir, 'job.json.lock.stale-424242-strand'), holderText(holderPid)));
+    return dir;
+  };
+  try {
+    const liveId = 'cleanstrand-1-99970';
+    const liveDir = plant(liveId, process.pid);
+    const stuck = run(['clean', '--all'], env);
+    // Non-vacuity (observed): with `liveLockTomb` forced to return null, this clean
+    // removes the whole job — the live holder's lock deleted out from under it —
+    // and every assertion below fails.
+    assert.equal(stuck.status, 0, `one refused job does not end the run: ${stuck.stderr}`);
+    assert.match(stuck.stdout, new RegExp(`${liveId}\\s+its record could not be locked — not removed`),
+      'the job is kept, and the reason given is the lock it could not take');
+    assert.match(stuck.stderr, /could not be taken: a lock whose holder is still ALIVE/,
+      'and the strand is named on stderr, not swallowed into a one-line "kept"');
+    assert.equal(fs.existsSync(path.join(liveDir, 'job.json')), true,
+      'the record is untouched, so the job still lists and a later clean can take it');
+    assert.match(run(['list'], env).stdout, new RegExp(`^${liveId}  done`, 'm'));
+    assert.equal(fs.existsSync(path.join(liveDir, 'job.json.lock.stale-424242-strand')), true,
+      'and the live lock is exactly where it was: this verb removes nothing it cannot prove dead');
+
+    // And the contrast, in a room of its own so the two cannot be confused: a
+    // tombstone whose holder is dead goes with the job, as it always did.
+    fs.rmSync(liveDir, { recursive: true, force: true });
+    const deadId = 'cleanstrand-1-99971';
+    const deadDir = plant(deadId, DEAD_PID);
+    const swept = run(['clean', '--all'], env);
+    assert.equal(swept.status, 0, swept.stderr);
+    assert.match(swept.stdout, new RegExp(`^removed: ${deadId}$`, 'm'));
+    assert.equal(fs.existsSync(deadDir), false, "a dead holder's tombstone is litter, and goes");
+  } finally {
+    fs.rmSync(room, { recursive: true, force: true });
   }
 });
 

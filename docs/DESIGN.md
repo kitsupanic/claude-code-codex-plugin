@@ -373,6 +373,52 @@ dies between its rename and its removal would otherwise leak one for ever, while
 a tombstone holding a *live* lock (a slow holder condemned for its age, waiting
 on a restore) must not be collected at all. Both suffixes are strictly longer
 than the lock's name, so nothing the sweep matches can ever be the lock itself.
+And what the sweep does with that live-holder tombstone is **put it back**: one
+rename onto the lock path, which is single-winner like every other move here and
+leaves the tombstone untouched when it fails. Leaving it standing was only half a
+fix, for the reason the next paragraph is about. The age gate keeps this off the
+ordinary mid-flight restore — a tombstone cut from a live successor carries that
+successor's own fresh mtime, and a lock's mtime is its acquisition time and is
+never refreshed — and where a successor really has held for more than five
+seconds, restoring it is what its breaker was about to do anyway. The sweep also
+**re-reads the holder of the tombstone it won** before removing anything: winning
+a rename proves what is in it now, not what was in it when the decision was taken,
+and anything found alive is put back (on the lock path, or under its old name if
+that path is occupied) rather than deleted.
+
+**A live lock stranded in a tombstone while the lock path stands free is one
+terminal state behind three doors, and acquisition refuses past it.** A breaker
+that crashes between its rename and its restore, a restore that failed because a
+third writer took the path, an existence probe that read the tombstone wrongly —
+all three end in the same place: somebody's live lock in a `.stale-*` directory,
+and `job.json.lock` free. Acquisition consulted only the canonical path, so the
+next writer took it and the stranded holder was in a **silent double-hold**: two
+writers under one record, arrived at by the mechanism that exists to prevent
+exactly that. So the job directory is read before staging, and a tombstone whose
+holder is alive — or unreadable, fail-closed like every other reading in this
+seam — blocks acquisition, which turns into the ordinary loud refusal at the
+deadline, naming the tombstone. A tombstone whose holder is *dead or absent* never
+blocks: it is litter awaiting the sweep, and waiting on a corpse would wedge the
+job. **The block is the mechanism, and it lasts exactly as long as the stranded
+holder's process** — while that process runs, every acquirer of the job is refused
+loudly at its own deadline, which is correct, because that process still believes
+it holds the record; when it exits, the tombstone reads dead, stops blocking and is
+collected by a later sweep. The one repair that heals rather than backstops is the
+breaker's own: a breaker whose restore failed keeps the tombstone in hand and
+**retries the rename at every turn of its wait**, taking no lock itself until it
+lands, so a strand whose breaker survived is gone in milliseconds. The sweep's
+restore (above) and `removeJobDir`'s inner refusal sit *behind* the guard —
+defense-in-depth for states nothing in-process can reach except the guard-to-stage
+TOCTOU. `clean` refuses a
+job directory holding such a tombstone for the same reason, per job, the way it
+refuses any directory it cannot finish removing.
+
+**The wait bounds are monotonic.** The lock's fifteen seconds, the worker-resolve
+poll and the kill verification all measure with `performance.now()`: they are
+compared only against readings taken in the same process, and a wall-clock step —
+NTP, a manual set, a VM resume — must not be able to shorten or extend a wait a
+caller is blocked in. Ages, grace windows and timestamps stay on the wall clock,
+because an mtime is a wall-clock fact and nothing else can be compared with one.
 
 Release is **by identity, not by path**. `rmSync` on the lock path removes
 whatever is there, and after a legitimate stale break that is somebody else's
@@ -381,8 +427,13 @@ believes it holds. So a releaser reads the holder file back and removes the lock
 only while it still names its own pid; a lock that has changed hands is left
 exactly where it is, for its own holder to release or to age out.
 
-**A pid and nothing else**, which is a decision rather than an omission. The
-start time could go beside it, as it does for every kill target — but reading it
+**A pid and a nonce, and no start time** — which is a decision rather than an
+omission. The nonce is identity: sixty-four random bits written fresh on every
+acquisition (never per process — one process locks the same record many times in
+a run, and two of its own acquisitions must not match each other), so the holder
+text a breaker condemned identifies *that* lock rather than merely that pid's
+locks. Liveness readers parse the leading digits and ignore the rest.
+The start time could go beside it, as it does for every kill target — but reading it
 is a synchronous PowerShell spawn, so paid lazily it lands *inside* the critical
 section this exists to protect and paid eagerly it lands on the first record
 write of every process; and the direction is wrong twice over. Start-time
@@ -880,8 +931,9 @@ than opening nothing and claiming otherwise.
   the first is a second thing to be wrong, and the record is where identity is
   written down. Stated here rather than implied away.
 - **A record lock whose holder died and whose pid was instantly reissued is not
-  broken until that impostor exits.** The holder file carries a pid and no start
-  time (the reasoning is under the write lock above), so a number that is alive
+  broken until that impostor exits.** The holder file carries a pid and a
+  per-acquisition nonce, and no start time (the reasoning is under the write lock
+  above) — the nonce is identity, not liveness — so a number that is alive
   reads as a holder that is alive. The window is small — the lock is held for
   milliseconds, and the holder has to die inside it — and the consequence is the
   safe one: every writer waits its fifteen seconds and then REFUSES, saying the
@@ -900,25 +952,65 @@ than opening nothing and claiming otherwise.
   already the record-version-mismatch domain — a mismatch a supervisor refuses
   on sight. One runtime per jobs root is the cure, and it is the rule anyway.
 - **A break that moved a live successor puts it back, and the put-back can
-  lose.** The stale break is bound to the condemned lock's identity, so a breaker
-  that finds a successor in its tombstone renames it back to the lock path rather
-  than removing it — but the path stands empty for the microseconds in between,
-  and a third writer publishing into that gap makes the restore fail. The victim's
-  lock is then stranded in the tombstone: it is **left there rather than removed**,
-  so it can be inspected, and the breaker says so loudly on stderr, naming the
-  tombstone and warning that the victim has lost mutual exclusion. That stranded
-  tombstone is swept once it ages past the stale mark *and* its holder is no
-  longer alive: the sweep skips an aged tombstone whose holder file names a live
-  pid, because such a tombstone is a mid-flight restore's cargo — a live holder's
-  own lock — and collecting it by age would be the one place in this mechanism
-  where a live lock is deleted rather than stranded. The residual is two ways of
-  reading a holder wrongly, and both fall toward leaving the tombstone, which is
-  the safe direction: a sweep that lands on the exact instant of the holder's
-  death (and an unreadable holder file, which is skipped fail-closed) leaves a
-  tombstone standing until the next sweep, and pid reuse makes a dead holder look
-  alive and leaves it standing for as long as the impostor runs. The precondition
-  for the stranding itself is three writers on one job directory inside one
-  microsecond window, against a lock that was already dead enough to condemn.
+  lose — but a lost put-back is no longer a hole anybody can fall into.** The
+  stale break is bound to the condemned lock's identity, so a breaker that finds
+  a successor in its tombstone renames it back to the lock path rather than
+  removing it; the path stands empty for the microseconds in between, and a third
+  writer publishing into that gap makes the restore fail. The victim's lock is
+  then stranded in the tombstone: **left there rather than removed**, so it can be
+  inspected, and the breaker says so loudly on stderr, naming the tombstone. What
+  changed is what happens next. Nobody acquires past it — a `.stale-*` tombstone
+  whose holder is live or unreadable blocks staging and turns into the loud
+  refusal at the deadline — and `clean` refuses to remove a job directory holding
+  one. The breaker retries its restore at every turn of its own wait, so a strand
+  whose breaker survived is repaired in milliseconds; a strand whose breaker did
+  not survive is **held safe by the guard until its stranded holder's process
+  exits**, at which point the tombstone is dead litter and a later sweep collects
+  it. The sweep's restore is a backstop behind that guard, not the cure.
+  Narrowed, not closed, and what remains is:
+  - the stranding itself, whose precondition is unchanged: three writers on one
+    job directory inside one microsecond window, against a lock that was already
+    dead enough to condemn;
+  - the two ways of reading a holder wrongly, both of which still fall toward
+    leaving the tombstone standing — a sweep landing on the exact instant of the
+    holder's death, an unreadable holder file (fail-closed), and pid reuse making
+    a dead holder look alive for as long as the impostor runs. With the guard in
+    place, a *falsely live* tombstone now also blocks acquisition until it is read
+    truthfully, so the failure is a refusal rather than a silent double-hold;
+  - and a theoretical composition of the guard with the monotonic wait: both the
+    guard and the deadline are process-local judgements about a shared directory,
+    so two processes can disagree for one 20ms turn about whether a tombstone is
+    live. The disagreement resolves by the next readdir, and the destructive
+    variant of it — a breaker removing a tombstone it did not condemn — additionally
+    requires the holder text to collide, which the per-acquisition nonce puts out
+    of reach of anything but sixty-four-bit chance.
+
+  And what the guard itself costs, stated rather than implied away:
+  - **The wedge lasts the stranded holder's process lifetime.** Every acquirer of
+    that one job waits its fifteen seconds and refuses, loudly, for as long as the
+    process named in the tombstone runs. That is bounded, visible and per job, and
+    it is the price of the state it replaced: 0.8.3 reached the same state as a
+    **silent double-hold**, two writers under one record with nothing printed.
+  - **A tombstone whose holder file is UNREADABLE is a manual-repair wedge.** It
+    can never read as dead, so nothing lifts the block on its own; the refusal
+    names the tombstone path and says to inspect and remove it by hand once nothing
+    is running. Deliberate: every other reading in this seam is fail-closed, and a
+    lock this runtime cannot read the owner of is the last place to start guessing.
+  - **A restore that lands after its victim finished re-wedges for the same
+    duration.** A lock put back on the canonical path after its holder has left its
+    critical section is unreleasable — release is by identity and that holder will
+    never ask again — so it stands until the sweep's stale age and the next
+    breaker, i.e. until roughly the same process lifetime the tombstone would have
+    blocked for. The restore is therefore neutral-to-better rather than a fix, and
+    that is precisely why the guard's blocking, not the restore, is the accepted
+    contract.
+  - **The two backstop branches have no in-process trigger path, and so no test
+    covers them.** The sweep's live-holder restore and the verify-after-win
+    rename-back are reachable only through the guard-to-stage TOCTOU or a
+    source-path ABA between two sweepers — microsecond windows nothing in this
+    runtime can produce on demand. They are unit-reachable only by fabricating the
+    directory state, which asserts the branch rather than the race. Said plainly:
+    defense-in-depth, unexercised.
 - **Windows `shell: true` quoting refuses what it cannot escape.** `codex.cmd`
   needs a shell, so `spawnCodex`/`runCodexSync` join argv into one command line
   with `cmdQuote`. Three characters cannot survive that command line and are

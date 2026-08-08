@@ -3,6 +3,112 @@
 Versioning rule: **a push that changes behavior MUST bump the version** — see
 [README → Releases and versioning](../README.md#releases-and-versioning) for why.
 
+## 0.8.4
+
+A second opinion from GPT-5.6, this time on 0.8.3's own break protocol — the
+entry below — read against the source before a line was changed. Six findings:
+five confirmed by adjudication, two of those reproduced or measured live, and
+one partial whose probability story the adjudication refuted. Patch bump: no new
+verb, no schema change, and a shared thesis: **a live lock in a tombstone still
+holds the record.**
+
+**A live lock stranded in a `.stale-*` tombstone while the canonical path stands
+free is one terminal state behind three doors, and acquisition now refuses past
+it.** A breaker that crashes between its rename and its restore; an existence
+probe that answers "gone" for a directory that is merely unreadable; a restore
+that failed because a third writer took the path — all three end in the same
+place, somebody's live lock in a tombstone and `job.json.lock` empty. Acquisition
+consulted only the canonical path, so the next writer took it and the stranded
+holder was in a **silent double-hold**: two writers under one record, arrived at
+by way of the mechanism that exists to prevent exactly that. Reproduced on this
+machine — a real cancel acquired past a hand-built strand in ~80ms, stderr empty,
+and because the two writers' generation numbers collide the lost update is
+forensically invisible afterwards. So the job directory is read before staging,
+and a tombstone whose holder is alive — or **unreadable**, fail-closed like every
+other reading in this seam — blocks. 0.8.3 closed the break's front door; this
+closes the room behind it.
+
+**The block is the mechanism, and its cost is stated rather than implied away.**
+A tombstone whose holder is dead or absent blocks nothing: it is litter awaiting
+the sweep, and waiting on a corpse would wedge every acquisition in the job
+behind something nothing will ever come back for. What does block, blocks for
+exactly as long as the stranded holder's **process** — while it runs, every
+acquirer of that job waits its fifteen seconds and refuses loudly, which is
+correct, because that process still believes it has the record; when it exits the
+tombstone reads dead, stops blocking, and a later sweep collects it. The refusal
+names the tombstone and says what will and will not lift it, because "could not
+be locked; re-run" is useless advice against a live lock sitting in a directory
+nobody looks in. An unreadable holder file can never read as dead and so is a
+manual-repair wedge, deliberately; the message says so. All of it is in DESIGN's
+residuals as what the guard itself costs, beside the state it replaced.
+
+**The heal is the breaker's own, and the rest is redundancy that says so.** A
+breaker whose restore failed keeps the tombstone in hand and retries the rename
+at **every turn of its own wait**, taking no lock itself until it lands — so a
+strand whose breaker survived is repaired in milliseconds, and the deadline
+refusal, if it comes, names the tombstone still held. Behind the guard, the sweep
+now **restores** an aged live-holder tombstone rather than merely skipping it, and
+**re-reads the holder of the tombstone it won** before removing anything, putting
+anything live back rather than deleting it. Both are defense-in-depth: with the
+guard in place the only route to a strand this process did not cut itself is the
+guard-to-stage microsecond TOCTOU or a source-path ABA between two sweepers,
+which nothing in this runtime can produce on demand. They are recorded as
+unexercised rather than counted as covered.
+
+**Only `ENOENT` is "gone" — the discipline the holder read already followed, now
+applied to the probes.** Two `existsSync` calls decided whether a condemned
+tombstone had been collected, and `existsSync` answers **false for a directory
+that is there** and could not be statted: an ACL, `EPERM`, `EBUSY`, a cloud
+filter. Demonstrated against a real directory ACL. Reading that as "collected"
+skipped the verification entirely and left whatever stood in the tombstone
+unexamined, which is one of the three doors above. Both became three-valued
+`statSync`: `ENOENT` alone is absence, and anything else is present-but-
+unmeasurable and falls through to the fail-closed verification. **The failed
+restore's diagnosis rests on the rename's own errno**, not on a second probe
+taken at a later moment against a racing directory — on Windows it could not have
+told the two causes apart anyway, since both a pinned source and an occupied
+target come back `EPERM`, and the measurement behind that is Defender's
+on-access scan being summoned by the break rename itself. The calm branch also
+stopped over-claiming: a tombstone that vanished may have been *restored* by a
+sweeper that found its holder alive, not only collected by one that proved it
+dead, and the message now covers both.
+
+**The holder file carries a pid and a nonce.** The break's identity check
+compared an mtime and a pid, which is a fingerprint rather than an identity: two
+locks can share both. Sixty-four bits from the OS CSPRNG are written fresh on
+every **acquisition** — never per process, because one process locks the same
+record many times in a run and two of its own acquisitions must not match each
+other — so `tombIsCondemned` compares what it condemned rather than what merely
+resembles it. Liveness readers parse the leading digits and ignore the rest. The
+mtime-and-pid collision this closes was the one partial finding: adjudication
+showed its precondition is a backward clock step of five seconds or more, not the
+ordinary race it was reported as, and the fix closes it outright regardless.
+
+**The wait bounds are monotonic.** The lock's fifteen seconds, the worker-resolve
+poll and the kill verification now measure with `performance.now()`. Each is
+compared only against readings taken in the same process, and a wall-clock step —
+NTP, a manual set, a VM resume — must not be able to shorten or extend a wait a
+caller is blocked in: a wait bound is a promise. Ages, grace windows and
+timestamps stay on the wall clock, because an mtime is a wall-clock fact and
+nothing else can be compared with one.
+
+**`clean` refuses a job whose directory holds a live-cargo tombstone.**
+`removeJobDir` deletes everything but the record and the lock, tombstones
+included — which would have been the one deletion of a live lock this runtime
+performs, by way of the verb whose whole job is tidying up. The job is refused
+instead, loudly and per job, the way `clean` already refuses any directory it
+cannot finish: one stuck job does not end a clean run, it lists, and a later
+clean takes it once the holder is gone.
+
+**Test hooks: one new pause point.** `RESTORE_PAUSE` stands a breaker between
+moving a successor into its tombstone and putting it back — the window in which a
+third writer can take the freed path and make the restore fail — because a window
+of a chosen length there is not producible on demand.
+
+**Tests: 100 → 105 in the dispatch suite, 159 total.** Each new one was pinned
+non-vacuously against a deliberately broken copy of the guard it covers; the
+room-closure test's control reproduces the pre-fix silent double-hold in 60ms.
+
 ## 0.8.3
 
 A second opinion from GPT-5.6 on 0.8.2's own lock rework — the entry below —
