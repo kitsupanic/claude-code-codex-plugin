@@ -597,6 +597,24 @@ worker-resolve `warning` field, whose text is already in `run.log` and whose los
 costs nothing but a duplicate. Everything else in the kill seam, the launch path
 and the finalizer is checked.
 
+**But unchecked is not the same as unconstrained, and that write now moves nothing
+backwards.** It carries no precondition on purpose — it may not fail on a cancel's
+verdict, because the pid it is recording is the only thing that cancel has to kill
+— so the discipline it *does* carry is that it adds and never rewinds. It is a
+function of the record as it is inside the lock, and it can land arbitrarily late:
+reading the supervisor's start time is a shell spawn, and the supervisor is
+running the whole time. As a flat object patch it did two things it should never
+have done. It wrote `launch: 'spawned'` over a supervisor that had already reached
+`exec-spawning` or `exec`, **regressing the phase** — which is exactly the reading
+`killWindow` uses to refuse to call a codex-exec window a death, so a cancel
+landing after it killed the supervisor, verified the targets it knew about,
+recorded `killed` and released the role while codex ran on (and off Windows codex
+is detached and reparents, so the leftover sweep finds nothing). And it *replaced*
+`pidStarts` wholesale, erasing the start times the supervisor had just written for
+`codexPids` — the identity every later kill checks codex by, without which those
+numbers are fired at bare. So `pidStarts` is merged, and `launch` advances to
+`spawned` only from `pending` or `spawning`.
+
 **Two of those checks refuse a launch outright: one before the spend, one after
 it.** The
 sight label — the only evidence the delivery gate ever reads — is written before
@@ -889,8 +907,8 @@ descendants — and writes them to `codexPids` and to `codex.pid`, so they are k
 targets and verification targets like any other. And the kill walks the **tree**:
 live descendants of every target are killed alongside it, and anything still
 descended from one afterwards is a survivor, even if it was never a recorded pid.
-The table comes from `Get-CimInstance Win32_Process` on Windows and `ps -eo
-pid=,ppid=` elsewhere. **If it cannot be read, the kill is not verified** — and
+The table comes from `Get-CimInstance Win32_Process` on Windows and `ps -eo`
+elsewhere. **If it cannot be read, the kill is not verified** — and
 that is a state, not a warning. `killPids` answers `enumerated: false` when
 neither shell would say (both `powershell` and `pwsh` failing on Windows), which
 means the descendants were never enumerated and the leftover sweep read nothing:
@@ -913,6 +931,144 @@ job has on a sweep nothing had witnessed — and the retry then read "already
 reaped". Off Windows the process group is the other half
 of the same proof: `codexPgid` is recorded, and a group that still has members
 after the kill counts as a survivor.
+
+**And what is written down as a target fails CLOSED, which is the opposite
+direction from the kill itself.** The two are deliberately different decisions.
+The *kill* is fail-open: a pid whose identity cannot be proved is still signalled,
+because declining to kill a codex that really is there is the direction that costs
+money. What gets **recorded** as a vouched-for target is fail-closed, because a
+record is permanent and a wrong one is self-consistent for ever. The wrapper's
+descendants are found by inference from a ppid field the OS does not keep honest,
+and `livingDescendantsOf` keeps every edge it cannot *disprove* — so a stranger
+that outlived the previous owner of a reissued number can appear as the wrapper's
+child, get written into `codexPids` with **its own** current start time, and pass
+every later identity check by being compared to itself. The runtime would be
+signing the papers itself, and a cancel hours later would send `taskkill /PID <n>
+/T /F` into somebody else's tree. So a discovered descendant is recorded only if it
+clears the **wrapper-start floor**: the wrapper's own start time is read in the
+supervisor at spawn time, when the number is certainly still the process just
+created, and a candidate whose start predates it (by more than the same two
+seconds of slop `sameStartTime` allows — cmd.exe starts node within milliseconds,
+so a strict "after" would reject the genuine worker) is not the wrapper's child,
+whatever the table says. A candidate whose start time the OS *will not give up* is
+not recorded either; that is the closed direction, and its cost is the fallback
+this runtime already ships — the wrapper stays a recorded target, the supervisor
+warns that no worker could be resolved, and the kill-time descendant walk still
+reaches the real workers from the live wrapper, where fail-open is correct because
+nothing it finds is persisted. The floor is applied inside the resolve *poll*, so a
+candidate set filtered down to nothing keeps polling for the real worker rather
+than latching a stranger the first time the table names one.
+
+**A survivor is a retry target, not a line of display text.** `killSurvivors` is a
+string `status` prints, and for a release it was the *only* place a final-sweep
+survivor went: the late Windows worker, never a recorded pid and reachable only as
+a descendant, was reported and then forgotten. The retry the operator is told to
+run re-gathered the same recorded numbers, whose wrapper was by then dead, killed
+nothing — and on pid reuse of that dead wrapper could flip the job to `killed` with
+the worker still billing. The `kill-failed` write now records each survivor as a
+target in `codexPids` **together with the start time it was observed with**, read
+moments after it was seen alive. The pid alone would be the forgery above; anchored,
+the retry's identity check re-tests it at fire time and refuses a reused number
+exactly as it refuses a reissued recorded one. An anchor the record already holds
+is never overwritten by the observed one — re-stamping a recorded pid with a time
+read *now* is how a number the check waved through fail-open would acquire papers
+of its own. A survivor that had *no* recorded anchor is self-stamped, which is a
+stated residual (see "the survivor persist can still anchor a stranger" under known
+issues) rather than a floor: the floor available at that write would not exclude
+the strangers it is aimed at, and would drop real survivors on a host that will not
+give up a start time.
+
+**A pid the OS confirmed dead is not signalled twice.** The tree kill runs two
+rounds, because a tree can grow between the enumeration and the signal. Round two
+used to fire at every pid round one had targeted, including the ones `waitGone`
+had just watched disappear — and a number freed during that ~3 second verify
+window can be reissued inside it, so the second `taskkill /T` went at the new
+owner's tree. Round two skips every pid round one's `waitGone` watched disappear,
+and it skips them **by what was seen, not by what the OS says now**: excluding on
+*current* liveness excluded nothing in exactly the case the exclusion exists for —
+a reissued number reads alive again, and would be fired at, at the inheritor's
+whole tree. The confirmed-dead numbers are remembered in a set, and they are out of
+both the round-two fire list and the roots the descendant walk re-enumerates from.
+That cannot skip anything real: the number is spent, and round one's kin of it are
+already targets in their own right.
+
+**And the identity check's cache is never poisoned by a query that failed.** Start
+times are memoized per invocation — the watcher asks about the same supervisor
+every 500ms, and a shell spawn a tick is a load, not a diagnostic. Misses were
+memoized too, including the misses produced by a query that never ran: a
+non-zero `ps`, both PowerShell and pwsh refusing, the 15-second timeout tripping
+under load. One unlucky second would then disarm the identity check for that pid
+for the lifetime of the process — the watch loop is long-lived, and the same map is
+read again at `killJob`'s identity pass and at the post-kill check. A miss is
+cached only when the OS actually answered; a failed query answers nothing and
+remembers nothing, and the next caller asks again.
+
+**The reap of an unvouched-for claim checks identity too — and it is presently a
+backstop.** It was the last kill in the runtime that fired on the strength of a
+number alone: `killJob` routes every source it gathers through the recorded start
+times, and the corrupt-owner reap did not, so a `.pid` file whose numbers the OS
+had reissued sent a tree kill at a stranger. It routes them the same way now, and
+only the numbers actually fired at are consumed as spent. **What that buys today is
+narrower than it looks.** Both callers reach the reap only for a claim whose record
+is *unreadable* — corrupt, or absent — which is what "unvouched-for" means here,
+and an unreadable record carries no `pidStarts`, so the check fails open and
+refuses nothing on the paths that exist. What it does close is a TOCTOU: the reap
+re-reads the record itself, and one that was unreadable at classification (a
+scanner holding the file, a write landing mid-read) can read fine a moment later
+inside the reap, at which point the reissued-pid refusal is real. The exposure it
+does *not* close is the one it resembles — bare `.pid` numbers fired at with no
+identity to check them against — and that is the separately stated residual below,
+inherent to a record that cannot be read.
+
+**Off Windows the session is a third membership, and it catches the group-leaver.**
+codex is spawned detached, so its pid is its process-group id *and* its session id
+— the number the record already carries as `codexPgid`. A child that calls
+`setpgid` leaves the group (`groupAlive` stops seeing it) and, once orphaned,
+leaves the ppid walk as well; it stays in the session. So the POSIX process-table
+read asks for the session column (`ps -eo pid=,ppid=,pgid=,sess=`, falling back to
+the old two-column form on a `ps` that will not answer it, because "the table could
+not be read" would turn every kill on such a host into an unverified one), and any
+live pid whose session is the recorded one is a target before the kill and a
+survivor after it. The column is parsed defensively: macOS prints a session
+*pointer* rather than a session id, which is not a pid and is simply not recorded,
+leaving the sweep with no opinion there rather than a wrong one. "Not a pid" is
+read strictly — **plain decimal digits or nothing**, because `Number()` happily
+accepts the `0x…` form a pointer is printed in, and a small enough one would read
+as a positive integer, be recorded as a session id and could then match a live
+`codexPgid`. Windows is unchanged; it has no sessions to give.
+
+**The reaped ledger's unlocked fallback writes to its own file.** `reaped.pids` is
+the durable half of "this number is spent", merged under the record lock. When the
+lock cannot be had at all it used to be merged anyway, unlocked — a read-modify-write
+onto a shared file, which is the same lost update the lock exists to prevent one
+layer down: two writers who both lost the lock lost one of the two lists, and a
+lost entry is a spent number **re-armed**. That path now writes
+`reaped.pids.<writer pid>`, which nothing else writes, and every reader unions the
+shared file with any sidecars it finds. Readers do not fold sidecars away: deleting
+one races the writer that owns it, which is the lost entry again.
+
+**And the sidecar is staged and renamed, not appended.** It was the one ledger
+write in the file that went straight at the destination, and an append is not
+atomic: a process killed mid-write leaves a truncated line whose digit prefix reads
+as a valid pid nothing ever fired at — an innocent number marked spent for ever,
+and, where the truncation collides with a real target, the genuinely spent number
+missing from the ledger so a later reap skips it and codex bills on. The file is
+owner-exclusive, so the read-modify-write races nobody: the union is written to
+`reaped.pids.<pid>.building` and renamed onto the sidecar, which is either done or
+not done. Both staging names are outside the digit-anchored sidecar pattern, so no
+reader unions a half-written one in.
+
+**And a pid verified dead is recorded spent even when the record cannot be
+written.** The supervisor's registration-failure path kills what it just spawned
+and had recorded nothing about it — the numbers stayed loaded in `codex.pid` with
+no start time and no ledger entry, so a retry fired them bare at whatever had
+inherited them. Concurrently with a cancel that wrote `kill-pending`, the refusal
+that follows stands down and writes nothing at all, which leaves that live record
+as the whole account of the job. The reaped ledger is written there now, on the
+verified branch only: survivors, and a kill nothing could enumerate, are still
+legitimate targets and marking them spent would disarm the retry that has to reach
+them. It does not depend on the lock that just refused — the ledger's sidecar is
+exactly the half that does not.
 
 **Off Windows, the tree is the process group.** `taskkill /T` walks the tree
 itself and is the tested, first-class path; elsewhere there was no tree at all —
@@ -1105,19 +1261,69 @@ than opening nothing and claiming otherwise.
   current start time no longer matches is neither read as alive nor fired at.
   What remains: records written before the field existed keep the old behavior,
   macOS `ps` has no `etimes` so the query answers nothing there, and start
-  times are memoized per invocation — a reuse occurring mid-run degrades to the
-  old behavior. Most remaining cases fail in the safe direction: a spurious
-  `kill-failed` refuses a launch rather than launching a duplicate, and the
-  reaped-pid list still stops a number already fired at from ever being fired
-  at again.
+  times are memoized per invocation — a reuse occurring *within* one invocation,
+  after that pid's start time has been read successfully, reads as the old
+  process. (A memoized *miss* no longer has that effect: a query that failed is
+  not cached, so the next caller re-asks. A query that succeeded and found no
+  such process is cached, and correctly — the pid was gone.)
 
-  **One case does not, and it is the kill targets read out of the `.pid` files
-  when there is no usable record to check them against.** `pidStarts` lives in
-  `job.json`, so a job whose record is corrupt or absent — the reap that clears
-  an unvouched-for claim, and `cancel` on a corrupt job — has nothing to compare
+  **And the check is fail-open by design, so "narrowed" is the honest word and
+  not a hedge.** Absence of a recorded start time, or of a readable current one,
+  leaves a pid exactly the standing it had: killed, and read as alive. Identity
+  can withdraw a kill target; it can never manufacture one, because the direction
+  that costs money is declining to kill a codex that really is there. Every
+  remaining hole below is therefore a *signal at a stranger*, never a codex left
+  running — with the single exception noted in the next paragraph, which is why
+  the recording side fails closed instead.
+
+  **What does not fail safely is a target RECORDED wrongly, and that is closed
+  from the other end.** A pid written into `codexPids` alongside its own current
+  start time matches itself for ever, so no later check can catch it. The
+  wrapper-start floor (see "what is written down as a target fails CLOSED") is
+  what keeps an inferred descendant out of the record unless it can be shown to
+  have started after the wrapper did, and survivors persisted for retry are
+  anchored the same way. **The residual is reuse inside the slop window**: a
+  number reissued to a process that started within `START_TIME_SLOP_MS` (two
+  seconds) of the original's start is indistinguishable from it by this clock, in
+  both directions — the floor would admit it, and the identity check would wave
+  it through. Two seconds is not arbitrary (two readings of the same instant differ
+  by the rounding of whatever printed them), and no finer clock is available
+  through `ps`/CIM; the window is stated rather than narrowed by guesswork.
+
+  **And the survivor persist can still anchor a stranger it never recorded.** The
+  `kill-failed` write puts the final sweep's leftovers into `codexPids` with the
+  start time they were observed with, and a leftover is by construction a pid
+  nothing wrote down — that is what the fix is for. On Windows a dead parent's
+  number stays in its orphan's `ppid` field, which is exactly how the sweep reaches
+  the real codex worker behind a killed wrapper; if that number has been *reissued*
+  inside the kill, the inheritor's own children read as leftovers through the same
+  stale field, and having no recorded anchor they are self-stamped — the same
+  forgery the wrapper-start floor closes at spawn time, reopened at persist time.
+  **No floor is applied here, deliberately.** The anchors in hand at that write are
+  the job's recorded codex starts, and a floor built on them does not exclude the
+  dominant sub-class: the inheritor's children are *younger* than the job, not
+  older, so they clear it. What such a floor would reliably do is the closed
+  direction's cost — a survivor whose start time the OS will not give up (macOS
+  `ps` has no `etimes`) would not be written down, and unlike the spawn-time floor
+  there is no fallback behind it: the survivor is reported and the job is
+  `kill-failed` either way, but the retry's `gather` would no longer hold the one
+  target that reaches it. So the trade is refused and the residual stated. Its
+  window is the reuse of a just-killed number inside one kill — seconds, against
+  the spawn-time version's whole job lifetime — and its direction is the expensive
+  one, a recorded target that matches itself for ever, which is why it is written
+  here rather than left implied.
+
+  **The kill targets read out of the `.pid` files when there is no usable record
+  to check them against are still fired at bare.** `pidStarts` lives in
+  `job.json`, so a job whose record is *corrupt or absent* has nothing to compare
   a number to, and those numbers are fired at on the strength of the number
   alone. That is the first shot, which is the one that can land on a stranger;
-  the reaped list only ever stopped the second. The `.pid` files are deliberately
+  the reaped list only ever stopped the second. Narrowed since: the reap of an
+  unvouched-for claim and `killJob` both route every source through the identity
+  check now, so a *readable* record refuses its own reissued numbers — what is
+  left is the corrupt-record case, where by construction there is nothing to
+  check against. (Which is the whole of the reap's own caller set, so the routing
+  there is a TOCTOU backstop rather than an active refusal; see above.) The `.pid` files are deliberately
   not given a start-time sidecar of their own: a second file to keep in step with
   the first is a second thing to be wrong, and the record is where identity is
   written down. Stated here rather than implied away.
@@ -1314,17 +1520,36 @@ than opening nothing and claiming otherwise.
   `taskkill /T /F` on it) as data, so the decision is asserted on both platforms;
   the drill that actually kills a grandchild through the group is skipped on
   Windows, which is where this repo's suite is run. Nothing here is verified on a
-  real POSIX box yet — say so rather than imply otherwise.
+  real POSIX box yet — say so rather than imply otherwise. That now covers the
+  session sweep and its `ps -eo pid=,ppid=,pgid=,sess=` read as well: the parser
+  and the fallback are reasoned about above, and neither has been run against a
+  live `ps` in this repo's CI.
+- **A POSIX child that calls `setsid()` is undiscoverable, and nothing here
+  pretends otherwise.** Three memberships identify a process this job started:
+  the ppid walk, the process group, and — since the group is escapable with one
+  `setpgid` call — the session. A child that takes a session of its own leaves all
+  three at once. It is then reachable only through a pid this job recorded, and it
+  never was one. No membership remains to test it by, so this is stated rather
+  than worked around; the same limitation `stale` has always carried, at one more
+  remove. Nothing codex is known to do produces it — the sweep is shipped because
+  it is cheap and correct either way, not because a leaver was observed.
 - **A job whose supervisor is killed between `launch: 'spawning'` and its pid being
   recorded stays `kill-pending` until the 15-second window passes.** That is the
   safe direction — the role stays blocked, a retry resolves it — but it does mean a
   crashed dispatch can hold a role for 15 seconds longer than it used to.
 - **The process table costs about a second to read on Windows**, because
-  `Get-CimInstance Win32_Process` does. It is read on a kill and once per job when
-  codex was launched through a shell wrapper — not in any hot path — but a `cancel`
-  is perceptibly slower than it was, and that is the price of verifying the tree
-  rather than a list of numbers. `ps -eo pid=,ppid=` off Windows is free by
-  comparison.
+  `Get-CimInstance Win32_Process` does, and the start-time query is a second
+  PowerShell of the same kind. Between them they are read on every kill, in the
+  worker-resolve poll (once every 200ms until a worker appears, up to five
+  seconds), and once per liveness-identity check — not in any hot path, but a
+  `cancel` is perceptibly slower than it was, and the supervisor spends one extra
+  start-time query inside the codex-exec window so that the wrapper's own start
+  time is read before the poll that needs it as a floor. That is the price of
+  verifying the tree, and of verifying that the tree is *ours*, rather than a list
+  of numbers. `ps -eo` off Windows is free by comparison. **And a failed query is
+  no longer cheap the way it used to be**: it is not cached, so a host where the
+  query is persistently failing re-asks rather than settling into "no opinion" —
+  deliberate, because the settled state was a silently disarmed identity check.
 - **A probe file name that cannot survive the delivery gate's round trip is
   refused.** `sight` is written as `cwd-file:<name>` and read back by a validator
   that requires a name with no `:` and no path separator, so a POSIX file called
@@ -1338,8 +1563,14 @@ than opening nothing and claiming otherwise.
   has to, or the job is `kill-pending` for ever — and the ordinary verified kill
   then runs against the recorded pids and their tree. On Windows the orphan is still
   a descendant and is caught; off Windows codex was detached into its own group and
-  reparented, so it may not be. That is the same limitation `stale` has always
-  carried, narrowed rather than removed.
+  reparented, so **the ppid walk will not reach it**. What reaches it there is the
+  recorded `codexPgid` — as a group kill, as the `groupAlive` proof, and now as a
+  session sweep for anything that left the group — and that number is only on the
+  record if the supervisor lived long enough to write it. A supervisor that died
+  *before* the registration write leaves a codex with no recorded pid, no recorded
+  pgid and no recorded session, and nothing in this runtime can find it. That is
+  the same limitation `stale` has always carried, narrowed rather than removed, and
+  the narrowing is real only on the far side of the registration write.
 - **The junction/symlink drill is skipped, loudly, on a platform that will not
   create one.** Windows needs no elevation for a directory junction, so it runs
   where this suite runs; a POSIX box with symlink creation denied would print the

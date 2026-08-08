@@ -101,6 +101,32 @@ Things the brief left open, decided here:
   the next reap consults, so a surviving pid file cannot resurrect a spent number.
   Consumption happens only after a *verified* kill: pids that survived are
   demonstrably still theirs, and still need firing at.
+- **Process identity fails OPEN when deciding to kill and CLOSED when deciding to
+  write a target down.** One mechanism, two opposite defaults, and the split is
+  deliberate. A kill fired at a pid whose identity cannot be proved may hit a
+  stranger; a kill *withheld* may leave a codex billing with nothing left that can
+  stop it, so the kill decision keeps its "the check only ever subtracts" rule.
+  A *record* is different in kind: a pid written into `codexPids` beside its own
+  current start time matches itself for ever, so a stranger promoted there once is
+  a stranger the runtime vouches for permanently, and every later check confirms
+  the forgery. So nothing is recorded as a target unless it can be shown to be
+  ours — a discovered descendant must clear the wrapper's own start time, and a
+  survivor persisted for retry is stored with the start time it was observed with,
+  never overwriting an anchor the record already holds. **The survivor persist is
+  where the closed direction stops, and on purpose**: a leftover has no recorded
+  anchor to keep, so it is self-stamped. A floor there would have to be built from
+  the job's own codex starts, which the strangers it aims at (children of a process
+  that inherited a number this kill just freed) clear easily by being *younger* than
+  the job — while a survivor whose start time the platform will not give up would be
+  dropped, and unlike the spawn-time floor nothing stands behind that loss: the
+  retry would hold no target that reaches it. Stated as a residual in DESIGN rather
+  than closed with a check that costs more than it buys. Two further corollaries of
+  the same asymmetry: a pid *verified* dead is always written to the reaped ledger
+  (an unrecorded verified kill re-arms the number), and the start-time cache is
+  never populated from a query that failed (a cached miss silently disarms the
+  check for the life of the process). The one thing none of them may do is regress
+  the launch phase or delay the registration write — an unkillable codex is worse
+  than a stranger's process surviving.
 - **The finished banner states the terminal state, and only `done` is good news.**
   It announced `JOB FINISHED - result is ready` for every state, including jobs
   whose answer `result` was about to refuse — the same class of defect as every

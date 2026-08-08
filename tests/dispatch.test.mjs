@@ -12,7 +12,9 @@ import { fileURLToPath } from 'node:url';
 // Imported, not hard-coded: the schema stamp is the thing the delivery gate reads,
 // so a fixture that wants to be deliverable has to carry whatever this release
 // writes. Hard-coded 1s silently stopped meaning "current" the moment it moved.
-import { RECORD_VERSION, cmdQuote, watchLaunchArgs } from '../scripts/codex-dispatch.mjs';
+import {
+  RECORD_VERSION, cmdQuote, watchLaunchArgs, reapedPids, livingDescendantsOf,
+} from '../scripts/codex-dispatch.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.join(HERE, '..');
@@ -5190,7 +5192,395 @@ test('codex that was spawned and could not be recorded is KILLED, not left billi
     'and so is its child: the kill goes through the tree, or "verified dead" means nothing');
   assert.equal(fs.existsSync(path.join(dir, 'out.txt')), false,
     'it never got as far as an answer, which is the trade this branch makes on purpose');
+  // And the numbers it just killed are RECORDED SPENT, or the retry the operator is
+  // sent to run fires them again, bare, at whatever the OS has since handed them to.
+  // This branch used to write nothing at all: it killed, watched them die, and left
+  // `codex.pid` loaded with no entry in the reaped ledger.
+  //
+  // The lock is free here, so the ledger lands in the shared `reaped.pids` file
+  // (the record itself is the corruption this test planted, and is never rewritten).
+  //
+  // Non-vacuity (observed): with the `if (verified) recordReapedPids(dir, codexPids)`
+  // line removed, `reapedPids` stays empty, the poll below times out, and the cancel
+  // after it names every one of those dead codex numbers as a target it fired at.
+  assert.ok(await poll(() => pids.every((p) => reapedPids(dir).has(p)), 20000, 100),
+    `a pid verified dead is recorded spent: ${[...reapedPids(dir)].join(', ')} vs ${pids.join(', ')}`);
+  assert.ok(fs.existsSync(path.join(dir, 'reaped.pids')),
+    'in the file copy, which is the one a corrupt record leaves as the only ledger');
+
+  // The consequence, through the runtime: the retry this refusal tells the operator
+  // to run gathers the still-loaded `codex.pid` and fires at NOTHING out of it.
+  const retry = run(['cancel', id]);
+  const named = (retry.stdout.match(/^killed recorded pids: (.*)$/m) || [, ''])[1];
+  for (const p of pids) {
+    assert.equal(named.includes(String(p)), false,
+      `pid ${p} was killed and recorded reaped, and this cancel fired at it again: ${named}`);
+  }
 });
+
+// ---------------------------------------------------------------------------
+// 0.8.6: the phase only moves forward, a failed query remembers nothing, a
+// survivor is a target, and a writer with no lock owns its own file.
+// ---------------------------------------------------------------------------
+
+test('a dispatch registering LATE adds to the record and rewinds nothing', async () => {
+  // THE ONE WRITE IN THE KILL SEAM THAT CARRIES NO PRECONDITION, and it cannot have
+  // one: the pid it is recording is the only thing a cancel has to kill, so it must
+  // land whatever it finds. What it may not do is move anything BACKWARDS.
+  //
+  // Flat, it did both. `launch: 'spawned'` went over the supervisor's own
+  // `exec-spawning`/`exec`, which is the reading `killWindow` uses to refuse to call
+  // a codex-exec window a death — regressed, a cancel kills the supervisor, verifies
+  // the targets it knows about, records `killed`, releases the role, and codex runs
+  // on. And `pidStarts: startTimesFor([child.pid])` was a whole-object assignment
+  // that erased the start times the supervisor had just written beside `codexPids`,
+  // which are the identity every later kill checks codex by.
+  //
+  // The real window is one start-time query wide. REGISTER_PAUSE_MS holds this
+  // dispatch inside it while a REAL supervisor — not a fabricated record state —
+  // runs the whole way to `exec` underneath it, so what lands late is the genuine
+  // write against the genuine record.
+  const brief = writeBrief('briefregisterlate.md', 'slow');
+  const HOLD = 15000; // the hook's own ceiling is the record lock's patience
+  const t0 = Date.now();
+  const dispatching = dispatchPaused(brief, 'registerlate', 0, {
+    CODEX_DISPATCH_TEST_REGISTER_PAUSE_MS: String(HOLD),
+    FAKE_CODEX_SLEEP_MS: '60000',
+  });
+  const findDir = () => fs.readdirSync(JOBS).find((n) => n.startsWith('registerlate-'));
+  let id;
+  try {
+    // Inside the hold, and the supervisor has gone all the way past the phase this
+    // write used to overwrite: `exec` means codex exists and its pids are on the
+    // record with their start times beside them.
+    assert.ok(await poll(() => findDir() && record(findDir()).launch === 'exec', 14000, 50),
+      'the supervisor must reach exec while the dispatch is still held, or this proves nothing');
+    id = findDir();
+    // The registration write cannot have landed yet: it happens no earlier than the
+    // spawn plus the whole hold, and this is well inside it. (`supervisorPid` is not
+    // the tell — the supervisor writes its own pid as a fallback when it finds a
+    // record that does not name it, which is exactly the situation this hold makes.)
+    const observed = Date.now() - t0;
+    assert.ok(observed < HOLD - 1000,
+      `the supervisor reached exec inside the hold, or this proves nothing (${observed}ms)`);
+    const before = record(id);
+    assert.ok((before.codexPids || []).length, 'the supervisor recorded what it spawned');
+    const codexStarts = Object.fromEntries(
+      before.codexPids.map((p) => [String(p), before.pidStarts[String(p)]]));
+    assert.ok(Object.values(codexStarts).every((s) => typeof s === 'string'),
+      `every recorded codex pid has an identity anchor: ${JSON.stringify(before.pidStarts)}`);
+
+    const d = await dispatching;
+    assert.equal(d.code, 0, d.stderr);
+    assert.ok(Date.now() - t0 > HOLD,
+      'and the hold was really in force, so the write under test landed AFTER that reading');
+    const after = record(id);
+
+    // Non-vacuity (observed): with the write reverted to the flat
+    // `updateRecord(dir, { supervisorPid, pidStarts: startTimesFor([child.pid]), launch: 'spawned' })`,
+    // `after.launch` reads `spawned` and `after.pidStarts` holds the supervisor's
+    // entry and nothing else — both assertions below fail, and a cancel run at that
+    // moment would answer `killed` over a live codex.
+    for (const [pid, start] of Object.entries(codexStarts)) {
+      assert.equal(after.pidStarts[pid], start,
+        `codex pid ${pid} lost the start time the supervisor recorded for it`);
+    }
+    assert.equal(after.launch, 'exec',
+      `the phase only ever moves forward; this write rewound it to ${after.launch}`);
+    assert.deepEqual(after.codexPids, before.codexPids, 'and its targets are untouched');
+
+    // The write still LANDS. It is the one that makes the supervisor killable, and
+    // nothing above may be read as it being allowed to skip.
+    assert.equal(typeof after.supervisorPid, 'number', 'the kill target is recorded');
+    assert.equal(typeof after.pidStarts[String(after.supervisorPid)], 'string',
+      'with its own identity anchor merged in beside the ones already there');
+    assert.ok(pidAlive(after.supervisorPid), 'and it names a real process');
+  } finally {
+    if (id) run(['cancel', id]);
+  }
+});
+
+test('a start-time query that FAILED is not remembered, so the next caller re-asks', async () => {
+  // THE CACHE, which is one of the four identity decisions and the only one whose
+  // failure is invisible from outside. A miss used to be cached whether or not the
+  // OS had been heard from, so one unlucky second — a PowerShell that would not
+  // start, the fifteen-second timeout tripping under load — permanently disarmed the
+  // identity check for that pid in a process that lives as long as the watch loop
+  // does. Every later reader (killJob's identity pass, the post-kill check, this
+  // walk) got "no opinion" for the rest of the run.
+  //
+  // Pinned in-process, because the cache is per-process: `livingDescendantsOf` is
+  // the exported reader that consults it, and its whole job is to disprove a claimed
+  // parentage from start times. Two real processes, three and a half seconds apart
+  // (the slop is two), and a table that LIES about which is the parent — the older
+  // one cannot be the younger one's child, and saying so is exactly the check a
+  // poisoned cache cannot make.
+  const older = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)'],
+    { stdio: 'ignore', detached: true });
+  older.unref();
+  await new Promise((r) => setTimeout(r, 3500));
+  const younger = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)'],
+    { stdio: 'ignore', detached: true });
+  younger.unref();
+  try {
+    assert.ok(await poll(() => pidAlive(older.pid) && pidAlive(younger.pid), 10000, 50),
+      'both stand-ins must be alive, or neither has a start time to read');
+    const lying = new Map([[younger.pid, 1], [older.pid, younger.pid]]);
+
+    // First call: the query cannot run at all. Fail-open, as it must be — an edge
+    // nothing could disprove stands.
+    process.env.CODEX_DISPATCH_TEST_NO_START_TIMES = '1';
+    let blind;
+    try { blind = livingDescendantsOf([younger.pid], lying); } finally {
+      delete process.env.CODEX_DISPATCH_TEST_NO_START_TIMES;
+    }
+    assert.deepEqual(blind, [older.pid],
+      'a query that could not run disproves nothing: the claimed child stays');
+
+    // Second call, same pids, and the OS will answer this time.
+    //
+    // Non-vacuity (observed): with `answer(false)` reverted to caching the miss —
+    // `for (const pid of ask) startTimeCache.set(pid, found.get(pid) || null)`
+    // unconditionally — this second call reads two cached nulls, never asks the OS,
+    // and returns [older.pid] again. The assertion below fails, and in the runtime
+    // that is a stranger's tree kept as a kill target for the life of the process.
+    const seeing = livingDescendantsOf([younger.pid], lying);
+    assert.deepEqual(seeing, [],
+      `the failed query left no verdict behind: the parentage is re-checked and disproved ` +
+      `(${older.pid} started 3.5s before ${younger.pid})`);
+  } finally {
+    for (const p of [older.pid, younger.pid]) { try { process.kill(p); } catch { /* gone */ } }
+  }
+});
+
+test('a kill-failed survivor is written down as a target, with the identity it was seen with', async () => {
+  // A SURVIVOR WAS A LINE OF DISPLAY TEXT. `killSurvivors` is a string `status`
+  // prints; nothing that kills reads it back. So the worker the FINAL SWEEP found —
+  // never a recorded pid, reachable only as a descendant of one — was reported and
+  // then forgotten: the retry the operator is told to run re-gathered the same
+  // recorded numbers, whose parent was by then dead, killed nothing, and could flip
+  // the job to `killed` with that process still billing.
+  //
+  // WHAT IS PINNED HERE IS THE RECORD, and deliberately not the retry: on Windows a
+  // dead parent's number is still the `ppid` field of its orphan, so `killPids`'
+  // final descendant sweep reaches this grandchild from the recorded-but-dead codex
+  // whether or not it was ever written down (measured: with the survivor branch
+  // disabled, the retry still ends `killed` with the orphan gone). The recorded
+  // target is what the fix is, and it is what a POSIX reparent-to-1 — where that
+  // sweep finds nothing — actually depends on.
+  //
+  // The fake's grandchild is exactly that shape: a live descendant of codex that no
+  // pid file and no record field names. NOKILL makes the first cancel fail to take
+  // without any of it being raced.
+  const brief = writeBrief('briefsurvivortarget.md', 'slow');
+  const r = run(['dispatch', '--brief', brief, '--role', 'survivortarget'],
+    { FAKE_CODEX_SLEEP_MS: '60000' });
+  assert.equal(r.status, 0, r.stderr);
+  const id = jobIdFrom(r.stdout);
+  const childPidFile = path.join(JOBS, id, 'child.pid');
+  let grandchild;
+  try {
+    assert.ok(await poll(() => record(id).codexPid && fs.existsSync(childPidFile), 30000),
+      'codex must be up and must have started its own child');
+    grandchild = Number(fs.readFileSync(childPidFile, 'utf8').trim());
+    const before = record(id);
+    assert.equal((before.codexPids || []).includes(grandchild), false,
+      'the grandchild is NOT a recorded target — that is the whole point of it');
+    const codexAnchor = before.pidStarts[String(before.codexPid)];
+    assert.equal(typeof codexAnchor, 'string', 'and codex itself has a recorded anchor');
+
+    const c1 = run(['cancel', id], { CODEX_DISPATCH_TEST_NOKILL: '1' });
+    assert.notEqual(c1.status, 0, 'a kill that did not take must exit nonzero');
+    const failed = record(id);
+    assert.equal(failed.state, 'kill-failed');
+    // Non-vacuity (observed): with the survivor branch reverted to the flat patch
+    // that writes only `killSurvivors`, `codexPids` still holds the spawn-time
+    // number alone — `[38788]`, with the survivor 34988 nowhere on the record — and
+    // the three assertions below fail.
+    assert.ok((failed.codexPids || []).includes(grandchild),
+      `the survivor ${grandchild} must be written down as a target: ${JSON.stringify(failed.codexPids)}`);
+    assert.equal(typeof failed.pidStarts[String(grandchild)], 'string',
+      'WITH an identity anchor: a bare number fired at later lands on whatever inherited it');
+    // THE RECORDED ANCHOR WINS. A survivor that was already a recorded pid keeps the
+    // start time written when the number was certainly ours, rather than one read
+    // now — re-stamping is how a stranger the identity check waved through fail-open
+    // gets papers of its own.
+    //
+    // AND THIS ONE DOES NOT CATCH A REVERSED SPREAD ON WINDOWS: CIM re-read moments
+    // later returns the byte-identical start string, so both orders produce the same
+    // value here. The order is pinned by review (and would be catchable only where
+    // the two readings can differ in formatting, i.e. POSIX); what this assertion
+    // really holds is that the anchor is not LOST.
+    assert.equal(failed.pidStarts[String(before.codexPid)], codexAnchor,
+      'and a survivor already on the record is not re-stamped with a time read at kill time');
+
+    // And the anchor is one a later kill can actually use: the number is still that
+    // process, so `recordedProcesses` keeps it as a target rather than reading it as
+    // reissued. (A cancel that fires for real ends the job.)
+    const c2 = run(['cancel', id]);
+    assert.equal(c2.status, 0, `the retry must be able to finish the job: ${c2.stderr}`);
+    assert.equal(record(id).state, 'killed');
+    assert.ok(await poll(() => !pidAlive(grandchild), 20000),
+      'and nothing this job started is left running');
+  } finally {
+    for (const pid of [grandchild, ...(record(id).codexPids || [])].filter(Boolean)) {
+      try { process.kill(pid); } catch { /* already gone */ }
+    }
+  }
+});
+
+test('a reap that could not take the lock writes its OWN file, never the shared one', async () => {
+  // THE LOST UPDATE, ONE LAYER DOWN. `reaped.pids` is shared, so merging into it
+  // means read-modify-write, and the fallback for a writer that could not take the
+  // record lock did exactly that — two of them, and one list is gone. A lost entry
+  // is a spent pid number RE-ARMED, which is the single failure this ledger exists
+  // to prevent.
+  //
+  // So a writer with no lock never reads or renames the shared file at all: it
+  // appends to `reaped.pids.<its own pid>`, which nothing else writes. That is the
+  // property under test, and it is what makes the concurrent case safe by
+  // construction — there is no read to be stale and no rename to lose.
+  //
+  // The lock is wedged with a live holder's tombstone, the same fabrication the lock
+  // tests use, so both attempts inside `recordReapedPids` provably fail.
+  const id = 'reapsidecar-1-99981';
+  const dir = path.join(JOBS, id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'job.json'), 'not json at all');
+  // Another writer's shared list, already on disk. It must come through untouched.
+  fs.writeFileSync(path.join(dir, 'reaped.pids'), '4242\n');
+  const victim = spawn(process.execPath, ['-e', 'setTimeout(()=>{}, 300000)'],
+    { stdio: 'ignore', detached: true });
+  victim.unref();
+  fs.writeFileSync(path.join(dir, 'codex.pid'), String(victim.pid));
+  const wedge = wedgeRecord(dir);
+  try {
+    assert.ok(await poll(() => pidAlive(victim.pid), 10000, 50), 'the victim must be up');
+    const c = run(['cancel', id]);
+    assert.equal(c.status, 0, `the kill itself needs no lock and must still verify: ${c.stderr}`);
+    assert.ok(await poll(() => !pidAlive(victim.pid), 20000), 'and it must have taken');
+
+    // Non-vacuity (observed): with the fallback reverted to the shared-file
+    // read-modify-write (`if (!withRecordLock(dir, mergeFile).locked) mergeFile();`),
+    // no sidecar is written at all — the count below is 0 — and the shared file is
+    // rewritten by that merge instead. The rewrite is the lost update: what it puts
+    // there is whatever THIS writer happened to read, so a concurrent writer's list
+    // is only there if it landed first.
+    const sidecars = fs.readdirSync(dir).filter((n) => /^reaped\.pids\.\d+$/.test(n));
+    assert.equal(sidecars.length, 1, `exactly one writer's sidecar: ${sidecars.join(', ')}`);
+    assert.match(fs.readFileSync(path.join(dir, sidecars[0]), 'utf8'),
+      new RegExp(`^${victim.pid}$`, 'm'), 'holding the numbers this writer reaped');
+    assert.equal(fs.readFileSync(path.join(dir, 'reaped.pids'), 'utf8'), '4242\n',
+      "the shared file is untouched byte for byte — there is nothing here to overwrite");
+
+    // And both lists are one ledger to every reader.
+    const spent = reapedPids(dir);
+    assert.equal(spent.has(4242), true, "the other writer's entry survives");
+    assert.equal(spent.has(victim.pid), true, "and so does this one's");
+  } finally {
+    liftWedge(wedge);
+    try { process.kill(victim.pid); } catch { /* already gone */ }
+  }
+});
+
+test('the reaped ledger is the UNION of every writer\'s file, and of nothing else', () => {
+  // The reader half of the sidecar rule, and the two concurrent unlocked writers
+  // posed as what they leave behind: two files, neither of which either writer ever
+  // read. Both sets have to come back, or the number that went missing is re-armed
+  // against whatever now holds it.
+  //
+  // The `.tmp` is the staging half of the LOCKED merge, which is named
+  // `reaped.pids.<pid>.tmp` and may be a torn write at any instant. Reading it as a
+  // sidecar would let a half-flushed file decide that a live process is spent, which
+  // is why the sidecar name is anchored on digits.
+  const id = 'reapunion-1-99982';
+  const dir = path.join(JOBS, id);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'job.json'), JSON.stringify({
+    recordVersion: RECORD_VERSION, id, role: 'reapunion', state: 'done',
+    started: new Date(Date.now() - 3600000).toISOString(), finished: new Date().toISOString(),
+    supervisorPid: null, codexPid: null, launch: 'exec', exitCode: 0,
+    sight: 'cwd-file:LICENSE', reapedPids: [10],
+  }));
+  fs.writeFileSync(path.join(dir, 'reaped.pids'), '20\n');
+  fs.writeFileSync(path.join(dir, 'reaped.pids.1111'), '30\n');
+  fs.writeFileSync(path.join(dir, 'reaped.pids.2222'), '40\n50\n');
+  fs.writeFileSync(path.join(dir, 'reaped.pids.3333.tmp'), '60\n');
+  fs.writeFileSync(path.join(dir, 'notreaped.pids.4444'), '70\n');
+
+  // Non-vacuity (observed): with the sidecar loop removed from `reapedPids`, 30, 40
+  // and 50 are absent — both unlocked writers' whole lists are lost to every reader,
+  // which is the same re-armed number by another route.
+  const spent = reapedPids(dir);
+  assert.deepEqual([...spent].sort((a, b) => a - b), [10, 20, 30, 40, 50],
+    'the record copy, the shared file, and every writer sidecar — and nothing else');
+  assert.equal(spent.has(60), false, 'a staged .tmp is not a sidecar: it may be half-written');
+  assert.equal(spent.has(70), false, 'and neither is a file that merely ends in a number');
+});
+
+test('a descendant whose start time cannot be read is never written down as codex',
+  { skip: process.platform === 'win32' ? false : 'Windows-only: the .cmd shell wrapper is a Windows path' },
+  async () => {
+    // THE WRAPPER-START FLOOR, in its fail-CLOSED direction. What `resolveWorkerPids`
+    // returns is written into `codexPids` alongside the pid's OWN current start time,
+    // so a process promoted by a no-opinion ppid edge is recorded with an identity
+    // that matches itself for ever: every later check compares the stranger to the
+    // stranger, and the job's cancel fires `taskkill /PID <n> /T /F` at somebody
+    // else's tree, with papers this runtime signed itself.
+    //
+    // A start time this host will not give up is therefore a NO. Posing a genuinely
+    // older descendant needs the OS to reissue a specific number under a wrapper this
+    // suite just spawned, which cannot be aimed at; NO_START_TIMES poses the other
+    // input to the same decision — the floor is unreadable, so nothing clears it.
+    //
+    // Both halves are run, because the cost of getting this wrong in the other
+    // direction is an unrecorded codex: with the query working the real worker behind
+    // the wrapper IS written down, and that is the same dispatch one hook apart.
+    const brief = writeBrief('brieffloor.md', 'slow');
+    const env = { CODEX_DISPATCH_BIN: FAKE_CMD, FAKE_CODEX_SLEEP_MS: '60000' };
+    const seen = run(['dispatch', '--brief', brief, '--role', 'floorseen'], env);
+    assert.equal(seen.status, 0, seen.stderr);
+    const seenId = jobIdFrom(seen.stdout);
+    const blind = run(['dispatch', '--brief', brief, '--role', 'floorblind'],
+      { ...env, CODEX_DISPATCH_TEST_NO_START_TIMES: '1' });
+    assert.equal(blind.status, 0, blind.stderr);
+    const blindId = jobIdFrom(blind.stdout);
+    try {
+      assert.ok(await poll(() => (record(seenId).codexPids || []).length > 1, 40000),
+        'with start times readable, the real worker behind the wrapper is recorded');
+      // `launch: 'exec'` is the registration landing, which is the write that puts
+      // `codexPids` down — reading it any earlier would race the write under test.
+      assert.ok(await poll(() => record(blindId).launch === 'exec', 40000),
+        'the blind supervisor must get as far as recording what it spawned');
+
+      // Non-vacuity (observed): with the floor removed from the poll — `const born =
+      // kin;` — this job recorded FIVE pids, every number the ppid walk reached
+      // behind a wrapper whose start nothing could read. That is the defect exactly:
+      // four of them written down as codex with an identity nothing proved was ours,
+      // each one a `taskkill /PID <n> /T /F` target for the rest of the job.
+      const rec = record(blindId);
+      assert.deepEqual(rec.codexPids, [rec.codexPid],
+        `only the wrapper this supervisor spawned itself is a recorded target: ` +
+        `${JSON.stringify(rec.codexPids)}`);
+      // Written immediately after the registration, so it is polled rather than read
+      // out of the snapshot above.
+      assert.ok(await poll(() => record(blindId).warning, 20000),
+        'and the cost is stated on the record rather than swallowed');
+      assert.match(String(record(blindId).warning), /codex worker pid could not be resolved/);
+      assert.equal(
+        fs.readFileSync(path.join(JOBS, blindId, 'codex.pid'), 'utf8').trim().split(/\s+/).length, 1,
+        'the pid file mirrors exactly what was proven, and nothing that was not');
+    } finally {
+      for (const id of [seenId, blindId]) run(['cancel', id]);
+    }
+  });
+
+test('the POSIX session sweep reaches a child that left the process group',
+  { skip: 'POSIX-only, and integration-only on every host: neither the session-aware `ps` parser '
+      + 'nor `sessionMembers` is exported, and the escape they guard — a child that calls setpgid '
+      + 'without setsid — cannot be posed from node (`detached: true` calls setsid, which leaves the '
+      + 'session too). Left unwritten rather than written unverified; see the report for Fix 6.' },
+  () => {});
 
 test('every state/reason pair this suite put on disk is one the docs allow', () => {
   // The record-level half of the pair contract (the source-level half is in

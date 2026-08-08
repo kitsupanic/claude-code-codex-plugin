@@ -55,7 +55,7 @@ this is orchestration infrastructure.
 | **Job model** | background jobs polled from the session via a companion app-server broker | detached supervisor, on-disk records, unique job dirs, atomic role claims, verified kill-before-retry, stale reaping, atomic type-checked records, whitelisted ids and roles proved inside the jobs root |
 | **Hooks** | `SessionStart`/`SessionEnd` lifecycle, plus an opt-in stop-time review gate | none, ever — enforced by a test |
 | **Footprint** | companion app-server, agents, skills, prompt templates, output schemas, 8 commands | one zero-dependency script, 7 commands, 1 skill |
-| **Tests** | 8 test files, CI on every pull request | 164 tests — fake-codex lifecycle drills, the deliverability matrix, sight-gate and kill-verification drills, path-escape canaries, a concurrency race and a fenced-claim takeover, plus an opt-in live smoke |
+| **Tests** | 8 test files, CI on every pull request | 171 tests — fake-codex lifecycle drills, the deliverability matrix, sight-gate and kill-verification drills, path-escape canaries, a concurrency race and a fenced-claim takeover, plus an opt-in live smoke |
 
 Things the official plugin has that this one deliberately does not: the
 `codex-rescue` subagent, `/codex:review`'s zero-brief native reviewer, the
@@ -194,15 +194,17 @@ every install was pinned to the first of them — the fix landed in the repo and
 nowhere else, silently, which is the same shape of failure as a blind answer:
 confident, and wrong in a way nothing surfaces.
 
-Current release: **0.8.5** — the end of a four-patch arc on one mechanism, the
-record lock, each release a second opinion on the one before it: 0.8.2 published
-the lock by an atomic rename so no writer can see one without a holder in it,
-0.8.3 made every destructive step prove it is destroying what it condemned,
-0.8.4 closed the room behind that by refusing to acquire past a live lock
-stranded in a tombstone, and 0.8.5 finished the rule the other three imply — the
-release renames before it removes like every other break, and every write whose
-loss would strand a record is checked and said out loud instead of hoped for.
-Blow-by-blow in [docs/CHANGELOG.md](docs/CHANGELOG.md).
+Current release: **0.8.6** — a five-patch arc on the record lock (0.8.2–0.8.5,
+each release a second opinion on the one before it: an atomic rename so no writer
+sees a lock without a holder, every destructive step proving it is destroying
+what it condemned, the room behind that closed by refusing to acquire past a live
+stranded lock, and every write whose loss would strand a record checked and said
+out loud) — and then 0.8.6 turned the same adversarial lens on the KILL seam:
+process identity under pid reuse. The kill decision stays fail-open so a slow
+process table never leaves real codex billing, but what gets recorded as a
+target now fails closed, a verified-dead pid is marked spent, a failed
+start-time query no longer poisons the cache, and the launch phase can never
+rewind. Blow-by-blow in [docs/CHANGELOG.md](docs/CHANGELOG.md).
 
 0.8.1 — a dual review of 0.8.0, whose lead finding is a
 correction to what 0.8.0 claimed: dispatch's own post-spawn cancel branch was the
@@ -303,7 +305,7 @@ node scripts/codex-dispatch.mjs preflight         # install / auth / functional-
 ## Tests
 
 ```
-node --test                            # everything: 164 tests (bare form — see below)
+node --test                            # everything: 171 tests (bare form — see below)
 node --test tests/dispatch.test.mjs    # lifecycle, against a fake codex
 node --test tests/packaging.test.mjs   # manifests, command frontmatter, no-hooks invariant
 node --test tests/resolution.test.mjs  # binary resolution, sight-probe targeting, blind scan, whitelists, deliverability (imported, not spawned)

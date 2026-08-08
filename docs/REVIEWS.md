@@ -3,9 +3,9 @@
 Every constraint in the runtime traces to an entry here. The catalog records the
 production failures this design answers; the review sections record the dual
 frontier reviews of 0.3.0, 0.4.0, 0.8.0 and 0.8.1, the 0.7.3 full-repo
-review, the 0.8.2 and 0.8.3 single-seam reviews, and the 0.8.4 docs-truth
-audit, whose findings became 0.4.0, 0.5.0, 0.8.0, 0.8.1, 0.8.2, 0.8.3,
-0.8.4 and 0.8.5.
+review, the 0.8.2 and 0.8.3 single-seam reviews, the 0.8.4 docs-truth
+audit, and the 0.8.5 kill-seam review, whose findings became 0.4.0, 0.5.0,
+0.8.0, 0.8.1, 0.8.2, 0.8.3, 0.8.4, 0.8.5 and 0.8.6.
 
 ## The failure catalog behind the design (2026-08-05/06, all seen in production)
 
@@ -762,3 +762,118 @@ round ended a turn "waiting" on a background suite run that its harness
 reaps at turn end — the same wait-that-was-never-alive the relay was cured
 of two days earlier, proving the lesson generalizes: no agent may end a
 turn owing work to a background child.
+
+### The 0.8.5 kill-seam review (2026-08-08) — the review that had to be re-framed to run, and the seven that were one
+
+After five patches on the record lock the adversarial lens moved to the kill
+seam, and the dispatch hit something no prior round had: **Codex's own content
+filter refused the brief.** The framing — "construct any interleaving in which
+the runtime kills a wrong target" — reads as offensive-security work, and the
+first job came back `failed` with a Trusted-Access-for-Cyber notice. The retry
+of the identical brief was doomed to the same refusal, so the request was
+re-framed as what it actually is: a correctness review of the project's own
+process-termination code, so it kills reliably and only its own processes. That
+passed preflight and ran. The lesson is operational and durable: an adversarial
+brief to a filtered model must be written as the defensive work it is, not as an
+attack to construct — the substance was identical, only the framing was honest
+about intent. Every future security-shaped dispatch to Codex starts from the
+defensive framing.
+
+The review returned seven findings, five High and two Medium; six independent
+arms adjudicated them, one per finding. The severities came down hard — one High
+survived, the rest resized to Medium or Low — and, more usefully, the seven
+collapsed to a single concern: **process identity under pid reuse.** Every
+finding was a way for the runtime to sign papers for the wrong process, or to
+fail to sign them for the right one, once the OS reissues a number.
+
+The decision the round turned on was the fail direction, and two adjudicators
+appeared to contradict each other on it — one arguing the kill must stay
+fail-open, another that a fail-closed identity check was the single most
+important change. The reconciliation is that they were describing **different
+kill sites.** The primary kill of a live job's own recorded pids must stay
+fail-open: "identity unknown" there is almost always a slow or broken process
+table over genuine pids, and failing closed would skip real codex and leave it
+billing — and, structurally, verification's survivor set is derived from the
+fired set, so a skip the kill makes is a skip verification is blind to, and the
+skipped codex verifies as a clean kill. So fail-open on the kill decision is not
+a weakness to be corrected; it is load-bearing. The discipline changes live
+everywhere else: at what gets **recorded** as a target (fail closed — never
+manufacture a vouched target from an unproven inference), at what gets **marked
+spent** (a verified-dead pid is recorded reaped), and at the **cache** (never
+poisoned on a query failure) — plus the launch phase may only advance.
+
+- **The one true High: dispatch's post-spawn write could rewind the phase.** It
+  was the seam's single non-CAS writer, a shallow merge that could put
+  `launch: 'spawned'` back over a supervisor's `exec-spawning` and replace the
+  codex pids' start identities with the supervisor's alone. A cancel then read
+  the regressed phase, killed the supervisor, missed the detached POSIX codex
+  spawned after its snapshot, and recorded `killed` with the role released while
+  codex billed. The repo's own comments already documented the supervisor
+  winning that race for a different reason — the ordering was known, the write
+  just never defended against it. A function patch now merges pid identities and
+  advances the phase, never rewinds it.
+- **Identity forged from a stale edge.** A "no-opinion" parent edge in the
+  Windows descendant walk — kept when start times were absent or tied — could
+  promote an unrelated process into `codex.pid`, recorded with its *own* start
+  time, so every later identity check was self-consistent for the wrong process
+  and `taskkill /T` eventually fired at a stranger's whole tree, permanently.
+  Closed with a wrapper-start floor at the recording site: a descendant older
+  than the wrapper that spawned it cannot be its child and is never recorded;
+  ties accepted, because cmd.exe spawns its worker within milliseconds.
+- **A timed-out query poisoned the cache forever.** The start-time lookup cached
+  its misses, and a load-induced timeout was cached identically to a genuine
+  absence — latching "no opinion" through every retry, and in the long-lived
+  watcher, permanently. The comment justifying the cache ("won't answer better
+  later") was false for a timeout. Now a miss is cached only when the query
+  itself succeeded.
+- **The kill signalled the confirmed-dead twice.** Round two fired at every pid,
+  including ones round one had watched die, so a number reissued in the verify
+  window took its inheritor's tree. Round two now skips a seen-dead set collected
+  from round one, and the code's "not signalled twice" is true as written.
+- **A survivor was named but never hunted.** A late worker that survived a kill
+  was reported as a survivor and stored as display text — never fed back as a
+  target — so retry was a permanent no-op, and on a POSIX reparent the job could
+  record `killed` over a live worker. Survivors are now persisted as
+  identity-anchored targets, the recorded anchor winning so a fail-open-waved
+  number cannot self-stamp.
+- **Our own 0.8.5 fix left a re-arm.** The registration-failure cleanup killed a
+  codex pid, verified it dead, and — standing down against a concurrent cancel's
+  `kill-pending` — left it un-spent under a live record, so a retry re-fired the
+  number at its new owner. It now records the pid reaped; the ledger's unlocked
+  fallback lands the spent-mark even under the refused lock.
+- **The last-resort ledger lost updates.** When neither lock attempt succeeded,
+  the reaped ledger did an unlocked read-modify-write on the shared file, so two
+  writers lost one's spent-marks. Each writer now stages its own sidecar and
+  readers union them: no shared-file RMW, no lost update, tmp+rename so no torn
+  line.
+- **A POSIX group-leaver escaped the net.** A child that left codex's process
+  group and lost its parent chain was invisible to the group kill. The process
+  table now carries a session column, and any live pid in codex's session is a
+  target — with the honest residual that a full `setsid()` child leaves the
+  session too and cannot be discovered.
+
+Two of the fixes are pinned by review rather than by test, because their trigger
+— a pid reissued inside a ~3-second verify window — is not producible on demand,
+and a hook that faked it would assert the branch rather than the race; the code
+says so in the file's own idiom. Two new inert hooks (`REGISTER_PAUSE_MS`,
+`NO_START_TIMES`) finally made the phase-rewind and cache-poison interleavings
+posable — their absence was exactly why these survived the earlier sweeps. Seven
+tests went in (110 to 117 dispatch, 171 total); the POSIX session sweep ships
+with a **skipped** test carrying its reason, because `detached` on POSIX is
+`setsid`, so node cannot spawn the setpgid-only child the sweep exists to catch.
+
+The residuals are stated in DESIGN rather than implied away: the POSIX session
+sweep and its decimal parser have never run against a live `ps` in this
+Windows-only CI; macOS worker resolution records no discovered descendants (no
+`etimes`) and degrades to the wrapper-only fallback with a warning; the
+survivor-persist path can still anchor a never-recorded stranger inside a
+seconds-wide reuse window; and the full-`setsid()` leaver is undiscoverable by
+construction. The lesson the round adds to the catalog: **when every finding in
+a review is a different face of one invariant, fix the invariant, not the faces
+— and decide its fail direction once, per site, in the open.**
+
+One operational note, in the running series of them: a test agent probing a fix
+ran `clean --all` against the real jobs root without a scratch
+`CODEX_DISPATCH_JOBS` and deleted the finished-job history there — the same class
+of accident the scratch-root rule exists to prevent, now written into every
+brief that carries a shell.

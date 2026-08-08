@@ -3,6 +3,135 @@
 Versioning rule: **a push that changes behavior MUST bump the version** — see
 [README → Releases and versioning](../README.md#releases-and-versioning) for why.
 
+## 0.8.6
+
+A fourth opinion from GPT-5.6, adversarial and aimed at the **kill seam** — and
+the first review of this arc to be refused by Codex's own content filter. The
+framing was "construct an interleaving that kills a wrong target", which reads as
+offensive-security work; re-dispatched with the framing the task actually had — a
+correctness review of this project's own process-termination code — it ran. Seven
+findings, five High and two Medium as filed. All seven adjudicated by six
+independent arms, and adjudication did two things worth recording: it brought the
+severities down substantially (one High held, the rest Medium or Low), and it
+collapsed the seven into **one** root concern. Patch bump: no new verb, no schema
+change, and **no new reason** — every fix reused the reasons already there — with
+a shared thesis: **identity fails open to kill, and closed to write a target
+down.**
+
+**The kill decision stays fail-open, and that is the organizing choice.** A pid
+whose identity cannot be proved but which is genuinely alive must still be
+killable: a slow process table or a timed-out query is not evidence of innocence,
+and withholding the signal leaves a real codex billing with nothing left that can
+stop it. So the primary kill keeps its rule that the check only ever *subtracts*.
+Two adjudicators looked like they disagreed about the fail direction; the
+reconciliation is that they were about different kill sites, and the discipline
+that changed is the discipline of the **writes**. What gets **recorded** as a
+target fails closed, because a pid written into the record beside its own start
+time matches itself for ever — a stranger vouched for once is vouched for
+permanently, and every later check confirms the forgery. What is **verified dead**
+is always marked spent, because an unrecorded verified kill re-arms the number.
+And the **cache** is never poisoned by a query that failed. Above all of them, the
+launch phase may never rewind.
+
+**Dispatch's post-spawn write was the seam's one non-CAS writer.** A shallow
+merge, landing after the supervisor had already reached `exec-spawning`, could
+rewind `launch` back to `spawned` and wipe the codex pids' start identities in the
+same stroke — so a POSIX cancel read the earlier phase, killed the supervisor,
+never touched the detached codex, and recorded the job killed while it went on
+billing. The single most consequential finding of the review and the one High that
+survived adjudication intact. It is a function-patch now: `pidStarts` merges
+rather than replaces, and the phase only ever advances.
+
+**A "no opinion" is not an identity, and the Windows descendant walk used to
+treat it as one.** With start times absent or tied, the walk could promote an
+unrelated process into `codex.pid` — and record it with **its own** start time, so
+every identity check afterwards was perfectly self-consistent about the wrong
+process. The result is a `taskkill /T` at a stranger's entire tree, and it is not a
+transient: it is the job's recorded truth for the rest of its life. Closed at the
+recording site with a **wrapper-start floor** — a descendant older than the wrapper
+that spawned it is never written down — which is the fail-closed direction applied
+where it belongs, on *adding*. Ties are accepted deliberately: `cmd.exe` spawns
+node within milliseconds of itself, and a floor that rejected equal starts would
+reject the real worker.
+
+**A cached miss from a query that never ran disarms the check for ever.** The
+start-time lookup cached its negatives on a comment that justified it — "it won't
+answer better later" — which is true of a process that does not exist and false of
+a fifteen-second timeout under load. The false half latched "no opinion" into a
+per-process cache: through every retry, and through the entire life of the
+long-lived watch loop. The cache is now written only on a query that **succeeded**
+with a genuinely absent row. A query that could not run answers nothing and
+remembers nothing.
+
+**Round 2 of `killPids` re-fired at pids round 1 had watched die.** A number
+reissued inside the verify window got its inheritor's tree signalled by the second
+round of a kill that had already worked — the reuse hazard produced by the
+mechanism that exists to be thorough about reuse. Round 2 skips a seen-dead set
+collected from round 1, which has the incidental virtue of making the code's own
+comment ("nothing is signalled twice") true as written rather than aspirational.
+
+**A survivor that nothing can retry is not a survivor, it is a sentence.** A
+kill-failed late worker was reported to the operator as surviving and then
+discarded: survivors were display text, never persisted as targets, so the retry
+that the whole `kill-failed` state exists to arm was a permanent no-op — and on
+POSIX a reparented survivor could go on billing under a record that said `killed`.
+Survivors are persisted as **identity-anchored** targets now, with an anchor the
+record already holds always winning, so a number that fail-open waved through
+cannot self-stamp over a real identity.
+
+**0.8.5's own registration-failure cleanup left a verified kill unrecorded.** The
+kill it fires is verified, and its pid was left un-spent under a live
+`kill-pending` — so a retry re-fired that number at whoever had inherited it by
+then, which is the precise hazard the reaped ledger was built for, reintroduced by
+a release that was tightening the same seam. It records the pid reaped, and the
+ledger's unlocked fallback means the mark lands even when the lock is refused.
+
+**And that fallback was losing writes.** The unlocked last resort did a
+read-modify-write on the shared ledger, so under contention one writer's spent
+marks silently dropped another's — re-arming exactly the numbers the file exists to
+retire, on the path taken when things are already going badly. Each writer stages
+its **own** sidecar now and readers take the union: no lost update by construction,
+and the write is tmp+rename, so no reader ever sees a torn line.
+
+**A POSIX child can leave the process group and the parent chain both, and then
+nothing was looking for it.** The group kill misses it and the descendant walk
+cannot reach it. The process table carries a **session** column now, and any live
+pid in codex's session is a target. The residual is stated in the same breath
+rather than implied away: a child that calls `setsid()` outright leaves the session
+too, and this finds nothing it cannot see.
+
+Alongside them: `reapUnvouchedJob` routes through the identity filter — a **TOCTOU
+backstop** today rather than a live guard, since every current caller reaches it
+only with unreadable records, and it is documented as exactly that; session
+parsing is decimal-only; and the comments and DESIGN passages where the prose
+promised more than the code delivered are corrected in the same pass, which is
+0.8.5's finding applied to itself.
+
+**Residuals, stated rather than closed.** The POSIX session sweep and the decimal
+parser have never run against a live `ps` — the host is Windows-only and there is
+no CI standing behind them. macOS worker resolution records **no** discovered
+descendants at all: there is no `etimes` to floor them with, so it falls back to
+the wrapper-only path and warns. The survivor persist can still anchor a
+never-recorded stranger inside a seconds-wide reuse window, and DESIGN carries the
+argument for why a floor there would cost more than it buys rather than a claim
+that the case is handled. And the full-`setsid()` session-leaver is undiscoverable.
+
+**Test hooks: two new knobs, and adjudication named both as the reason these
+survived the last sweep.** `CODEX_DISPATCH_TEST_REGISTER_PAUSE_MS` holds the
+dispatch between spawning the supervisor and the write that registers its pid —
+the only point from which the phase-rewind interleaving can be posed, since the
+existing spawn pause sits *after* that write. `CODEX_DISPATCH_TEST_NO_START_TIMES`
+makes the start-time query unable to run at all, which is the cache-poison case.
+Both are inert unless set.
+
+**Tests: 110 → 117 in the dispatch suite, 171 total.** One POSIX-only test is
+present and **skipped with its reason visible**: the session sweep cannot be posed
+from node, because `detached` there *is* `setsid` and the child leaves the very
+session the test needs it to stay in. Several properties are review-pinned rather
+than tested and say so in comments, in the file's existing idiom — pid reuse inside
+a ~3s window is not producible on demand, and a test that pretended otherwise
+would be testing its own scaffolding.
+
 ## 0.8.5
 
 A third opinion from GPT-5.6, and this one was not aimed at the code at all: a

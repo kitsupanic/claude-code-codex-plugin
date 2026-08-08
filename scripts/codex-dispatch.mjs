@@ -83,6 +83,13 @@ export const KNOWN_LAUNCH_PHASES = ['pending', 'spawning', 'spawned', 'exec-spaw
 // An unrecognised phase resolves to the most dangerous one: codex may be running
 // and unregistered.
 export const MOST_DANGEROUS_PHASE = 'exec-spawning';
+// THE PHASE ONLY EVER MOVES FORWARD. The phases from which `spawned` is an
+// advance — and therefore the only ones dispatch's post-spawn write may set it
+// over. Everything later was written by the supervisor, which knows something
+// this dispatch does not: that codex exists. Writing `spawned` over
+// `exec-spawning` or `exec` is not bookkeeping, it is telling `killWindow` that a
+// codex-exec window is not open when it is.
+export const PRE_SPAWNED_PHASES = ['pending', 'spawning'];
 
 // A pid is a positive integer in a domain an OS could actually have issued.
 // `supervisorPid: -1` used to reach killPlan(-1), which off Windows signals the
@@ -1577,6 +1584,23 @@ export function pidAlive(pid) {
 // manufacture one — because the direction that costs money is declining to kill
 // a codex that really is there, and that direction stays closed.
 //
+// AND THAT IS ONE OF FOUR DECISIONS, NOT ALL OF THEM. Process identity under pid
+// reuse touches four places in this file, and only the first is fail-open:
+//   the KILL DECISION      — fail OPEN. An unproven identity over a genuine pid
+//                            is still killed (the paragraph above). Do not flip it.
+//   what is RECORDED as a  — fail CLOSED. A vouched-for target is never
+//   target                   manufactured from an unproven inference: see the
+//                            wrapper-start floor on `resolveWorkerPids`, which
+//                            refuses to write down a discovered descendant it
+//                            cannot show started after the wrapper did.
+//   what is MARKED SPENT   — a pid VERIFIED dead is recorded reaped, always, or
+//                            the number is re-armed against its next owner.
+//   the CACHE              — never poisoned by a query that failed: a miss is
+//                            remembered only when the OS actually answered.
+// Nothing in any of the three may regress the launch phase or the launch path;
+// the cost of being wrong there is an unkillable codex, which is the one outcome
+// worse than a stranger's process surviving.
+//
 // Two readings of the same instant differ by the rounding of whatever printed
 // them, so a couple of seconds apart is the same process.
 const START_TIME_SLOP_MS = 2000;
@@ -1600,9 +1624,17 @@ function injectedStartTime(pid) {
 // the watcher asks about the same supervisor every 500ms for as long as the job
 // runs — a shell spawn a tick is not a diagnostic, it is a load. A number
 // reissued DURING one of these processes' lifetimes reads as the old process,
-// which is the fail-open direction and exactly today's behaviour. Misses are
-// cached too: a query that could not answer once will not answer better 500ms
-// later, and its answer is "no opinion" either way.
+// which is the fail-open direction and exactly today's behaviour.
+//
+// A MISS IS CACHED ONLY WHEN THE QUERY ITSELF SUCCEEDED. An absent row from a
+// `ps` that exited 0, or from a CIM query that ran and named no such process, is
+// a real answer: that pid is gone, and asking again buys nothing. A query that
+// FAILED — a non-zero `ps`, both shells refusing, the 15s timeout tripping under
+// load — answered nothing at all, and caching "no opinion" for it poisons this
+// pid for the lifetime of the process: the watch loop is long-lived, and the same
+// map is read again at killJob's identity pass and at the post-kill check. One
+// unlucky second of load would permanently disarm the identity check for that
+// number. So a failed query leaves the cache untouched and the next caller re-asks.
 const startTimeCache = new Map();
 
 // The OS's start time for each of these pids, as ISO text, in ONE query — a
@@ -1631,23 +1663,35 @@ function pidStartTimes(pids) {
   }
   if (!ask.length) return out;
   const found = new Map();
-  // Every pid that was asked about gets an entry, so a pid the OS would not name
-  // is not asked about again by this process.
-  const answer = () => {
-    for (const pid of ask) startTimeCache.set(pid, found.get(pid) || null);
+  // `queried` is the whole discipline: every pid that was asked about gets a
+  // cached entry when the OS was actually heard from — so a pid it would not name
+  // is not asked about again by this process — and NOTHING is cached when it was
+  // not, so a failure is re-asked rather than remembered as a verdict.
+  const answer = (queried) => {
+    if (queried) for (const pid of ask) startTimeCache.set(pid, found.get(pid) || null);
     for (const [pid, when] of found) out.set(pid, when);
     return out;
   };
+  // Test-only: the start-time query cannot run at all — a host where PowerShell
+  // will not start, a `ps` that is not on PATH, the 15s timeout tripping under
+  // load. None of those is producible on demand in CI, and what is under test is
+  // the DECISION a failed query makes: it answers nothing AND remembers nothing,
+  // so the next caller asks again. Never set outside the suite.
+  if (process.env.CODEX_DISPATCH_TEST_NO_START_TIMES) return answer(false);
   const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 15000 };
   if (!WIN) {
     const r = spawnSync('ps', ['-o', 'pid=,etimes=', '-p', ask.join(',')], opts);
-    if (r.status !== 0) return answer();
+    // `ps -p` exits 1 when NONE of the pids exist, which is an answer; but it
+    // exits non-zero for a failed query too, and the two are not distinguishable
+    // here. The safe reading is the one that re-asks: an unnecessary second query
+    // costs a shell spawn, a poisoned cache costs the identity check.
+    if (r.status !== 0) return answer(false);
     const now = Date.now();
     for (const line of String(r.stdout || '').split(/\r?\n/)) {
       const m = line.trim().match(/^(\d+)\s+(\d+)$/);
       if (m) found.set(Number(m[1]), new Date(now - Number(m[2]) * 1000).toISOString());
     }
-    return answer();
+    return answer(true);
   }
   // The filter is built from numbers that already passed `isPid`, so nothing
   // untrusted reaches the WQL. `.ToString('o')` is the round-trip format:
@@ -1656,16 +1700,23 @@ function pidStartTimes(pids) {
   const script =
     `Get-CimInstance Win32_Process -Filter '${filter}' | ` +
     `ForEach-Object { "$($_.ProcessId) $($_.CreationDate.ToString('o'))" }`;
+  // A shell that exited 0 ANSWERED, even when it named nothing: the pids asked
+  // about are simply gone. The second shell is tried anyway on an empty answer,
+  // because a powershell that runs and prints nothing is also how a broken CIM
+  // looks — but the fact that one of them ran is remembered, so an empty-but-real
+  // answer is still cached. Only "neither shell would run" declines to cache.
+  let queried = false;
   for (const shell of ['powershell', 'pwsh']) {
     const r = spawnSync(shell, ['-NoProfile', '-NonInteractive', '-Command', script], opts);
     if (r.status !== 0) continue;
+    queried = true;
     for (const line of String(r.stdout || '').split(/\r?\n/)) {
       const m = line.trim().match(/^(\d+)\s+(\S+)$/);
       if (m) found.set(Number(m[1]), m[2]);
     }
-    if (found.size) return answer();
+    if (found.size) return answer(true);
   }
-  return answer();
+  return answer(queried);
 }
 
 // Same process, or not enough evidence to say otherwise. Absence on either side
@@ -2806,6 +2857,18 @@ function killTree(pid) {
 // alongside their recorded ancestors, and any that remain afterwards are
 // survivors. Returns a Map<pid, ppid>, or null when the table cannot be read —
 // which is reported, never silently treated as "the tree is empty".
+//
+// AND OFF WINDOWS IT CARRIES THE SESSION TOO, on a `sessions` property beside the
+// map (Map<pid, sid>, absent on Windows and on any `ps` that would not say). The
+// ppid walk and the process group are both escapable: a child that calls
+// `setpgid` leaves codex's group — `groupAlive` stops seeing it — and Windows-
+// style reparenting aside, a POSIX orphan's ppid becomes 1. The SESSION is the
+// one membership a plain `setpgid` cannot shed, and codex is spawned with
+// `detached: true`, which makes its pid the session id as well as the pgid. So
+// `sess === codexPgid` is a third way to recognise a process this job started.
+// The map shape is kept exactly as it was because `descendantsOf` is the walk's
+// contract and is tested against it; the sessions ride alongside rather than
+// changing it.
 function processTable() {
   const parse = (text) => {
     const table = new Map();
@@ -2815,6 +2878,37 @@ function processTable() {
     }
     return table.size ? table : null;
   };
+  // The POSIX parser is field-based rather than anchored, because the session
+  // column is not the same thing everywhere: Linux `sess` is the session id, and
+  // macOS prints a session POINTER, which is not a pid and must not be compared
+  // to one. A column that does not read as a positive integer is simply not
+  // recorded, which leaves the session sweep with no opinion there rather than a
+  // wrong one — and the pid/ppid pair, which is what the walk needs, still parses.
+  //
+  // DECIMAL OR NOTHING, and that is the guard `Number()` does not give: it accepts
+  // `0x...`, which is exactly the shape a macOS session POINTER is printed in. A
+  // small hex pointer would otherwise read as a positive integer, be recorded as a
+  // session id, and — vanishingly rarely, but for free — match a live `codexPgid`
+  // and put a stranger in the session sweep's target list. A column that is not
+  // plain digits is not recorded, which leaves the sweep with no opinion.
+  const decimal = (s) => (/^\d+$/.test(s) ? Number(s) : NaN);
+  const parsePosix = (text) => {
+    const table = new Map();
+    const sessions = new Map();
+    for (const line of String(text).split(/\r?\n/)) {
+      const f = line.trim().split(/\s+/);
+      if (f.length < 2) continue;
+      const pid = decimal(f[0]);
+      const ppid = decimal(f[1]);
+      if (!Number.isInteger(pid) || !Number.isInteger(ppid)) continue;
+      table.set(pid, ppid);
+      const sess = decimal(f[3] ?? '');
+      if (Number.isInteger(sess) && sess > 0) sessions.set(pid, sess);
+    }
+    if (!table.size) return null;
+    table.sessions = sessions;
+    return table;
+  };
   // Test-only: the table cannot be read at all — a host where PowerShell will
   // not run, a WMI service that is down, a `ps` that is not on PATH. Producing
   // that on demand in CI is not possible; what is under test is the DECISION
@@ -2823,8 +2917,17 @@ function processTable() {
   if (process.env.CODEX_DISPATCH_TEST_NO_PROCESS_TABLE) return null;
   const opts = { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, timeout: 15000 };
   if (!WIN) {
-    const r = spawnSync('ps', ['-eo', 'pid=,ppid='], opts);
-    return r.status === 0 ? parse(r.stdout) : null;
+    // The wide form first, the old two-column form as the fallback: a `ps` that
+    // does not know `sess` must degrade to the table this runtime always read,
+    // not to "the process table could not be read" — which would turn every kill
+    // on such a host into an unverified one.
+    for (const fields of ['pid=,ppid=,pgid=,sess=', 'pid=,ppid=']) {
+      const r = spawnSync('ps', ['-eo', fields], opts);
+      if (r.status !== 0) continue;
+      const table = parsePosix(r.stdout);
+      if (table) return table;
+    }
+    return null;
   }
   const script =
     'Get-CimInstance Win32_Process | ForEach-Object { "$($_.ProcessId) $($_.ParentProcessId)" }';
@@ -2910,6 +3013,30 @@ function startedBefore(child, parent) {
   return a < b - START_TIME_SLOP_MS;
 }
 
+// Every live pid the table places in one of these sessions. POSIX only: the map
+// is absent on Windows and on a `ps` that would not name a session, and no
+// session means no opinion, never an empty answer that stands in for one.
+//
+// A child that calls `setpgid` leaves the group codex leads and becomes invisible
+// to `groupAlive`; it stays in codex's SESSION, and codex is spawned detached, so
+// its pid is that session's id — the same number the record already carries as
+// `codexPgid`. That is the whole mechanism.
+//
+// RESIDUAL, stated where it lives: a child that calls `setsid()` outright leaves
+// the session too, and nothing here can see it. Recorded in DESIGN.md's residuals
+// rather than guessed at — there is no membership left to test it by.
+function sessionMembers(sessionIds, table) {
+  const sessions = table && table.sessions;
+  if (!sessions || !sessionIds.length) return [];
+  const wanted = new Set(sessionIds.filter(isPid));
+  if (!wanted.size) return [];
+  const out = [];
+  for (const [pid, sid] of sessions) {
+    if (isPid(pid) && wanted.has(sid)) out.push(pid);
+  }
+  return out;
+}
+
 // The real process(es) behind a shell wrapper. Polled rather than read once,
 // because cmd.exe takes a moment to start what it was asked to start, and an
 // empty answer here is the difference between verifying codex and verifying a
@@ -2918,7 +3045,52 @@ function startedBefore(child, parent) {
 const WORKER_RESOLVE_MS = 5000;
 const WORKER_POLL_MS = 200;
 
-function resolveWorkerPids(wrapperPid, { timeoutMs = WORKER_RESOLVE_MS } = {}) {
+// THE WRAPPER-START FLOOR, and it is the one place in this file where the
+// start-time machinery FAILS CLOSED.
+//
+// `livingDescendantsOf` may only subtract what it can DISPROVE, so it keeps every
+// edge it has no opinion about: absent, unparseable or within-slop start times
+// leave a claimed parentage standing. That is right for a KILL — sparing a real
+// descendant is the expensive mistake there. It is exactly wrong for a RECORD.
+// What this function returns is written into `codexPids` and `codex.pid`
+// alongside the pid's OWN current start time, so an unrelated process promoted by
+// a no-opinion edge is recorded with an identity that matches itself for ever:
+// every later check compares the stranger to the stranger and waves it through,
+// and the job's cancel fires `taskkill /PID <n> /T /F` at somebody else's tree.
+// The runtime would be signing the papers itself, permanently.
+//
+// So a discovered descendant is written down only if it could really be the
+// wrapper's child, and the test is the floor a genuine child cannot be under: it
+// started at or after the wrapper did. `wrapperStart` is read in the parent at
+// spawn time, when the number is certainly still the process just created, and
+// anything older than `wrapperStart - START_TIME_SLOP_MS` existed before the
+// wrapper did and is not its child, whatever the ppid field says.
+//
+// TIES AND NEAR-TIES ARE ACCEPTED. cmd.exe starts node within milliseconds and
+// both readings are rounded by whatever printed them, so a strict "after" would
+// reject the genuine worker on every run — the slop is the same two seconds
+// `sameStartTime` allows, used in the same direction.
+//
+// AND AN UNREADABLE START IS A NO. This is the closed direction: a pid whose
+// start time the OS will not give up cannot be shown to be ours, so it is not
+// recorded as ours. The cost is bounded and already handled — the wrapper itself
+// stays a recorded target, the supervisor warns that no worker could be resolved,
+// and the kill-time descendant walk still reaches the real workers from the live
+// wrapper (that walk is fail-open, and stays that way; nothing it finds is
+// persisted). On a host that never answers — macOS `ps` has no `etimes` — the
+// answer is the wrapper-only fallback this runtime already ships for a wrapper
+// that produced no children.
+function bornAfterWrapper(kin, wrapperStart, starts) {
+  const floor = Date.parse(wrapperStart ?? '');
+  if (!Number.isFinite(floor)) return [];
+  return kin.filter((pid) => {
+    const when = starts.get(pid);
+    if (typeof when !== 'string' || !Number.isFinite(Date.parse(when))) return false;
+    return !startedBefore(when, wrapperStart);
+  });
+}
+
+function resolveWorkerPids(wrapperPid, { timeoutMs = WORKER_RESOLVE_MS, wrapperStart = null } = {}) {
   if (!isPid(wrapperPid)) return [];
   // Monotonic, like every other in-process wait bound here: a wall-clock step
   // must not be able to shorten or extend a poll a caller is blocked in.
@@ -2926,9 +3098,13 @@ function resolveWorkerPids(wrapperPid, { timeoutMs = WORKER_RESOLVE_MS } = {}) {
   for (;;) {
     const table = processTable();
     const kin = livingDescendantsOf([wrapperPid], table);
-    if (kin && kin.length) return kin;
-    if (!pidAlive(wrapperPid)) return kin || [];
-    if (performance.now() >= deadline) return kin || [];
+    // The floor is applied HERE, inside the poll, and not at the write below it:
+    // a set filtered down to nothing must keep polling for the real worker rather
+    // than latch a stranger the first time the table names one.
+    const born = kin && kin.length ? bornAfterWrapper(kin, wrapperStart, pidStartTimes(kin)) : kin;
+    if (born && born.length) return born;
+    if (!pidAlive(wrapperPid)) return born || [];
+    if (performance.now() >= deadline) return born || [];
     sleepSync(WORKER_POLL_MS);
   }
 }
@@ -2965,22 +3141,53 @@ function waitGone(pids, ms = KILL_VERIFY_MS) {
 // Two rounds, because a tree can grow between the enumeration and the kill: a
 // wrapper that has not yet started its worker, a codex still spawning its sandbox
 // helpers. Two is enough for that and bounded enough not to become a loop.
-function killPids(pids, { rounds = 2 } = {}) {
+//
+// `sessions` is the POSIX third membership (see `sessionMembers`): the caller
+// passes the recorded `codexPgid`, which is codex's session id as well, and any
+// live process still in that session is a target and a survivor even though it
+// left the process group and the ppid walk cannot reach it.
+function killPids(pids, { rounds = 2, sessions = [] } = {}) {
   const targets = [...new Set(pids.filter(isPid))];
-  if (!targets.length) return { survivors: [], targets: [], enumerated: true };
+  const session = sessions.filter(isPid);
+  if (!targets.length && !session.length) return { survivors: [], targets: [], enumerated: true };
   const fired = new Set(targets);
+  // SEEN DEAD, AND IT HAS TO BE REMEMBERED RATHER THAN RE-ASKED. A round that
+  // excluded pids by CURRENT liveness excluded nothing in the one case the
+  // exclusion exists for: the number freed in round one and REISSUED inside the
+  // verify window reads alive again, and gets a second tree kill aimed squarely
+  // at the inheritor. So the pids `waitGone` watched disappear are written down
+  // here, and a number in this set is spent whatever the OS says about it later.
+  //
+  // NO TEST POSES IT. The OS reissuing a chosen number inside a ~3 second verify
+  // window is not producible on demand, and a hook that faked the reissue would
+  // assert the branch rather than the race. Pinned by review, like the other
+  // reuse-window properties this file states rather than exercises.
+  const seenDead = new Set();
   let enumerated = true;
 
   for (let round = 0; round < rounds; round++) {
     const table = processTable();
     if (!table) enumerated = false;
-    // Descendants are only meaningful for a parent that is alive: a dead pid's
-    // recorded parentage is stale on Windows and can name a REUSED number.
-    const live = targets.filter(pidAlive);
-    const kin = table ? (livingDescendantsOf(live, table) || []) : [];
+    // Descendants are only meaningful for a parent that is alive and was not
+    // already confirmed dead: a dead pid's recorded parentage is stale on Windows
+    // and can name a REUSED number, and a confirmed-dead one whose number is live
+    // again names the inheritor's children outright.
+    const live = targets.filter((pid) => !seenDead.has(pid) && pidAlive(pid));
+    const kin = table
+      ? [...(livingDescendantsOf(live, table) || []), ...sessionMembers(session, table)]
+      : [];
     for (const pid of kin) fired.add(pid);
-    for (const pid of [...fired]) killTree(pid);
-    if (!waitGone([...fired]).length) break;
+    // ROUND TWO DOES NOT FIRE AT A PID THE OS CONFIRMED DEAD. Round one's
+    // `waitGone` watched every fired pid until it was gone or the verify window
+    // ran out, and a number freed during that window can be reissued inside it —
+    // so a second `killTree` at it is a tree kill aimed at whoever inherited it.
+    // Excluding it cannot skip anything real: the number is spent, and round
+    // one's kin of it are already individually in `fired`.
+    for (const pid of fired) if (!seenDead.has(pid)) killTree(pid);
+    const alive = waitGone([...fired]);
+    const standing = new Set(alive);
+    for (const pid of fired) if (!standing.has(pid)) seenDead.add(pid);
+    if (!alive.length) break;
   }
 
   const alive = waitGone([...fired]);
@@ -2989,7 +3196,9 @@ function killPids(pids, { rounds = 2 } = {}) {
   // cmd.exe wrapper.
   const after = processTable();
   if (!after) enumerated = false;
-  const leftovers = after ? (livingDescendantsOf([...fired], after) || []) : [];
+  const leftovers = after
+    ? [...(livingDescendantsOf([...fired], after) || []), ...sessionMembers(session, after)]
+    : [];
   return {
     survivors: [...new Set([...alive, ...leftovers.filter(pidAlive)])],
     targets: [...fired],
@@ -3008,8 +3217,8 @@ function killPids(pids, { rounds = 2 } = {}) {
 const UNENUMERATED_KILL = WIN
   ? 'the kill could not be verified: the process table could not be read (both powershell and pwsh ' +
     'failed), so nothing enumerated the tree behind these pids'
-  : 'the kill could not be verified: the process table could not be read (ps -eo pid=,ppid= failed), ' +
-    'so nothing enumerated the tree behind these pids';
+  : 'the kill could not be verified: the process table could not be read (ps -eo failed, in both the ' +
+    'session-aware and the pid,ppid form), so nothing enumerated the tree behind these pids';
 
 const UNENUMERATED_ADVICE =
   'A kill nothing could enumerate is not a verified kill: the recorded pids may be gone while a\n' +
@@ -3036,6 +3245,17 @@ const PID_FILES = ['supervisor.pid', 'codex.pid'];
 // the .pid files have to the record: a second copy, so a bad record cannot cost
 // us the truth.
 const REAPED_PIDS_FILE = 'reaped.pids';
+// And a PER-WRITER sidecar for the one path that cannot take the record lock at
+// all. `reaped.pids` is shared, so merging into it means read-modify-write, and
+// two unlocked writers doing that lose one of the two lists — a lost entry is a
+// spent pid number RE-ARMED, which is the exact failure this ledger exists to
+// prevent. A writer with no lock therefore never touches the shared file: it
+// writes `reaped.pids.<its own pid>`, which nothing else writes, and readers
+// union every sidecar with the shared file. The name is anchored on digits so
+// neither of the staging names beside it — the `reaped.pids.<pid>.tmp` the locked
+// merge stages, the `reaped.pids.<pid>.building` the sidecar's own write stages —
+// is mistaken for one.
+const REAPED_SIDECAR_RE = /^reaped\.pids\.\d+$/;
 
 function readPidList(file) {
   const pids = [];
@@ -3051,6 +3271,16 @@ function readPidList(file) {
 // numbers get reused, so a replayed kill lands on whatever inherited it.
 export function reapedPids(dir) {
   const spent = new Set(readPidList(path.join(dir, REAPED_PIDS_FILE)));
+  // The sidecars of every writer that could not take the lock. Unioned, never
+  // folded away here: a reader that deleted them would race the appender that
+  // owns one, and losing that append is the re-armed number again.
+  let entries = [];
+  try { entries = fs.readdirSync(dir); } catch { /* unreadable dir: the record copy is the other half */ }
+  for (const name of entries) {
+    if (REAPED_SIDECAR_RE.test(name)) {
+      for (const n of readPidList(path.join(dir, name))) spent.add(n);
+    }
+  }
   const record = readRecord(dir);
   if (!isCorrupt(record) && Array.isArray(record.reapedPids)) {
     for (const n of record.reapedPids) if (Number.isInteger(n) && n > 0) spent.add(n);
@@ -3072,12 +3302,20 @@ function recordedPids(dir) {
 // Writing the numbers down is what actually makes a reap non-repeatable. The
 // rename below is the visible half and it can fail; this half cannot be defeated
 // by a locked file, an attribute, or a permission that changed underneath us.
-// BOTH copies are merged UNDER THE RECORD LOCK, and both merges are computed from
-// reads taken inside it. They used to be computed from reads taken before it, in
-// two separate read-modify-writes: two cancels reaping in parallel each wrote its
-// own list over the other's, and a lost entry is a spent pid number RE-ARMED —
-// fired at again, hours later, at whatever inherited it. The file is the record's
-// second copy, so the record's lock is the right one for both.
+// WHEREVER A LOCK CAN BE HAD, BOTH copies are merged UNDER THE RECORD LOCK, and
+// both merges are computed from reads taken inside it. They used to be computed
+// from reads taken before it, in two separate read-modify-writes: two cancels
+// reaping in parallel each wrote its own list over the other's, and a lost entry
+// is a spent pid number RE-ARMED — fired at again, hours later, at whatever
+// inherited it. The file is the record's second copy, so the record's lock is the
+// right one for both.
+//
+// AND WHERE NO LOCK CAN BE HAD, THE MERGE IS NOT ATTEMPTED AT ALL. An unlocked
+// read-modify-write onto the shared file is the very lost update the paragraph
+// above describes, one layer down — the fallback used to do exactly that, so two
+// writers who both lost the lock lost one of their two lists. That path writes to
+// its own sidecar instead (see REAPED_SIDECAR_RE) and never reads or renames the
+// shared file, so there is nothing for a concurrent writer to overwrite.
 function recordReapedPids(dir, pids) {
   const list = [...new Set(pids.filter((n) => Number.isInteger(n) && n > 0))];
   if (!list.length) return;
@@ -3104,10 +3342,28 @@ function recordReapedPids(dir, pids) {
   if (merged) return;
   // The callback never ran: the record is corrupt (evidence, never rewritten) or
   // the lock could not be taken. The FILE is the copy that exists precisely for
-  // those cases, so it is merged anyway — under the lock when one can be had, and
-  // unlocked rather than not at all when it cannot. A lost entry re-arms a spent
-  // number, which is the failure this file is here to prevent.
-  if (!withRecordLock(dir, mergeFile).locked) mergeFile();
+  // those cases, so it is written anyway — merged into the shared list under the
+  // lock when one can be had, and APPENDED to this writer's own sidecar when it
+  // cannot. A lost entry re-arms a spent number, which is the failure this file is
+  // here to prevent, and an unlocked merge is one of the ways to lose one.
+  if (!withRecordLock(dir, mergeFile).locked) {
+    // STAGED AND RENAMED, LIKE EVERY OTHER LEDGER WRITE. This was the one append
+    // in the file, and an append is not atomic: a process killed mid-write leaves
+    // a truncated line, whose digit prefix parses as a perfectly valid pid that
+    // was never fired at. That marks an innocent number spent for ever — and if
+    // the truncation happens to collide with a real target, the number that IS
+    // spent goes missing, a later reap skips it, and codex bills on. The sidecar
+    // is owner-exclusive (nothing else writes `reaped.pids.<our pid>`), so the
+    // read-modify-write below races nobody and this is pure atomicity, not a
+    // lock. The staging name deliberately does not end in digits, so
+    // REAPED_SIDECAR_RE cannot mistake it for a sidecar a reader should union in.
+    const sidecar = path.join(dir, `${REAPED_PIDS_FILE}.${process.pid}`);
+    try {
+      const building = `${sidecar}.building`;
+      fs.writeFileSync(building, [...new Set([...readPidList(sidecar), ...list])].join('\n') + '\n');
+      renameWithRetry(building, sidecar);
+    } catch { /* best effort: the record copy is the other half */ }
+  }
 }
 
 // A pid file that has been acted on is spent. Renaming it is what stops a second
@@ -3172,7 +3428,30 @@ function reapUnvouchedJob(root, dir) {
   assertInsideRoot(root, dir, 'reap a job directory');
   const pids = recordedPids(dir);
   if (!pids.length) return { ok: true, killed: [] };
-  const killed = killPids(pids);
+  // IDENTITY BEFORE THE TRIGGER, HERE TOO — AND PRESENTLY AS A BACKSTOP. `killJob`
+  // routes every source it gathers through `recordedProcesses`; this kill did not,
+  // and fired on the strength of a number alone. It routes them the same way now.
+  //
+  // BE HONEST ABOUT WHAT THAT BUYS TODAY. Both callers reach this function only
+  // for a claim whose record is UNREADABLE — that is what "unvouched-for" means
+  // here — and an unreadable record carries no `pidStarts`, so the check fails
+  // open and `reissued` is always empty on the paths that exist. What it closes is
+  // a TOCTOU: the record is re-read here, freshly, and a record that was
+  // unreadable at classification (a scanner holding the file, a write landing
+  // mid-read) can read fine inside this call — at which point the refusal is real.
+  // The exposure it does NOT close is the one it looks like it does: bare `.pid`
+  // numbers fired at with no identity to check them against, which is a residual
+  // documented in DESIGN and inherent to a record that cannot be read.
+  const unique = recordedProcesses(readRecord(dir), pids);
+  const reissued = pids.filter((pid) => !unique.includes(pid));
+  if (reissued.length) {
+    process.stderr.write(
+      `note: the job at ${clean(dir)} recorded pid(s) ${reissued.join(', ')}, and the process(es)\n` +
+      `holding those numbers now started at a different time — the OS reissued them. They belong to\n` +
+      `something else and have NOT been signalled.\n`
+    );
+  }
+  const killed = killPids(unique);
   // Survivors refuse the takeover — and so does a kill nothing could enumerate
   // (see UNENUMERATED_KILL). This job's record is evidence and is never
   // rewritten, so the refusal IS the safe direction here: the role does not
@@ -3186,14 +3465,18 @@ function reapUnvouchedJob(root, dir) {
       unverified: !killed.enumerated,
     };
   }
-  const spent = consumePidFiles(dir, pids);
+  // Only the numbers that were fired at are spent, exactly as `killJob` spends
+  // them: a reissued one was never signalled, is not this job's, and marking it
+  // reaped would be recording a kill that did not happen. A file still holding one
+  // simply stays loaded.
+  const spent = consumePidFiles(dir, unique);
   if (spent.failed.length) {
     process.stderr.write(
       `WARNING: could not rename spent pid file(s) in ${dir}: ${spent.failed.join('; ')}\n` +
       `Those pids are recorded as reaped in ${REAPED_PIDS_FILE}, so nothing will fire at them again.\n`
     );
   }
-  return { ok: true, killed: pids, consumed: spent.consumed, failed: spent.failed };
+  return { ok: true, killed: unique, consumed: spent.consumed, failed: spent.failed };
 }
 
 // A job that has no kill target yet, and may already have a supervisor on its
@@ -3388,8 +3671,17 @@ function killJob(job) {
   }
   // Every write below is a COMPARE-AND-SWAP on "the state is still live", the
   // same `expect` mechanism the supervisor's exit handler, the exec-spawning
-  // mark and dispatch's post-spawn write already use. A write that loses it did
-  // not lose data: it found a verdict, and the verdict is the answer.
+  // mark and dispatch's post-spawn CANCEL branch already use. A write that loses
+  // it did not lose data: it found a verdict, and the verdict is the answer.
+  //
+  // ONE WRITE IN THE SEAM CARRIES NO PRECONDITION, and it is named here so the
+  // sentence above is not read as covering it: dispatch's registration write, the
+  // one that puts `supervisorPid` down at spawn time. It cannot fail on a verdict,
+  // because the verdict may be a cancel's and the pid it is recording is the only
+  // thing that cancel has to kill. What it does instead is refuse to move anything
+  // BACKWARDS — it merges `pidStarts` rather than replacing it, and it advances
+  // `launch` to `spawned` only from `pending` or `spawning` — so a record another
+  // writer has moved on is added to, never rewound.
   //
   // THE STATE REPORTED IS THE ONE THAT BEAT THE SWAP, read INSIDE the lock and
   // handed back by `updateRecordOutcome`. Re-reading the record here instead
@@ -3485,7 +3777,13 @@ function killJob(job) {
       return { ok: false, pending: true, survivors: [], targets: [], window: 'exec' };
     }
   }
-  const killed = killPids(unique);
+  // POSIX: the recorded `codexPgid` is codex's SESSION id too (it is spawned
+  // detached), and a child that called `setpgid` is out of the group and off the
+  // ppid walk while still being in that session. Passed as a third membership for
+  // the kill to look for; Windows has no sessions to give and passes nothing.
+  const sessions = WIN ? [] : [...new Set(
+    [r].filter((rec) => rec && !isCorrupt(rec)).map((rec) => rec.codexPgid).filter(isPid))];
+  const killed = killPids(unique, { sessions });
   const survivors = killed.survivors;
   const finished = new Date().toISOString();
   const priorWarning = isCorrupt(r) ? undefined : r.warning;
@@ -3529,10 +3827,38 @@ function killJob(job) {
   // UNENUMERATED_KILL), so it lands in the same state a survivor does.
   const unverified = !killed.enumerated;
   if (survivors.length || unverified) {
-    // The pid files stay loaded on purpose: those processes are demonstrably still
-    // alive — or nothing could show they are not — so the numbers are still theirs
-    // and still need firing at.
-    const marked = updateRecordOutcome(job.dir, {
+    // A SURVIVOR IS A RETRY TARGET, NOT A LINE OF DISPLAY TEXT. `killSurvivors` is
+    // a string `status` prints; it is not read back by anything that kills. So the
+    // late Windows worker the final sweep found — never a recorded pid, reachable
+    // only as a descendant — was reported and then forgotten: the retry the
+    // operator is told to run re-gathered the same recorded numbers, whose wrapper
+    // was by then dead, killed nothing, and could flip the job to `killed` with
+    // that worker still billing.
+    //
+    // So the survivors are written down as targets, WITH THE IDENTITY THEY WERE
+    // OBSERVED WITH. The pid alone would be the forgery this seam exists to
+    // prevent — a bare number fired at hours later lands on whatever inherited it
+    // — so each one goes into `pidStarts` beside its start time as read here,
+    // moments after it was seen alive. The retry's `gather` picks them up out of
+    // `codexPids` and `recordedProcesses` re-checks the anchor at fire time, so a
+    // reused number is refused exactly as a reissued recorded pid is.
+    //
+    // A function patch, because both fields are merges and this is a
+    // read-modify-write: computing them from the pre-kill `r` would drop whatever
+    // the supervisor registered while the kill was running.
+    //
+    // RESIDUAL, AND NO FLOOR IS APPLIED. A leftover is by construction a pid
+    // nothing wrote down, so a number reissued during this kill can put the
+    // inheritor's children here — via the same stale ppid field that reaches the
+    // real orphaned worker — and they self-stamp. That is the wrapper-floor class
+    // reopened at persist time. The floor is not applied because the anchors in
+    // hand are the job's own codex starts, and those strangers are YOUNGER than the
+    // job, so they clear it; what the floor would reliably do is drop a real
+    // survivor whose start time the platform will not give up, and unlike the
+    // spawn-time floor nothing stands behind that loss — the retry would have no
+    // target that reaches it. Window and direction are in DESIGN's residuals.
+    const survivorStarts = survivors.length ? startTimesFor(survivors.filter(isPid)) : {};
+    const marked = updateRecordOutcome(job.dir, (current) => ({
       state: 'kill-failed',
       // The state and the reason are written as a PAIR. A live record can carry
       // a reason from a phase this cancel is now ending (a version skew puts
@@ -3542,8 +3868,26 @@ function killJob(job) {
       reason: undefined,
       finished,
       killSurvivors: survivors.length ? survivors.join(', ') : undefined,
+      ...(survivors.length ? {
+        codexPids: [...new Set([
+          ...(Array.isArray(current.codexPids) ? current.codexPids : []),
+          ...survivors.filter(isPid),
+        ])],
+        // THE RECORDED ANCHOR WINS, which is why the spread runs this way round.
+        // A survivor may be a pid the job wrote down at spawn; re-stamping it with
+        // a start time read NOW would replace a proven identity with an observed
+        // one, and on a number the identity check waved through fail-open (the
+        // query failed, the platform will not say) that is precisely how a
+        // stranger gets papers of its own. New numbers get an anchor; existing
+        // ones keep theirs.
+        [PID_START_FIELD]: {
+          ...survivorStarts,
+          ...(current[PID_START_FIELD] && typeof current[PID_START_FIELD] === 'object'
+            ? current[PID_START_FIELD] : {}),
+        },
+      } : {}),
       ...(unverified ? { warning: [priorWarning, UNENUMERATED_KILL].filter(Boolean).join('; ') } : {}),
-    }, { expect: stillCancellable });
+    }), { expect: stillCancellable });
     const verdict = lostToVerdict(marked);
     if (verdict) {
       // A survivor outranks the bookkeeping: the verdict is left exactly as its
@@ -4106,12 +4450,47 @@ function cmdDispatch(opts) {
     fs.writeFileSync(path.join(dir, 'supervisor.pid'), String(child.pid));
     // The start time goes down WITH the number, here, while the process is
     // certainly still the one just spawned. It is what tells a cancel hours from
-    // now whether this pid is still ours or a number the OS has reissued.
-    updateRecord(dir, {
+    // now whether this pid is still ours or a number the OS has reissued. Read
+    // BEFORE the lock is taken: it is a shell spawn, and holding the record lock
+    // across one would stall every other writer for as long as PowerShell takes.
+    const supervisorStart = startTimesFor([child.pid]);
+    // TEST HOOK: holds this dispatch between the spawn and the write that
+    // registers it — the window in which the supervisor it just started reaches
+    // `launch: 'exec-spawning'` and spawns codex. The real window is the length of
+    // one start-time query and cannot be aimed at; what is under test is that this
+    // write, landing late, moves nothing backwards. Never set outside the suite.
+    sleepSync(testPauseMs('CODEX_DISPATCH_TEST_REGISTER_PAUSE_MS'));
+    // THE ONE NON-CAS WRITER IN THE SEAM, AND IT WRITES AS A FUNCTION OF WHAT IT
+    // FINDS. A plain object patch is a shallow merge over the record as it is
+    // inside the lock, and this write can land arbitrarily late — the start-time
+    // query above spends half a second in a shell, and the supervisor is running
+    // the whole time. Two fields made that dangerous:
+    //
+    //   `launch`    — a flat `'spawned'` overwrote a supervisor's already-recorded
+    //                 `exec-spawning` (or `exec`), REGRESSING the phase. That is
+    //                 the reading `killWindow` uses to refuse to call a codex-exec
+    //                 window a death: regressed, a cancel kills the supervisor,
+    //                 verifies the targets it knows about, records `killed` and
+    //                 releases the role while codex runs on — and off Windows codex
+    //                 is detached and reparents, so nothing is left to find. So the
+    //                 phase is only ever moved FORWARD from the two phases that
+    //                 precede it, and left alone otherwise.
+    //   `pidStarts` — a whole-object assignment replaced the map, erasing the start
+    //                 times the supervisor had just recorded for `codexPids`. Those
+    //                 are the identity every later kill checks codex by; erased,
+    //                 the numbers are fired at bare. So it is merged.
+    //
+    // Neither the pid nor its start time is ever withheld: this is still the write
+    // that makes the supervisor killable, and it always lands.
+    updateRecord(dir, (current) => ({
       supervisorPid: child.pid,
-      [PID_START_FIELD]: startTimesFor([child.pid]),
-      launch: 'spawned',
-    });
+      [PID_START_FIELD]: {
+        ...(current[PID_START_FIELD] && typeof current[PID_START_FIELD] === 'object'
+          ? current[PID_START_FIELD] : {}),
+        ...supervisorStart,
+      },
+      ...(PRE_SPAWNED_PHASES.includes(launchPhase(current)) ? { launch: 'spawned' } : {}),
+    }));
     // Attached only so a late 'error' cannot throw out of an already-detached
     // child; the synchronous pid check above is what actually decides.
     child.on('error', (err) => {
@@ -4702,12 +5081,22 @@ function cmdSupervise(dir) {
   // runtime's DECISION, that nothing landing in it may record a death.
   sleepSync(testPauseMs('CODEX_DISPATCH_TEST_EXEC_PAUSE_MS'));
 
+  // THE WRAPPER'S OWN START TIME, READ FIRST AND READ ONCE. This is the only
+  // instant at which `child.pid` is certainly the process this supervisor just
+  // created, and it is needed BEFORE the worker poll, not after it: it is the
+  // floor `resolveWorkerPids` measures candidate descendants against (see
+  // `bornAfterWrapper`). Read through `startTimesFor`, which busts the cache — this
+  // process may have asked about that same number earlier, for a job a `--force`
+  // was clearing, and the dead job's answer must not become the live one's papers.
+  const wrapperStarts = startTimesFor([child.pid]);
   // WHAT WAS ACTUALLY SPAWNED. `child.pid` is codex only when codex was spawned
   // directly. Through the Windows shell — which is the path the supported npm
   // build takes, because `codex.cmd` is a batch file — it is cmd.exe, and codex is
   // its child. Recording only that proxy is why a surviving codex could leave a
   // job marked `killed` with its role released.
-  const workers = viaShell ? resolveWorkerPids(child.pid) : [];
+  const workers = viaShell
+    ? resolveWorkerPids(child.pid, { wrapperStart: wrapperStarts[String(child.pid)] })
+    : [];
   const codexPids = [...new Set([child.pid, ...workers].filter(isPid))];
   if (codexPids.length) fs.writeFileSync(path.join(dir, 'codex.pid'), codexPids.join('\n'));
   // AND A REGISTRATION THAT DID NOT LAND MUST NOT BE ASSUMED. This was
@@ -4729,17 +5118,26 @@ function cmdSupervise(dir) {
     codexPids,
     // Merged, never replaced: the supervisor's own entry was written by the
     // dispatch that spawned it and is still the thing a cancel checks us by.
+    // The wrapper's entry is the one read at spawn time above rather than a
+    // second reading taken now — same number, but that first read is the one
+    // whose identity is certain, and it stands even if this query answers
+    // nothing.
     [PID_START_FIELD]: {
       ...(record[PID_START_FIELD] || {}),
-      ...startTimesFor(codexPids),
+      ...startTimesFor(workers),
+      ...wrapperStarts,
     },
     // POSIX: codex is detached, so it leads a group whose emptiness is part of a
     // verified kill. On Windows the tree is taskkill's business.
     codexPgid: !WIN && isPid(child.pid) ? child.pid : null,
     launch: 'exec',
   }, undefined, LAUNCH_WRITE_RETRY);
+  // POSIX: codex was spawned detached, so its pid is its session id as well as
+  // its pgid — the third membership a `setpgid` child cannot shed. Both kills
+  // below sweep it; Windows has none to give.
+  const codexSession = !WIN && isPid(child.pid) ? [child.pid] : [];
   if (!registered.ok) {
-    const killed = killPids(codexPids);
+    const killed = killPids(codexPids, { sessions: codexSession });
     // The same bar every kill in this runtime is held to: nothing survived, and
     // something actually looked. An unverified kill KEEPS THE ROLE — codex may
     // still be billing, and handing the claim away there is the `kill-failed`
@@ -4758,10 +5156,36 @@ function cmdSupervise(dir) {
       `See it: status ${id}`;
     try { fs.appendFileSync(runLogPath(dir), msg + '\n'); } catch { /* best effort */ }
     process.stderr.write(msg + '\n');
-    // Deliberately no `consumePidFiles`: it is a WRITE to the record, through the
-    // very lock that just refused this supervisor, and spending another wait on
-    // bookkeeping while a killed codex's fate is already stated above buys
-    // nothing. The pid files are litter a later clean takes.
+    // A PID VERIFIED DEAD IS RECORDED SPENT, and this branch used not to record
+    // anything. It killed `codexPids`, watched them die, and left the numbers
+    // LOADED in `codex.pid` with no start time on the record and no entry in the
+    // reaped ledger — so a retry (or the cancel the operator is sent to run) fires
+    // them again, bare, at whatever the OS has since handed them to. Concurrently
+    // with a cancel that wrote `kill-pending`, `refuseBeforeLaunch` below stands
+    // down and writes NOTHING, which leaves that live record as the only account
+    // of the job: kill-pending, targets loaded, identity absent. The one write
+    // that closes it is this one.
+    //
+    // It does not depend on the lock that just refused. `recordReapedPids` has an
+    // unlocked half — a per-writer sidecar the reader unions in — which exists for
+    // exactly this case, so the ledger lands whether or not the lock is still
+    // wedged. (The comment that used to sit here claimed the opposite and skipped
+    // the write on that reasoning.) Against a wedged lock it spends TWO waits
+    // getting there — `updateRecordOutcome`'s, then the `withRecordLock` the
+    // file-merge fallback takes before giving up and writing the sidecar — so
+    // about thirty seconds, not fifteen. That is the right trade: codex is already
+    // dead, this supervisor has nothing
+    // else to do, and the alternative is a live number nobody knows is spent.
+    //
+    // `consumePidFiles` is still not called. It is the same write plus a rename,
+    // and the rename is the cosmetic half — the LIST, not the file name, is what
+    // the next reap consults, so the numbers are already disarmed. The pid files
+    // are litter a later clean takes.
+    //
+    // ONLY ON THE VERIFIED BRANCH. Survivors — or a kill nothing could enumerate —
+    // are still legitimate targets, and marking them spent would disarm the retry
+    // that has to reach them.
+    if (verified) recordReapedPids(dir, codexPids);
     refuseBeforeLaunch({ state: 'failed', reason: 'record-write-refused', exitCode: -1 },
       { release: verified, spawned: true });
     process.exit(1);
@@ -4779,7 +5203,7 @@ function cmdSupervise(dir) {
   // rather than let a "pending" cancel and a running codex coexist.
   const afterExec = readRecord(dir);
   if (!isCorrupt(afterExec) && canonicalState(afterExec) !== 'running') {
-    const killed = killPids(codexPids);
+    const killed = killPids(codexPids, { sessions: codexSession });
     // A KILL NOTHING COULD ENUMERATE IS NOT A VERIFIED KILL, and this is the one
     // place that knows what it just spawned: codex behind a shell wrapper is a
     // DESCENDANT of the recorded pid, so an unreadable process table means the

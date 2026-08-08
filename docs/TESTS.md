@@ -281,7 +281,7 @@ and the codex-pid registration. Fourteen of the twenty carry a written
 non-vacuity note — what the test does against a deliberately broken copy of the
 thing it covers, observed rather than assumed.
 
-**Twenty test-only knobs live in the runtime**, each standing in for a condition
+**Twenty-two test-only knobs live in the runtime**, each standing in for a condition
 that cannot be produced on demand in CI, on both platforms, from both shells. What
 is under test in every case is the runtime's *decision*, never the mechanism that
 would have caused the condition:
@@ -355,6 +355,20 @@ would have caused the condition:
   the rename that wins an orphan and the removal of what it won, standing in for
   the sweeper dying there. What is under test is the state visible from outside
   that window: the orphan gone from its own path, and a tombstone to show for it.
+- `CODEX_DISPATCH_TEST_NO_START_TIMES=1` — the start-time query cannot run at all:
+  a PowerShell that will not start, a `ps` that is not on PATH, the fifteen-second
+  timeout tripping under load. The decision under test is that a *failed* query
+  answers nothing **and remembers nothing**, so the next caller asks again — a
+  cached miss from a query that never ran would disarm the pid-identity check for
+  that number for the rest of the process's life. A query that ran and found no
+  such process is a real answer and is still cached; this hook is the other case.
+- `CODEX_DISPATCH_TEST_REGISTER_PAUSE_MS=<ms>` — the dispatch is held between
+  spawning the supervisor and the write that registers its pid, which is the window
+  in which that supervisor reaches `exec-spawning` and spawns codex. The real
+  window is one start-time query wide and cannot be aimed at; what is under test is
+  that the late write adds and never rewinds — it merges `pidStarts` rather than
+  replacing it, and moves `launch` to `spawned` only from `pending` or `spawning`.
+  (`CODEX_DISPATCH_TEST_SPAWN_PAUSE_MS` sits *after* that write and cannot pose it.)
 - `CODEX_DISPATCH_TEST_WRITE_BUDGET_MS=<ms>` — the time budget half of both
   checked-write retries (`TERMINAL_WRITE_RETRY`, `LAUNCH_WRITE_RETRY`), and
   nothing else. Reaching either retry means a wedged lock and every attempt inside
