@@ -69,6 +69,19 @@ if (args[0] === 'login') {
 // ------------------------------------------------------------ codex sandbox
 if (args[0] === 'sandbox') {
   const cmd = args.slice(1);
+  // A WINDOW A TEST CAN AIM AT, AND A SIGNAL THAT IT IS OPEN. The sight probe is
+  // the last thing the supervisor does before it writes the sight label, and the
+  // test that wedges the record lock in between has to get its wedge in after
+  // every write that comes BEFORE the probe (the supervisor's own pid
+  // registration, which can be seconds late because the patch it carries spends
+  // PowerShell time) and before the label itself. The mark says the probe has
+  // started; the delay is how long it stays open.
+  const mark = process.env.FAKE_CODEX_SANDBOX_MARK;
+  if (mark) { try { fs.writeFileSync(mark, 'probe started\n'); } catch { /* best effort */ } }
+  const delay = Number(process.env.FAKE_CODEX_SANDBOX_DELAY_MS || 0);
+  if (Number.isFinite(delay) && delay > 0) {
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, delay);
+  }
   if (process.env.FAKE_CODEX_SANDBOX_UNAVAILABLE) {
     process.stderr.write("error: unrecognized subcommand 'sandbox'\n\nUsage: codex [OPTIONS] [PROMPT]\n");
     process.exit(2);

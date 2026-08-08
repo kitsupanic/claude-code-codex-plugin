@@ -3,6 +3,158 @@
 Versioning rule: **a push that changes behavior MUST bump the version** — see
 [README → Releases and versioning](../README.md#releases-and-versioning) for why.
 
+## 0.8.5
+
+A third opinion from GPT-5.6, and this one was not aimed at the code at all: a
+**docs-truth audit**, every claim DESIGN.md makes about the record lock
+classified against the source that is supposed to implement it — 72 TRUE, 30
+OVERCLAIM, 2 STALE. It found four code defect clusters, which makes it the most
+productive review of this four-release arc. That is the finding, and it is worth
+saying plainly: prose that overstates what the code does is usually not a writing
+error, it is the first visible symptom of the code not doing it. Patch bump: one
+new reason, no new verb, no schema change, and a shared thesis: **a claim is not
+a fact — in the prose or in the writes.**
+
+**The acquisition guard failed OPEN, in the release whose thesis was
+fail-closed.** 0.8.4's guard reads the job directory before staging and refuses
+past a live lock stranded in a tombstone. Its `readdir` was wrapped in a bare
+`catch` returning "no blocker" — the one observation in this seam pointed the
+wrong way, and it readmitted the exact silent double-hold the guard was built to
+close: a directory that cannot be enumerated is not a directory without
+tombstones, it is no evidence either way, and unproven absence does not stage.
+Three-valued now. `ENOENT` alone means gone — a job directory that is not there
+holds no tombstone, and staging's own `mkdir` stays the fast honest failure for
+that case rather than being pre-empted by a fifteen-second wait for a lock in a
+directory nobody will ever create. Every other errno is `unenumerable` and
+blocks, and it gets **its own refusal**: routing it through the stranded-lock
+message would have named a tombstone nobody read and sent an operator to inspect
+a path this process never saw, which is a refusal inventing its own evidence.
+
+**Releasing is a break of one's own lock, and it now follows the same discipline
+as every other one.** The release was the last bare `rmSync` on the canonical
+lock path — the same non-atomic hazard the sweep and the break each shed in
+0.8.3, and the same measurement behind it: Node's recursive removal unlinks the
+holder file before the directory, leaving the lock standing and **empty** for as
+long as the rmdir takes, which is precisely the holderless lock staged
+acquisition exists to make impossible. The identity test in front of it was a
+two-step bound to a pathname, so a stale break landing between the check and the
+removal made "ours" true about a lock that was somebody else's by the time it was
+deleted. So: rename to a tombstone, re-read the holder, compare **pid and
+nonce** — the `tombIsCondemned` test applied to release — and only then remove.
+A mismatch is somebody else's lock: it goes back if the path is free, is left
+standing if it is not, and is never removed. **And the unreadable case gets its
+own words**, because it is not that finding: a holder file that will not read
+microseconds after our own rename of our own lock is a transient far more often
+than it is a break, and the break sentence asserted as fact a thing this release
+cannot prove. What it can say is that ownership is unverified, so nothing was
+removed.
+
+**A blocker holding our own live pid is our own release litter, and clearing it
+is finishing our own release.** The rename-first release has a failure mode the
+old one did not: a swallowed final `rmSync` leaves a `.stale-*` tombstone naming
+a pid that is alive — this one. The guard cannot tell that from a stranded
+holder, so it would block every later acquisition of that job *including this
+process's own*, for as long as this process lives, with the sweep that would
+collect the thing sitting behind the guard: a wedge produced by tidying up. Both
+guard consumers clear it instead. The predicate is deliberately the **pid alone,
+not the nonce** — the nonce is the right test everywhere else, and the wrong one
+here, where it would refuse to clear litter left by an earlier acquisition of
+this same process, which is most of it. What makes the wider match safe is a
+property of the runtime and not of the filesystem: single-threaded, one record
+lock at a time, so at the moment the guard asks there is no acquisition of ours
+in flight and a self-pid tombstone can only be litter. `withRecordLock`'s
+`stranded` tombstone is explicitly excluded — it holds somebody else's **live**
+lock this process moved and owes a restore to. It is written down as one of the
+predicates that must be rewritten before anything here becomes concurrent.
+
+**The checked-writer discipline stopped one layer short of the two writes that
+matter most.** Terminal finalization — the loudest verdict this runtime produces,
+the one the whole job exists to reach — could fail without throwing: a `locked`
+or `corrupt` answer came back as `null`, the exit handler went straight on to
+release the role, and the record still said `running` beside a finished
+`out.txt`, with nobody alive to re-run the write. It reads `stale` for ever,
+holds its role, and `result` refuses the answer codex was paid for. It is checked
+now, and the three answers are three different findings: `precondition` is a
+**found verdict** and this stays silent about it, `locked` is contention this
+writer can afford to insist against (`TERMINAL_WRITE_RETRY` — five attempts
+inside a minute, ~75s worst case, because the detached supervisor has nothing
+else to do and every second not spent here is a job that reads stale), and
+anything still unwritten after that is reported in the run log and on stderr,
+naming the out file and the one cure: `cancel`.
+
+**A codex whose pids never reached the record is a run nobody can cancel, so it
+is not allowed to continue.** The registration write was fire-and-forget, and it
+is the write that turns a spawned codex into a *killable* one. Lost, the record
+keeps `launch: 'exec-spawning'` with no `codexPids`, so `killWindow` answers
+"exec" for the supervisor's whole life: every cancel writes `kill-pending`, kills
+nothing, and the finalizer's own compare-and-swap then loses to that
+`kill-pending` — a run stoppable only by promise, billing to completion. It is
+insisted on tightly (`LAUNCH_WRITE_RETRY`, one full lock wait and one more, ~30s)
+and a failure **kills what was just spawned**: milliseconds of codex is a cheaper
+thing to lose than the only handle on it, and the pid is in hand right there,
+which is the whole reason that line exists. The kill is held to the same bar as
+every other one in this runtime — nothing survived, and something actually
+looked — and an unverified one **keeps the role**, because handing a claim away
+while something that bills may still be alive is the `kill-failed` mistake under
+another name.
+
+**Two more writes ahead of the spend, and both refuse before it.** The sight
+label is the only evidence the delivery gate ever reads, so a label that does not
+land is a run that can never be delivered however well it goes — refused as
+unvouched with codex already paid for. It was fire-and-forget, which put the
+proof this release spends a shell probe to establish on the hope that a lock was
+free; it is retried and, failing, refuses **before** anything is launched. The
+pre-spawn launch marker is the same argument one step further: unchecked, a
+refused write left `launch: 'pending'` under a supervisor that was launched
+anyway, and "nothing was ever started" is the one reading that lets a cancel call
+a running job dead. It aborts before the spawn. Alongside them, `claim-lost` is
+checked and says so when it could not be recorded, the supervisor's own
+pid-registration failure stops reporting a merely-unlockable record as a corrupt
+one, and **dispatch's two nothing-was-spawned finalizations gained the
+`notCancelAuthored` precondition** their supervisor-side siblings have carried
+since 0.8.1 — the state is `launch: 'spawning'`, deliberately one a cancel may
+act on, so both writes could land on a cancel's verdict and hand the role away
+underneath it. All three of the spawn-failed, dispatch-failed and claim-lost
+reports now branch honestly on what the write actually did.
+
+**`clean` may not delete a record it could not read.** `removeJobDir` read the
+record it puts back on a failed removal through a catch-all that treated *any*
+error as "already gone" — and read it *after* the children loop, where a failure
+meant the safeguard silently did not exist at all: the last step could then fail
+with nothing in hand and leave exactly the unlistable directory the ordering
+exists to prevent, while `clean`'s summary said nothing was left half-removed.
+The read is hoisted above everything that unlinks, and **any** failure refuses
+the job untouched. An absence there is incoherent — this runs under the record
+lock, milliseconds after `cmdClean` read the same file — and an unreadable record
+is evidence the file is there and cannot be safeguarded.
+
+**And the prose the audit graded.** Sixteen corrections, each one a claim the
+code does not make: what the `generation` counter is and is not, that
+`recordVersion` is a *schema* stamp and cannot gate two runtimes' lock protocols
+against each other, that the sweep is opportunistic rather than scheduled, that a
+tombstone mismatch means *unproven* rather than *stolen*, the difference between a
+transient unreadable holder that clears itself and a persistent one that is a
+manual-repair wedge, the corner where a restore leaves things neutral-to-slightly-
+worse, what actually causes a rename to fail on each platform, and how wide the
+pid-reuse window really is. `refuseBeforeLaunch` gained a `spawned` option in the
+same pass, because its "Nothing was launched" sentence became false the moment a
+caller reached it with a codex spawned and killed — a message that is false in one
+caller is the same defect class as everything else in this catalog. TESTS.md's
+knob count went 14 → 20 and README's current release 0.8.1 → 0.8.5.
+
+**Test hooks: one new knob, and it is a budget, not an answer.**
+`CODEX_DISPATCH_TEST_WRITE_BUDGET_MS` shortens the *time budget* half of both
+checked-write retries and nothing else — reaching either retry means a wedged
+lock, and every attempt inside one costs a full fifteen-second lock wait, so the
+unshortened test is one nobody would run. The attempt caps, the decision to retry
+only `locked`, and every message ship exactly as tested.
+
+**Tests: 105 → 110 in the dispatch suite, 164 total.** Each new one was pinned
+non-vacuously against a deliberately broken copy of the guard it covers: the
+finalization-under-a-wedged-lock control has the supervisor exit in **total
+silence**, leaving a finished answer beside a record that says `running`, and the
+registration-refusal test asserts the whole grandchild tree is dead.
+
 ## 0.8.4
 
 A second opinion from GPT-5.6, this time on 0.8.3's own break protocol — the

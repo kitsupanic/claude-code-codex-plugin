@@ -3,8 +3,9 @@
 Every constraint in the runtime traces to an entry here. The catalog records the
 production failures this design answers; the review sections record the dual
 frontier reviews of 0.3.0, 0.4.0, 0.8.0 and 0.8.1, the 0.7.3 full-repo
-review, and the 0.8.2 and 0.8.3 single-seam reviews, whose findings became
-0.4.0, 0.5.0, 0.8.0, 0.8.1, 0.8.2, 0.8.3 and 0.8.4.
+review, the 0.8.2 and 0.8.3 single-seam reviews, and the 0.8.4 docs-truth
+audit, whose findings became 0.4.0, 0.5.0, 0.8.0, 0.8.1, 0.8.2, 0.8.3,
+0.8.4 and 0.8.5.
 
 ## The failure catalog behind the design (2026-08-05/06, all seen in production)
 
@@ -692,3 +693,72 @@ prose still told the previous design's healing story, promising a sweep
 that the new guard makes unreachable in exactly the states that trigger
 it. The destroyer must prove what it destroys; the healer must admit what
 it heals.
+
+### The 0.8.4 docs-truth audit (2026-08-08) — the prose audit that found four code defects
+
+The third dispatch under the caller-owned watch was not an adversarial review
+but a documentation-truth audit: every verifiable claim in DESIGN's
+record-lock section classified against the source — TRUE, OVERCLAIM,
+UNDERCLAIM, STALE — after three releases of concurrency fixes and three
+rounds of prose edits, in a repo whose history already treats a stale doc
+claim as a real defect. GPT-5.6-sol returned 72 TRUE, 30 OVERCLAIM, 2 STALE,
+and a verdict that the section could not be trusted as an audit baseline.
+That would have been worth the dispatch on its own. What made it the most
+productive review of the arc is that four of the overclaims, adjudicated,
+turned out to be **code defects wearing prose clothing**:
+
+- **The acquisition guard failed open on enumeration errors** — the seam's
+  ONLY fail-open observation, in the release whose thesis was fail-closed,
+  at its newest and most load-bearing gate. Every sibling read had been
+  taught the ENOENT-only rule; the readdir that decides whether a live lock
+  is stranded had not. → Three-valued: enumeration failure blocks, with a
+  refusal in its own words (there is no tombstone to name); a gone directory
+  does not block, because staging's own mkdir is the honest fast failure.
+- **The release was the last bare `rmSync` on the canonical lock path** —
+  the identical non-atomic hazard the sweep and the break shed in 0.8.3,
+  and the adjudication measured the enabling fact: Node's recursive rm
+  deletes children that appear mid-removal, so a stager landing in the
+  unlink-to-rmdir window loses its fresh lock to a removal already in
+  flight. → Release by rename-to-tombstone with a pid+nonce self-verify,
+  and a guard self-heal for release litter: a blocker tombstone holding
+  this process's own pid is its own leftovers in a single-threaded runtime
+  — removed and passed — while the stranded-restore tombstone is excluded
+  by name, because it holds somebody else's live lock and is owed a
+  restore, never a removal.
+- **The checked-writer discipline stopped one layer short of the two writes
+  that matter most.** A lock refusal at codex-exit left `running` on disk
+  forever beside a finished answer — and unlike every other refused writer,
+  the exit handler has nobody behind it to re-run: the record is the done
+  signal, and its writer was the one allowed to fail silently. A refused
+  pid registration left a run no cancel could reach, billing to completion
+  against a kill-pending promise nothing would keep. → Finalization retries
+  under a bounded budget and then says, loudly, exactly what exists and how
+  to resolve it; registration failure kills what it just spawned and
+  refuses, releasing the role only on a verified kill; sight labels and the
+  launch marker refuse before anything irreversible; and the failure
+  messages stopped asserting writes they had not made.
+- **`clean` could delete a record it could not read.** A transient read
+  failure was classified "already gone", the unlink then succeeded, and a
+  failed directory removal skipped the restore — an invisible job, under a
+  summary telling the operator nothing was half-removed. → The read moved
+  above the first unlink, and any failure refuses the job untouched: an
+  unreadable record is evidence a record exists and cannot be safeguarded,
+  which is exactly when deleting it must not proceed.
+
+The sixteen prose corrections landed on the final semantics, in the same
+register the code earned: sweep-eligible is not swept, a mismatch means
+unproven rather than a named villain, a wait bound is stated at its worst
+case, and the residuals carry what each guard costs. The lesson for the
+catalog: **an honesty audit is a bug-finder, because the gap between what
+the prose promises and what the code does is where the next defect already
+lives** — four of this round's fixes were found not by attacking the code
+but by asking whether the documentation was telling the truth.
+
+Two operational notes. A test agent probing `clean` ran it against the real
+jobs root — thirty-odd finished jobs' artifacts, gone; the rule that every
+manual runtime invocation sets a scratch `CODEX_DISPATCH_JOBS` first is now
+written into every brief that carries a shell. And the reviewer of this very
+round ended a turn "waiting" on a background suite run that its harness
+reaps at turn end — the same wait-that-was-never-alive the relay was cured
+of two days earlier, proving the lesson generalizes: no agent may end a
+turn owing work to a background child.

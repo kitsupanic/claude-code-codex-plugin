@@ -106,6 +106,7 @@ export const JOB_REASONS = [
   'cancelled-during-registration',
   'cancelled-during-exec',
   'record-version-mismatch',
+  'record-write-refused',
   'dispatch-failed',
 ];
 
@@ -814,9 +815,16 @@ const lockTombPath = (lock) =>
 // EIO, an ACL, a cloud filter waking a file back up — is a holder file that
 // EXISTS and could not be read, which is evidence for a holder and not against
 // one.
+// The errno travels with the unreadable answer, because the one reader that has
+// to explain itself — release, re-reading the holder of the tombstone it just cut
+// — can otherwise only say the read failed, and "EBUSY" and "EPERM" send an
+// operator to two different repairs.
 function lockHolderEvidence(lock) {
   try { return { text: fs.readFileSync(path.join(lock, RECORD_LOCK_HOLDER), 'utf8') }; }
-  catch (err) { return err && err.code === 'ENOENT' ? { absent: true } : { unreadable: true }; }
+  catch (err) {
+    if (err && err.code === 'ENOENT') return { absent: true };
+    return { unreadable: true, code: clean((err && (err.code || err.message)) || 'unknown') };
+  }
 }
 
 // Alive — or null, no evidence either way, which leaves the age test to decide.
@@ -839,11 +847,14 @@ function lockHolderLives(ev) {
 // Ours — the one question release may ask. `lockHolderLives` answers a different
 // one (is SOMEBODY there) and says true for any live pid, which is no evidence of
 // ownership at all.
-function lockHolderIsSelf(lock) {
-  let text;
-  try { text = fs.readFileSync(path.join(lock, RECORD_LOCK_HOLDER), 'utf8'); } catch { return false; }
-  const m = String(text).trim().match(/^(\d+)/);
+function holderIsSelf(ev) {
+  if (ev.absent || ev.unreadable) return false;
+  const m = String(ev.text).trim().match(/^(\d+)/);
   return !!m && Number(m[1]) === process.pid;
+}
+
+function lockHolderIsSelf(lock) {
+  return holderIsSelf(lockHolderEvidence(lock));
 }
 
 // A LIVE LOCK STRANDED IN A TOMBSTONE WHILE THE CANONICAL PATH STANDS FREE IS
@@ -871,9 +882,11 @@ function lockHolderIsSelf(lock) {
 // of this job is refused loudly at its own deadline (which is correct — that
 // process still believes it holds the record); when it exits, the tombstone reads
 // dead, stops blocking, and is collected by a later sweep. The one exception is a
-// tombstone whose holder file cannot be READ: it never reads as dead, so it blocks
-// until somebody repairs it by hand. That is deliberate — fail-closed, loud at
-// every deadline, and the refusal names the path to act on.
+// tombstone whose holder file cannot be READ: it cannot read as dead while that
+// lasts. The read is retried on every turn of every acquirer's wait, so a
+// TRANSIENT failure clears itself; a PERSISTENT one (an ACL, a broken permission)
+// blocks until somebody repairs it by hand. That is deliberate — fail-closed, loud
+// at every deadline, and the refusal names the path to act on.
 //
 // The two repairs behind this guard are redundancy, not the cure. A stranded
 // BREAKER that survived heals itself in milliseconds by retrying its own restore
@@ -881,15 +894,62 @@ function lockHolderIsSelf(lock) {
 // tombstone is defense-in-depth: with the guard in place the only way to reach a
 // strand this process did not cut itself is the guard-to-stage TOCTOU, the
 // three-writer microsecond race stated with the residuals.
+//
+// AND A GUARD THAT COULD NOT LOOK HAS NOT CLEARED ANYTHING. This is the one
+// observation in the seam whose fail-open direction readmits the silent
+// double-hold: a `readdir` that fails is not an absence of tombstones, it is an
+// absence of evidence, and unproven absence does not stage. So the answer is
+// three-valued. ENOENT is the only failure that means "no blocker": a job
+// directory that is not there holds no tombstone, and staging's own `mkdir` must
+// stay the fast, honest failure for that case rather than being pre-empted by a
+// fifteen-second wait for a lock in a directory nobody will ever create. Every
+// other errno — EPERM, EBUSY, EIO, an ACL, a cloud filter — is `unenumerable`,
+// and both callers treat it as blocked: the acquirer waits out its deadline like
+// any other contention and refuses in its own words, and `removeJobDir` refuses
+// the job rather than delete what it cannot prove is dead.
 function liveLockTomb(dir) {
   let names;
-  try { names = fs.readdirSync(dir); } catch { return null; }
+  try { names = fs.readdirSync(dir); }
+  catch (err) {
+    if (err && err.code === 'ENOENT') return { tomb: null };
+    return { tomb: null, unenumerable: clean(err && (err.code || err.message)) };
+  }
   for (const name of names) {
     if (!name.startsWith(`${RECORD_LOCK}${RECORD_LOCK_TOMB}`)) continue;
     const p = path.join(dir, name);
-    if (lockHolderLives(lockHolderEvidence(p)) === true) return p;
+    // The holder that decided this comes back with the answer: `healOwnLockLitter`
+    // asks a second question of the same bytes (is that live holder US), and
+    // reading the file twice would let the two questions be about two files.
+    const ev = lockHolderEvidence(p);
+    if (lockHolderLives(ev) === true) return { tomb: p, holder: ev };
   }
-  return null;
+  return { tomb: null };
+}
+
+// A BLOCKER HOLDING OUR OWN LIVE PID IS OUR OWN RELEASE LITTER, AND CLEARING IT
+// IS FINISHING OUR OWN RELEASE. `releaseRecordLock` swallows the removal of the
+// tombstone it proved is its own (there is nothing useful to do about a failed
+// `rmSync` there), and what that leaves is a `.stale-*` directory naming a pid
+// that is alive — this one. The guard cannot tell that from a stranded holder,
+// so it blocks: every later acquisition of this job, by any process AND by this
+// one, waits its deadline out and refuses, and the sweep that would collect the
+// thing is itself behind the guard. That is a wedge lasting until this process
+// exits, produced by tidying up.
+//
+// The predicate is deliberately only the PID, not the nonce: this runtime is
+// single-threaded and holds one record lock at a time, so at the moment this is
+// asked there is no acquisition of ours in flight and no tombstone of ours can be
+// anything but litter — whichever acquisition left it. Removing it is the removal
+// the release already decided on and could not complete. A failure to remove it
+// changes nothing: the caller keeps blocking, exactly as it did before.
+//
+// The `stranded` tombstone in `withRecordLock` never reaches this: it holds
+// somebody's LIVE lock that this process moved and owes a restore to, and it is
+// passed as a blocker of its own rather than through the guard.
+function healOwnLockLitter(guard) {
+  if (!guard.tomb || !holderIsSelf(guard.holder)) return guard;
+  try { fs.rmSync(guard.tomb, { recursive: true, force: true }); } catch { return guard; }
+  return { tomb: null };
 }
 
 // Assemble out of sight, publish in one step. The rename IS the acquisition: it
@@ -1061,6 +1121,70 @@ function tombIsCondemned(tomb, mtimeMs, condemned) {
   return now.absent !== true && String(now.text).trim() === String(condemned.text).trim();
 }
 
+// RELEASING IS A BREAK OF ONE'S OWN LOCK, AND IT FOLLOWS THE SAME DISCIPLINE AS
+// EVERY OTHER ONE. `rmSync` on the lock path is not a single-winner move and it
+// is not atomic: it unlinks the holder file first, leaving the lock standing and
+// EMPTY for however long the rmdir takes — the holderless lock the staged
+// acquisition exists to make impossible, and the same window the sweep and the
+// break each closed in 0.8.3 by moving before they remove. And the identity test
+// in front of it was a two-step bound to a pathname: a stale break landing
+// between the check and the removal made "ours" true about a lock that was
+// somebody else's by the time it was deleted. So the release renames to a
+// tombstone first, and only what it moved — and can still prove is its own — is
+// removed. Four dispositions, three of them refusals to delete:
+//
+//   - the holder is not ours: leave it. It is not ours to move, as before.
+//   - the rename fails: the lock was already broken or stolen; the same answer
+//     the identity test gave, one step later. Nothing is removed.
+//   - the won tombstone does not hold our own line (pid AND nonce, the
+//     `tombIsCondemned` comparison applied to release): a stale break replaced
+//     the lock between the check and the rename, so this tombstone holds somebody
+//     else's lock. It goes back to the lock path if that path is free, is left
+//     standing if it is not, and is never removed — one loud line either way.
+//     AND THE UNREADABLE CASE GETS ITS OWN WORDS, because it is not that finding.
+//     A holder file that will not read microseconds after our own rename of our
+//     own lock is a transient (EBUSY, a scanner, a cloud filter) far more often
+//     than it is a break, and the break sentence asserted as fact something this
+//     release cannot prove. What it can say is what happened: the holder could
+//     not be re-read, so ownership is unverified, so nothing is removed.
+//   - it does hold our line: remove it. A failure there is swallowed, as before:
+//     what is left is a tombstone whose holder is this process, which reads dead
+//     the moment this process exits and ages into the sweep — and which this
+//     process's own NEXT acquisition of this job clears itself (see the guard
+//     consumer in `withRecordLock`). Only a process that never acquires again
+//     leaves it standing until it exits.
+//
+// THE TOMBSTONE BRIEFLY HOLDS A LIVE PID — OURS — and that is deliberate and
+// harmless. For the microseconds between the rename and the removal, another
+// acquirer's `liveLockTomb` reads a live holder and refuses to stage: it waits
+// one 20ms turn and takes the freed path on the next. A releaser that dies
+// mid-removal leaves a tombstone naming a pid that is gone, which is the ordinary
+// lifecycle of every tombstone in this seam — dead, blocking nothing, collected
+// by a later sweep.
+function releaseRecordLock(lock) {
+  const mine = lockHolderEvidence(lock);
+  if (!holderIsSelf(mine)) return;
+  const tomb = lockTombPath(lock);
+  try { fs.renameSync(lock, tomb); } catch { return; }
+  const won = lockHolderEvidence(tomb);
+  if (!holderIsSelf(won) || String(won.text).trim() !== String(mine.text).trim()) {
+    let back = null;
+    try { fs.renameSync(tomb, lock); back = lock; } catch { /* the path is taken: leave it standing */ }
+    const where = back ? `put back at ${back}` : `left in ${tomb}`;
+    process.stderr.write(won.unreadable
+      ? `WARNING: the record lock at ${lock} was moved to a tombstone to release it and the tombstone's\n`
+        + `holder could not then be re-read (${won.code}), so this release cannot prove what it moved was\n`
+        + `its own — putting the lock back unverified. What this release moved was ${where}`
+        + ` and NOT removed.\n`
+      : `WARNING: the record lock at ${lock} was NOT this writer's by the time it was released — the\n`
+        + `holder read before the move said it was. Something broke this lock and published another in\n`
+        + `its place mid-release. What this release moved was ${where}`
+        + ` and NOT removed.\n`);
+    return;
+  }
+  try { fs.rmSync(tomb, { recursive: true, force: true }); } catch { /* our own dead tombstone: the sweep ages it out */ }
+}
+
 function withRecordLock(dir, fn) {
   const lock = path.join(dir, RECORD_LOCK);
   // MONOTONIC, BECAUSE THE WAIT BOUND IS A PROMISE THE WALL CLOCK MUST NOT BE
@@ -1078,7 +1202,22 @@ function withRecordLock(dir, fn) {
   let stranded = null;
   // The refusal names the tombstone, because "could not be locked; re-run" is
   // useless advice against a live lock sitting in a directory nobody will look in.
-  const refuse = (tomb) => {
+  //
+  // AND A GUARD THAT COULD NOT LOOK GETS ITS OWN WORDS. Routing an unenumerable
+  // job directory through the text below would name a tombstone nobody ever read
+  // and tell the operator to inspect a path this process never saw — a refusal
+  // that invents its own evidence. The two are different findings and they say so.
+  const refuse = (tomb, unenumerable) => {
+    if (unenumerable) {
+      process.stderr.write(
+        `WARNING: the record lock at ${lock} could not be taken: the job directory could not be\n`
+        + `enumerated (${unenumerable}), so the guard that refuses to stage past a live lock stranded in a\n`
+        + `tombstone could never run. That is unproven absence, not absence: a live holder's lock may be\n`
+        + `sitting in a "${RECORD_LOCK}${RECORD_LOCK_TOMB}*" directory with the lock path standing free, and staging past it\n`
+        + `would put two writers under this record. Retry once whatever is blocking that read is gone,\n`
+        + `and if it persists, investigate the directory by hand: ${dir}\n`);
+      return { locked: false };
+    }
     if (tomb) {
       process.stderr.write(
         `WARNING: the record lock at ${lock} could not be taken: a lock whose holder is still ALIVE\n`
@@ -1087,8 +1226,10 @@ function withRecordLock(dir, fn) {
         + `That holder still believes it has this record, so taking the lock path would put two writers\n`
         + `under it; this refuses instead. The block lasts as long as that holder's PROCESS does: once\n`
         + `it exits the tombstone reads as dead, stops blocking, and a later sweep collects it. If the\n`
-        + `holder file is UNREADABLE it can never read as dead and nothing lifts this on its own —\n`
-        + `inspect that directory and, once nothing is running under this job, remove it by hand.\n`);
+        + `holder file is UNREADABLE it cannot read as dead for as long as that lasts: a transient\n`
+        + `failure clears on a later turn and this lifts by itself, and one that persists lifts nothing —\n`
+        + `inspect that directory and, if it stays unreadable, remove it by hand once nothing is running\n`
+        + `under this job.\n`);
     }
     return { locked: false };
   };
@@ -1119,9 +1260,12 @@ function withRecordLock(dir, fn) {
     // A dead-or-absent holder's tombstone is litter and blocks nothing. This is
     // one `readdirSync` of a small directory every 20ms of contention, which is
     // cheaper than the state it prevents by any measure that matters.
-    const blocker = stranded || liveLockTomb(dir);
-    if (blocker) {
-      if (performance.now() >= deadline) return refuse(blocker);
+    //
+    // AND A BLOCKER THAT IS OUR OWN RELEASE LITTER IS CLEARED RATHER THAN WAITED
+    // OUT — see `healOwnLockLitter` for why a self-pid tombstone can only be that.
+    const guard = stranded ? { tomb: stranded } : healOwnLockLitter(liveLockTomb(dir));
+    if (guard.tomb || guard.unenumerable) {
+      if (performance.now() >= deadline) return refuse(guard.tomb, guard.unenumerable);
       sleepSync(20);
       continue;
     }
@@ -1275,13 +1419,12 @@ function withRecordLock(dir, fn) {
     sleepSync(20);
   }
   try { return { locked: true, value: fn() }; }
-  // RELEASE BY IDENTITY, NOT BY PATH. `rmSync` on the path removes whatever is
-  // there, and after a stale break that is somebody else's lock — the finisher
-  // deletes the directory another writer is still working under. A lock this
-  // process no longer owns is left exactly where it is: it is not ours to remove,
-  // and its own holder will release it or age out.
+  // RELEASE BY IDENTITY, NOT BY PATH, AND BY RENAME, NOT BY REMOVAL — see
+  // `releaseRecordLock` for both halves. A lock this process no longer owns is
+  // left exactly where it is: it is not ours to remove, and its own holder will
+  // release it or age out.
   finally {
-    try { if (lockHolderIsSelf(lock)) fs.rmSync(lock, { recursive: true, force: true }); } catch { /* best effort */ }
+    try { releaseRecordLock(lock); } catch { /* best effort */ }
   }
 }
 
@@ -1317,6 +1460,62 @@ function updateRecordOutcome(dir, patch, { expect } = {}) {
 function updateRecord(dir, patch, opts) {
   const outcome = updateRecordOutcome(dir, patch, opts);
   return outcome.ok ? outcome.record : null;
+}
+
+// A WRITE WHOSE LOSS IS UNSAFE ASKS TWICE, AND ONLY EVER A COUNTED NUMBER OF
+// TIMES. `locked` is the one answer worth repeating: it means an impostor at the
+// lock path, a holder that stalled past the wait, or a break that has not landed
+// yet — states that clear on their own, in seconds, while `corrupt` and
+// `precondition` are answers about the record itself and are returned at once.
+//
+// BOUNDED IN BOTH DIMENSIONS, because the two ways to be told `locked` cost
+// wildly different amounts of time. The slow one has already spent
+// RECORD_LOCK_WAIT_MS inside the call, so a handful of them is a minute of wall
+// clock and the ATTEMPT cap is what stops it; the fast one is a staging `mkdir`
+// that failed outright and returns immediately, so a cap on attempts alone would
+// spin, and the monotonic budget is what stops that. `performance.now()` for the
+// same reason `withRecordLock` uses it: a steppable wall clock must not be able
+// to lengthen a promise about how long something waits.
+const RECORD_WRITE_RETRY_MS = 250;
+// The two budgets this runtime is willing to spend on a write it may not lose.
+// TERMINAL is the detached supervisor's last act and it has nothing else to do:
+// five attempts inside a minute, because codex has already been paid for and
+// every second not spent here is a job that reads `stale` for ever. LAUNCH is
+// spawn-adjacent — the refusal that follows a failure costs milliseconds of
+// codex, and holding a live codex hostage to a lock is worse than refusing — so
+// it is one full lock wait and one more.
+//
+// AND THE BUDGET CAPS THE TIME BETWEEN ATTEMPTS, NOT THE TIME AN ATTEMPT TAKES:
+// it is checked after each one, and a `locked` answer can have spent a full
+// RECORD_LOCK_WAIT_MS getting there. So the minute and the twenty seconds are
+// what the loop is willing to have spent before it starts another attempt, and
+// the wall-clock worst cases are one lock wait longer than that — about 75s for
+// TERMINAL (four attempts landing just inside the minute, then a fifth) and about
+// 30s for LAUNCH, which is the same "one full lock wait plus one more" the line
+// above states.
+//
+// TEST HOOK: the BUDGET half of both, and nothing else. Reaching either retry at
+// all means a wedged lock, and every attempt inside one costs a full
+// RECORD_LOCK_WAIT_MS — so a test of the loud not-recorded message that this
+// runtime pays a minute for is a test nobody runs. The attempt caps, the decision
+// to retry only `locked`, and the messages are all untouched by it. Never set
+// outside the suite; unset, both budgets are exactly what the paragraph above
+// says.
+function writeBudgetMs(dflt) {
+  const n = Number(process.env.CODEX_DISPATCH_TEST_WRITE_BUDGET_MS);
+  return Number.isFinite(n) && n > 0 ? n : dflt;
+}
+const TERMINAL_WRITE_RETRY = { attempts: 5, budgetMs: writeBudgetMs(60000) };
+const LAUNCH_WRITE_RETRY = { attempts: 2, budgetMs: writeBudgetMs(20000) };
+function updateRecordWithRetry(dir, patch, opts, { attempts, budgetMs }) {
+  const deadline = performance.now() + budgetMs;
+  let outcome;
+  for (let attempt = 1; ; attempt++) {
+    outcome = updateRecordOutcome(dir, patch, opts);
+    if (outcome.ok || outcome.why !== 'locked') return outcome;
+    if (attempt >= attempts || performance.now() >= deadline) return outcome;
+    sleepSync(RECORD_WRITE_RETRY_MS);
+  }
 }
 
 // The liveness probe decides whether a kill worked, whether a job is stale, and
@@ -3068,6 +3267,18 @@ export function stillCancellable(record) {
   return !isCorrupt(record) && LIVE_STATES.includes(canonicalState(record));
 }
 
+// ONE NOTCH TIGHTER, AND IT IS THE PRECONDITION OF EVERY WRITER THAT WOULD BE
+// OVERWRITING A CANCEL RATHER THAN CARRYING ONE OUT. `kill-pending` and
+// `kill-failed` are LIVE states — they have to be, so a second cancel can retry
+// them — so `stillCancellable` alone lets a refusal write `failed(<reason>)` over
+// a cancel's verdict and hand away the role that `kill-failed` exists to keep
+// blocked. See the long note above `refuseBeforeLaunch`, which is where this
+// rule was first drawn; dispatch's own two finalizations carry it as well, for
+// the cancel that lands in the pre-spawn window.
+export function notCancelAuthored(record) {
+  return stillCancellable(record) && !CANCEL_STATES.includes(canonicalState(record));
+}
+
 // Returns { ok, survivors, targets }. A kill that cannot be shown to have worked
 // is NOT a kill: the job goes to `kill-failed`, keeps its role claim, and keeps
 // blocking dispatch — because whatever survived may still be codex, still billing.
@@ -3722,6 +3933,38 @@ function cmdDispatch(opts) {
   const claim = claimRole(root, role, id, { force: opts.force });
   if (!claim.ok) fail(claim.message);
 
+  // BOTH OF THIS DISPATCH'S NOTHING-WAS-SPAWNED FINALIZATIONS GO THROUGH HERE,
+  // AND THEY CARRY THE SAME PRECONDITION THE SUPERVISOR'S REFUSALS DO. The record
+  // says `launch: 'spawning'` from before the spawn is attempted, which is
+  // deliberately a state a cancel may act on — so a cancel can write
+  // `kill-pending` into the window these two writes land in, and an unconditional
+  // `failed(<reason>)` here overwrote that verdict and handed the role away
+  // underneath it, which is the mistake 0.8.x closed everywhere else in the seam.
+  // `notCancelAuthored` is the same predicate `refuseBeforeLaunch` defaults to,
+  // and a lost precondition is read the same way: a verdict was FOUND, it is not
+  // overwritten, and the release follows whoever owns it — a cancel-authored state
+  // owns its own role release (`kill-failed` above all, whose whole contract is
+  // that the role stays blocked), while any other found verdict belongs to a
+  // process that is not running anything of this job's, so the claim is still this
+  // dispatch's to give back.
+  //
+  // A write that could not be made AT ALL is unchanged: it found no verdict,
+  // nothing was spawned, and the role goes back exactly as it did before.
+  //
+  // The WRITE stays at each call site rather than moving in here, so the state and
+  // the reason are still written as literals side by side: that pair is a contract
+  // with the operator, and the scan that checks it against `commands/list.md`
+  // reads the source (tests/resolution.test.mjs). What is shared is the answer —
+  // what was found, and who owns the release.
+  const settleUnspawned = (written) => {
+    const found = !written.ok && written.why === 'precondition'
+      ? canonicalState(written.current)
+      : null;
+    const cancelOwns = !!found && CANCEL_STATES.includes(found);
+    if (!cancelOwns) releaseRole(root, role, id);
+    return { ok: written.ok, found, cancelOwns };
+  };
+
   // Set the moment a supervisor exists. Past that point the catch-all below must
   // NOT finalize the record or release the role: something is running.
   let spawned = false;
@@ -3784,7 +4027,22 @@ function cmdDispatch(opts) {
     // From here on a supervisor may exist, so nothing may read "no recorded pid"
     // as "nothing is running". The marker goes down BEFORE the spawn, because
     // after it there is no instant at which it could be written soon enough.
-    updateRecord(dir, { launch: 'spawning' });
+    //
+    // AND A MARKER THAT DID NOT LAND MEANS THE SPAWN MUST NOT HAPPEN, which is
+    // what the line above this one has said all along: everything to here is
+    // reversible and a spawned supervisor is not. Unchecked, a refused write left
+    // `launch: 'pending'` under a supervisor that was launched anyway — the
+    // registration window read as "nothing was ever started", which is the one
+    // reading that lets a cancel call a running job dead. The throw lands in the
+    // catch-all below, which finalizes the record (or says honestly that it could
+    // not) and gives the role back: `spawned` is still false, and it is still
+    // true that nothing is running.
+    const marked = updateRecordOutcome(dir, { launch: 'spawning' });
+    if (!marked.ok) {
+      throw new Error(
+        `the pre-spawn launch marker could not be written to the record (${clean(marked.why)}), and ` +
+        'nothing may be spawned behind a record that still reads as never having started');
+    }
 
     const supLog = fs.openSync(path.join(dir, 'supervisor.log'), 'a');
     const child = spawn(process.execPath, [SELF, '_supervise', dir], {
@@ -3800,17 +4058,35 @@ function cmdDispatch(opts) {
     // — which later reads `stale`, blocks the role, and makes the refusal claim
     // codex "may still be billing" for a process that never existed.
     if (!child.pid) {
-      updateRecord(dir, {
+      // Checked, because "the job is recorded as failed" is a sentence this
+      // dispatch has no right to say on a write it never looked at: a refused one
+      // leaves the record reading `running` with nothing behind it, which is the
+      // ghost the whole path exists to prevent, announced as its own cure. And
+      // conditional, because the write may land on a cancel's verdict — see
+      // `settleUnspawned`, which owns what a lost precondition means here.
+      const done = settleUnspawned(updateRecordOutcome(dir, {
         state: 'failed',
         reason: 'supervisor-spawn-failed',
         exitCode: -1,
         finished: new Date().toISOString(),
-      });
-      releaseRole(root, role, id);
+      }, { expect: notCancelAuthored }));
       fail(
         `dispatch: could not start job ${id} — the supervisor process would not spawn.\n` +
-        `The job is recorded as failed (supervisor-spawn-failed) and the "${role}" role has been\n` +
-        `released; nothing was billed, because codex was never reached.\n` +
+        (done.ok
+          ? `The job is recorded as failed (supervisor-spawn-failed) and the "${role}" role has been\n` +
+            `released; nothing was billed, because codex was never reached.\n`
+          : done.cancelOwns
+            ? `A cancel reached this job first; its verdict stands as "${clean(done.found)}" and has NOT\n` +
+              `been overwritten. Releasing the "${role}" role is that cancel's decision to make, so this\n` +
+              `dispatch released nothing. Nothing was billed, because codex was never reached.\n` +
+              `See it: status ${id}\n`
+            : done.found
+              ? `The record had already reached "${clean(done.found)}" before this failure could be\n` +
+                `written, so that verdict has NOT been overwritten; the "${role}" role has been released.\n` +
+                `Nothing was billed, because codex was never reached. See it: status ${id}\n`
+              : `The failure could NOT be recorded, so the job will read stale until it is cancelled; the\n` +
+                `"${role}" role has been released. Nothing was billed, because codex was never reached.\n` +
+                `Resolve the record: cancel ${id}\n`) +
         `out: ${outPath(dir)}`
       );
     }
@@ -3974,17 +4250,34 @@ function cmdDispatch(opts) {
         `out: ${outPath(dir)}`
       );
     }
-    updateRecord(dir, {
+    // Checked for the same reason the spawn-failure path is: this is the write
+    // that turns a ghost into a finalized job, and claiming it happened when it
+    // did not is worse than the ghost — it tells the operator to stop looking.
+    // Conditional for the same reason too: the throw can be the launch marker's
+    // own refusal, which is exactly where a cancel is most likely to be sitting.
+    const done = settleUnspawned(updateRecordOutcome(dir, {
       state: 'failed',
       reason: 'dispatch-failed',
       exitCode: -1,
       finished: new Date().toISOString(),
-    });
-    releaseRole(root, role, id);
+    }, { expect: notCancelAuthored }));
     fail(
       `dispatch: could not start job ${id}: ${clean(err.message)}\n` +
-      `The job is recorded as failed (dispatch-failed) and the "${role}" role has been released;\n` +
-      `nothing was billed, because codex was never reached.`
+      (done.ok
+        ? `The job is recorded as failed (dispatch-failed) and the "${role}" role has been released;\n` +
+          `nothing was billed, because codex was never reached.`
+        : done.cancelOwns
+          ? `A cancel reached this job first; its verdict stands as "${clean(done.found)}" and has NOT\n` +
+            `been overwritten. Releasing the "${role}" role is that cancel's decision to make, so this\n` +
+            `dispatch released nothing. Nothing was billed, because codex was never reached.\n` +
+            `See it: status ${id}`
+          : done.found
+            ? `The record had already reached "${clean(done.found)}" before this failure could be\n` +
+              `written, so that verdict has NOT been overwritten; the "${role}" role has been released.\n` +
+              `Nothing was billed, because codex was never reached. See it: status ${id}`
+            : `The failure could NOT be recorded (dispatch-failed), so the job will read stale until it is\n` +
+              `cancelled; the "${role}" role has been released. Nothing was billed, because codex was never\n` +
+              `reached. Resolve the record: cancel ${id}`)
     );
   }
 
@@ -4009,19 +4302,28 @@ function cmdSupervise(dir) {
   // record that already names us: re-writing it would be a second writer for no
   // gain. Writing it here remains the fallback for a record that does not.
   const existing = readRecord(dir);
-  const record = (!isCorrupt(existing) && existing.supervisorPid === process.pid)
-    ? existing
-    : updateRecord(dir, {
+  const written = (!isCorrupt(existing) && existing.supervisorPid === process.pid)
+    ? { ok: true, record: existing }
+    : updateRecordOutcome(dir, {
       supervisorPid: process.pid,
       [PID_START_FIELD]: {
         ...(!isCorrupt(existing) && existing[PID_START_FIELD] ? existing[PID_START_FIELD] : {}),
         ...startTimesFor([process.pid]),
       },
     });
-  if (!record) {
-    process.stderr.write(`supervisor: job.json is corrupt, refusing to run: ${dir}\n`);
+  // TWO WAYS TO FAIL, AND ONLY ONE OF THEM IS CORRUPTION. `updateRecord` answered
+  // null for both, so a record this supervisor merely could not LOCK — an
+  // impostor at the lock path, a holder that stalled — was reported to the
+  // operator as a corrupt job.json, which sends them to inspect a file that is
+  // perfectly fine. The refusal is the same either way; the diagnosis is not.
+  if (!written.ok) {
+    process.stderr.write(written.why === 'corrupt'
+      ? `supervisor: job.json is corrupt, refusing to run: ${dir}\n`
+      : `supervisor: job.json could not be locked to record this supervisor's pid (${clean(written.why)}), ` +
+        `refusing to run: ${dir}\n`);
     process.exit(1);
   }
+  const record = written.record;
   // Pid files mirror job.json: a corrupt record must not cost us the kill target.
   fs.writeFileSync(path.join(dir, 'supervisor.pid'), String(process.pid));
   const root = path.dirname(dir);
@@ -4063,9 +4365,24 @@ function cmdSupervise(dir) {
   //
   // The kill-pending HONOUR path below is the exception and passes its own
   // precondition: it is not overwriting that cancel, it is carrying it out.
-  const notCancelAuthored = (rec) =>
-    stillCancellable(rec) && !CANCEL_STATES.includes(canonicalState(rec));
-  const refuseBeforeLaunch = (patch, { expect = notCancelAuthored } = {}) => {
+  // The predicate itself is `notCancelAuthored`, up beside `stillCancellable`:
+  // dispatch's two finalizations carry the same rule against the same opponent.
+  //
+  // `release` is the one caller-settable half, and there is exactly one caller
+  // that turns it off: a refusal reached AFTER codex was spawned, whose kill of
+  // that codex could not be verified. Handing the role away there would be the
+  // `kill-failed` mistake by another name — a claim released while something that
+  // bills may still be alive — so that caller records the refusal and keeps the
+  // claim, and the operator's own cancel resolves it.
+  //
+  // `spawned` is the same caller's other half, and it exists because `release`
+  // cannot stand in for it. That caller passes `release: verified`, so a kill that
+  // DID verify comes through with release on and would have been told, in the
+  // unwritable-record report below, that "nothing was launched" — about a codex
+  // this supervisor spawned, killed and watched die. The reason cannot stand in
+  // for it either: `record-write-refused` is also the sight-label refusal's
+  // reason, and nothing is spawned there. So the caller that spawned says so.
+  const refuseBeforeLaunch = (patch, { expect = notCancelAuthored, release = true, spawned = false } = {}) => {
     const written = updateRecordOutcome(dir, {
       ...patch,
       // The state, the reason and the survivor list travel as ONE. The record this
@@ -4076,7 +4393,7 @@ function cmdSupervise(dir) {
       finished: new Date().toISOString(),
     }, { expect });
     if (written.ok) {
-      releaseRole(root, record.role, id);
+      if (release) releaseRole(root, record.role, id);
       return;
     }
     const msg = written.why === 'precondition'
@@ -4084,11 +4401,18 @@ function cmdSupervise(dir) {
         `refusal could be written, so that verdict has NOT been overwritten and no role claim was\n` +
         `released — whoever wrote it owns that decision. See it: status ${id}`
       : `supervisor: this refusal could not be written to the record (${clean(written.why)}), so the record\n` +
-        `still says what it said. Nothing was launched; the "${clean(record.role)}" role claim has been\n` +
-        `released. Look at the job: status ${id}`;
+        `still says what it said. ` +
+        (release
+          ? (spawned
+            ? `What was spawned has been killed and verified dead; the\n` +
+              `"${clean(record.role)}" role claim has been released.`
+            : `Nothing was launched; the "${clean(record.role)}" role claim has been\nreleased.`)
+          : `The "${clean(record.role)}" role claim has NOT been released — the line above\n` +
+            `this one says what was spawned and what became of it.`) +
+        ` Look at the job: status ${id}`;
     try { fs.appendFileSync(runLogPath(dir), msg + '\n'); } catch { /* best effort */ }
     process.stderr.write(msg + '\n');
-    if (written.why !== 'precondition') releaseRole(root, record.role, id);
+    if (written.why !== 'precondition' && release) releaseRole(root, record.role, id);
   };
 
   // ASSERT THE SCHEMA VERSION OF THE RECORD THIS SUPERVISOR PICKED UP. Two copies
@@ -4180,6 +4504,32 @@ function cmdSupervise(dir) {
       process.exit(1);
     }
   }
+  // THE SIGHT LABEL IS THE ONLY EVIDENCE THE DELIVERY GATE EVER READS, so a label
+  // that does not land is a run that can never be delivered: `result` reads
+  // `sight` out of the record, finds nothing there, and refuses the answer codex
+  // was paid to produce. This write was fire-and-forget, which put the whole
+  // proof — the thing this release spends a shell probe to establish — on the
+  // hope that a lock was free. Nothing has been spawned yet and everything here
+  // is still reversible, so a label that will not land is refused BEFORE the
+  // spend instead of discovered after it. `locked` is retried tight
+  // (LAUNCH_WRITE_RETRY): this is one step from the launch, and refusing costs
+  // nothing while waiting costs the operator a supervisor that is doing nothing.
+  const recordSightLabel = (patch) => {
+    const written = updateRecordWithRetry(dir, patch, undefined, LAUNCH_WRITE_RETRY);
+    if (written.ok) return;
+    const msg =
+      `supervisor: THE SIGHT LABEL COULD NOT BE RECORDED (${clean(written.why)}) — refusing to run.\n` +
+      `sight: ${clean(String(patch.sight))}\n` +
+      `The record is what "result" reads its proof out of, so a job whose label never landed could\n` +
+      `never be delivered however well it ran — it would be refused as unvouched with codex already\n` +
+      `paid for. Nothing has been launched, so nothing was billed. Re-dispatch once whatever is\n` +
+      `holding this job's record lock is gone: status ${id}`;
+    try { fs.appendFileSync(runLogPath(dir), msg + '\n'); } catch { /* best effort */ }
+    process.stderr.write(msg + '\n');
+    refuseBeforeLaunch({ state: 'failed', reason: 'record-write-refused' });
+    process.exit(1);
+  };
+
   // DELIVERABILITY REQUIRES PROVEN SIGHT, and exactly one thing proves it: a file
   // that already existed in this job's own --cd, read back through codex's sandbox
   // with its bytes returned. Two situations fall short of that and used to be
@@ -4227,9 +4577,9 @@ function cmdSupervise(dir) {
     }
     warning = `sight not proven, accepted by caller (--allow-unproven-sight): ${detail}`;
     try { fs.appendFileSync(runLogPath(dir), `supervisor: ${warning}\n`); } catch { /* best effort */ }
-    updateRecord(dir, { sight: ACCEPTED_SIGHT, warning });
+    recordSightLabel({ sight: ACCEPTED_SIGHT, warning });
   } else {
-    updateRecord(dir, { sight: sight.mode });
+    recordSightLabel({ sight: sight.mode });
   }
 
   // LAST CHECK BEFORE THE SPEND. Everything above is reversible; a launched codex
@@ -4262,13 +4612,20 @@ function cmdSupervise(dir) {
     abortSupervisor(dir, `the record says "${clean(now.state)}", not "running" — this job was cancelled before codex was launched`);
   }
   if (!verifyClaim(roleLockDir(root, record.role), id)) {
-    updateRecord(dir, {
+    // Checked, like every other terminal write: a `claim-lost` that could not be
+    // written leaves the record saying `running` with a supervisor about to exit,
+    // and the abort below would have announced a finalization that never
+    // happened. Nothing is retried here — the answer is the same either way, this
+    // supervisor is leaving — and nothing is released: the claim is somebody
+    // else's now.
+    const recorded = updateRecordOutcome(dir, {
       state: 'failed',
       reason: 'claim-lost',
       finished: new Date().toISOString(),
-    });
-    // Deliberately no releaseRole: the claim is somebody else's now.
-    abortSupervisor(dir, `the "${record.role}" role claim is no longer this job's — another dispatch owns it`);
+    }).ok;
+    abortSupervisor(dir,
+      `the "${record.role}" role claim is no longer this job's — another dispatch owns it`
+      + (recorded ? '' : ', and that could NOT be recorded: this job will read "stale" until it is cancelled'));
   }
 
   const promptFd = fs.openSync(path.join(dir, 'prompt.md'), 'r');
@@ -4353,7 +4710,21 @@ function cmdSupervise(dir) {
   const workers = viaShell ? resolveWorkerPids(child.pid) : [];
   const codexPids = [...new Set([child.pid, ...workers].filter(isPid))];
   if (codexPids.length) fs.writeFileSync(path.join(dir, 'codex.pid'), codexPids.join('\n'));
-  updateRecord(dir, {
+  // AND A REGISTRATION THAT DID NOT LAND MUST NOT BE ASSUMED. This was
+  // fire-and-forget, and it is the one write in the seam where that is
+  // indefensible: it is the write that turns a spawned codex into a KILLABLE one.
+  // Lost, the record keeps `launch: 'exec-spawning'` and no `codexPids`, so
+  // `killWindow` answers "exec" for as long as this supervisor lives — every
+  // cancel writes `kill-pending` and kills nothing, the honour path below has
+  // already had its one look at the record, and the finalizer's own
+  // compare-and-swap then fails against that `kill-pending`. A run nobody can
+  // stop except by promise, billing to completion.
+  //
+  // So it is insisted on, tightly (LAUNCH_WRITE_RETRY), and a failure kills what
+  // was just spawned rather than leaving it unkillable: milliseconds of codex is
+  // a cheaper thing to lose than the only handle on it. The pid is in hand right
+  // here, which is the whole reason this line exists at all.
+  const registered = updateRecordWithRetry(dir, {
     codexPid: isPid(child.pid) ? child.pid : null,
     codexPids,
     // Merged, never replaced: the supervisor's own entry was written by the
@@ -4366,7 +4737,35 @@ function cmdSupervise(dir) {
     // verified kill. On Windows the tree is taskkill's business.
     codexPgid: !WIN && isPid(child.pid) ? child.pid : null,
     launch: 'exec',
-  });
+  }, undefined, LAUNCH_WRITE_RETRY);
+  if (!registered.ok) {
+    const killed = killPids(codexPids);
+    // The same bar every kill in this runtime is held to: nothing survived, and
+    // something actually looked. An unverified kill KEEPS THE ROLE — codex may
+    // still be billing, and handing the claim away there is the `kill-failed`
+    // mistake under another name — so the refusal below is told not to release it.
+    const verified = !killed.survivors.length && killed.enumerated;
+    const msg =
+      `supervisor: CODEX WAS SPAWNED AND COULD NOT BE RECORDED (${clean(registered.why)}) — refusing to run it.\n` +
+      `A codex whose pids are not on the record cannot be cancelled: every kill would land on a\n` +
+      `record that does not know what to aim at, while codex ran on and billed. It has been killed\n` +
+      `instead, ${killed.survivors.length
+        ? `and pids ${killed.survivors.join(', ')} SURVIVED — the "${clean(record.role)}" role stays claimed.\n`
+          + `Kill them yourself before re-dispatching.`
+        : killed.enumerated
+          ? 'and verified dead; seconds of codex were spent and nothing was delivered.'
+          : `and ${UNENUMERATED_KILL} — the "${clean(record.role)}" role stays claimed.\n${UNENUMERATED_ADVICE}`}\n` +
+      `See it: status ${id}`;
+    try { fs.appendFileSync(runLogPath(dir), msg + '\n'); } catch { /* best effort */ }
+    process.stderr.write(msg + '\n');
+    // Deliberately no `consumePidFiles`: it is a WRITE to the record, through the
+    // very lock that just refused this supervisor, and spending another wait on
+    // bookkeeping while a killed codex's fate is already stated above buys
+    // nothing. The pid files are litter a later clean takes.
+    refuseBeforeLaunch({ state: 'failed', reason: 'record-write-refused', exitCode: -1 },
+      { release: verified, spawned: true });
+    process.exit(1);
+  }
   if (viaShell && !workers.length) {
     fs.appendFileSync(runLogPath(dir),
       'supervisor: WARNING - codex was launched through a shell wrapper and no worker process could ' +
@@ -4453,9 +4852,24 @@ function cmdSupervise(dir) {
     // ENOSPC on the temp file — and an uncaught throw out of an exit handler ends
     // this supervisor right here: the record still says `running`, so the job
     // reads `stale` for ever, holds its role, and `result` refuses a finished
-    // out.txt sitting next to it. A write that could not happen is reported, in
-    // the job's own log and on stderr, exactly like every other one in this
-    // runtime that cannot be made to stick.
+    // out.txt sitting next to it.
+    //
+    // AND IT MAY FAIL WITHOUT THROWING, WHICH IS THE HALF THIS USED TO DROP. A
+    // `locked` or `corrupt` answer is not an exception: `updateRecord` returned
+    // null and this handler went straight on to release the role, so the loudest
+    // verdict in the runtime — the one the whole job exists to produce — was the
+    // only write in the kill seam nobody checked. It is checked now, and the two
+    // losing answers are not the same finding:
+    //
+    //   - `precondition` is A FOUND VERDICT, the rule every other writer here
+    //     follows: something reached a terminal state while the log was being
+    //     scanned, that state is the answer, and this stays silent about it.
+    //   - `locked` is contention, and this writer can afford to insist: it is
+    //     retried to TERMINAL_WRITE_RETRY before it is given up on.
+    //   - anything still unwritten after that, `corrupt` included, is reported in
+    //     the job's own log and on stderr, exactly like every other write in this
+    //     runtime that cannot be made to stick — including the throw below, whose
+    //     message this one deliberately mirrors.
     try {
       const current = readRecord(dir);
       if (!isCorrupt(current) && canonicalState(current) === 'running') {
@@ -4471,13 +4885,23 @@ function cmdSupervise(dir) {
         // cancel to land inside it, and a `killed` verdict written in that gap used
         // to be overwritten by this `done`. The precondition is re-evaluated inside
         // the lock, so the other writer's verdict wins the race it just won.
-        updateRecord(dir, {
+        const written = updateRecordWithRetry(dir, {
           state: code === 0 ? 'done' : 'failed',
           warning: warnings.length ? warnings.join('; ') : undefined,
           blindSignature: blind || undefined,
           exitCode: code,
           finished: new Date().toISOString(),
-        }, { expect: (rec) => canonicalState(rec) === 'running' });
+        }, { expect: (rec) => canonicalState(rec) === 'running' }, TERMINAL_WRITE_RETRY);
+        if (!written.ok && written.why !== 'precondition') {
+          const msg =
+            `supervisor: codex exited ${code}, but its verdict could not be recorded ` +
+            `(${clean(written.why)}).\n` +
+            `The record still says "running", so this job will read "stale" and keep its role until\n` +
+            `someone cancels it. The answer file, if codex wrote one, is at ${outPath(dir)}\n` +
+            `Resolve the record: cancel ${id}`;
+          try { fs.appendFileSync(runLogPath(dir), msg + '\n'); } catch { /* best effort */ }
+          process.stderr.write(msg + '\n');
+        }
       }
     } catch (err) {
       const msg =
@@ -4511,7 +4935,11 @@ function cmdSupervise(dir) {
 
 // A supervisor that must not launch says so in the two places a human will look —
 // the job's own run.log and the supervisor's stderr — and exits nonzero. The
-// record has already been set by the caller; this only reports and stops.
+// record has already been WRITTEN AT by the caller, which is not the same as
+// written: a caller's finalization can lose its precondition or fail to take the
+// lock, and this function has no way to tell. Callers that finalize their own
+// record therefore check that write themselves and say so in `why` — this only
+// reports what it is handed, and stops.
 function abortSupervisor(dir, why, { launched = false } = {}) {
   const msg = launched
     ? `supervisor: ABORTING — ${why}.`
@@ -4978,11 +5406,12 @@ function cmdClean(opts) {
     process.stderr.write(
       `WARNING: ${failures.length} job director${failures.length === 1 ? 'y' : 'ies'} could not be removed:\n` +
       failures.map((f) => `  ${f}\n`).join('') +
-      `Something is holding a file open, or is sitting in the directory (a watcher window, an editor,\n` +
-      `a virus scanner, a shell). Each of them still has its job.json — put back if it had already\n` +
-      `been removed when the failure hit — so it still lists, still reads as finished, and a later\n` +
-      `clean will take it. Nothing was left half-removed and invisible, and the one case that could\n` +
-      `not be put back would have said so above.\n`
+      `Something is holding a file open, is sitting in the directory (a watcher window, an editor,\n` +
+      `a virus scanner, a shell), or is holding a record lock this runtime refuses to remove. Each\n` +
+      `of them still has its job.json — restored if it had already been removed when the failure hit\n` +
+      `— so it still lists, still reads as it did, and a later clean will take it. Nothing was left\n` +
+      `half-removed and invisible, and the one case where a record could not be restored would have\n` +
+      `said so above.\n`
     );
   }
 }
@@ -5029,43 +5458,67 @@ function cmdClean(opts) {
 // is refused instead, loudly and by job, which the caller already handles: one
 // stuck job does not end a clean run, it lists, and a later clean takes it once
 // whatever is holding that lock is gone. A dead-or-absent holder's tombstone
-// goes with the job as before.
+// goes with the job as before, and a job directory that cannot be ENUMERATED at
+// all is refused for the same reason one step weaker: the guard did not clear
+// this job, it failed to look at it, and unproven absence does not authorize a
+// removal any more than it authorizes an acquisition.
+//
+// AND THE RECORD IS READ BEFORE ANYTHING IS UNLINKED, because bytes that were
+// never read cannot be put back. The read used to sit between the children and
+// the record's own removal, where a failure meant the whole safeguard silently
+// did not exist — the last step could then fail with nothing in hand and leave
+// exactly the unlistable directory the ordering exists to prevent. It runs first
+// now, and ANY failure refuses the job rather than only ENOENT: this read happens
+// under the record lock, milliseconds after `cmdClean` read the same file, so an
+// absence is incoherent and an unreadable record is evidence that the file is
+// there and cannot be safeguarded. Nothing has been touched at that point, so the
+// job keeps everything it had.
 function removeJobDir(dir) {
-  const live = liveLockTomb(dir);
-  if (live) {
+  // The same self-heal the acquisition guard runs, and for the same reason: this
+  // runs in-process, holding this job's record lock, so a tombstone naming this
+  // pid is this process's own release litter (see `healOwnLockLitter`) and
+  // refusing the job over it would be refusing it over our own leftovers.
+  const guard = healOwnLockLitter(liveLockTomb(dir));
+  if (guard.unenumerable) {
     throw new Error(
-      `a record lock whose holder is still alive is stranded in ${path.basename(live)}`
+      `the job directory could not be enumerated (${guard.unenumerable}) — the guard cannot prove no live`
+      + ' lock is stranded here, so nothing was removed');
+  }
+  if (guard.tomb) {
+    throw new Error(
+      `a record lock whose holder is still alive is stranded in ${path.basename(guard.tomb)}`
       + ' — removing this job would delete a live lock');
+  }
+  let raw;
+  try { raw = fs.readFileSync(recordPath(dir)); } catch (err) {
+    throw new Error(
+      `the record could not be read (${clean(err.code || err.message)}) — nothing was removed; the job`
+      + ' still lists, and a re-run of clean will take it');
   }
   for (const name of fs.readdirSync(dir)) {
     if (name === 'job.json' || name === RECORD_LOCK) continue;
     fs.rmSync(path.join(dir, name), { recursive: true, force: true });
   }
-  let raw = null;
-  try { raw = fs.readFileSync(recordPath(dir)); } catch { /* already gone: nothing to put back */ }
   fs.rmSync(recordPath(dir), { force: true });
-  // Ours to give back, and only ours: released by the same identity test
-  // `withRecordLock` releases by, because a lock this process no longer holds is
-  // somebody else's and is not this removal's to delete.
-  const lock = path.join(dir, RECORD_LOCK);
-  try { if (lockHolderIsSelf(lock)) fs.rmSync(lock, { recursive: true, force: true }); } catch { /* best effort */ }
+  // Ours to give back, and only ours, and given back exactly the way
+  // `withRecordLock` gives it back (see `releaseRecordLock`): by identity, and by
+  // a rename to a tombstone rather than a removal of the live path.
+  try { releaseRecordLock(path.join(dir, RECORD_LOCK)); } catch { /* best effort */ }
   try {
     fs.rmSync(dir, { recursive: true, force: true });
   } catch (err) {
-    if (raw !== null) {
-      let restoreErr = null;
-      const held = withRecordLock(dir, () => {
-        try { fs.writeFileSync(recordPath(dir), raw); return true; } catch (e) { restoreErr = e; return false; }
-      });
-      if (!held.locked || !held.value) {
-        process.stderr.write(
-          `WARNING: job directory ${dir} could not be removed (${clean(err.code || err.message)}), and its\n` +
-          `job.json could not be put back (${restoreErr
-            ? clean(restoreErr.code || restoreErr.message)
-            : 'its record lock could not be re-acquired, and nothing writes that file without it'}). ` +
-          `Without a record\nthat directory is invisible to list, status and clean — remove it by hand.\n`
-        );
-      }
+    let restoreErr = null;
+    const held = withRecordLock(dir, () => {
+      try { fs.writeFileSync(recordPath(dir), raw); return true; } catch (e) { restoreErr = e; return false; }
+    });
+    if (!held.locked || !held.value) {
+      process.stderr.write(
+        `WARNING: job directory ${dir} could not be removed (${clean(err.code || err.message)}), and its\n` +
+        `job.json could not be put back (${restoreErr
+          ? clean(restoreErr.code || restoreErr.message)
+          : 'its record lock could not be re-acquired, and nothing writes that file without it'}). ` +
+        `Without a record\nthat directory is invisible to list, status and clean — remove it by hand.\n`
+      );
     }
     throw err;
   }

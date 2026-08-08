@@ -150,7 +150,7 @@ is worth spelling out per field, because the safe direction is different for eac
 | `recordVersion` | exactly the running `RECORD_VERSION` | **unvouched** for delivery — and, in `_supervise`, a refusal to run at all (`record-version-mismatch`). Dispatch and the supervisor are separate processes and can be different installed copies: an older supervisor picking up a newer record applies its own, weaker proof, and the job then delivers on the stamp the *dispatch* wrote. The stamp has to mean "this whole run met this gate", so the half that spends money checks it too. |
 | `role`, `id` | `^[a-z]+$` / `^[a-z]+-\d+-\d+$` | **corrupt** (unchanged from 0.4.0 — these are the strings that become paths). |
 | `exitCode` | any integer, `0` to deliver | not deliverable. The one number that is legitimately negative: `-1` means it never ran. |
-| `generation` | non-negative integer | corrupt. Bumped by every write; see the write lock below. |
+| `generation` | non-negative integer | corrupt. Bumped by every locked *update*, and absent on the record dispatch first creates; a byte-for-byte restore puts back the number it read. Not a write count — see the write lock below. |
 
 Two things sit alongside the field table because they are the same idea applied to
 the filesystem rather than to the record:
@@ -280,6 +280,8 @@ dispatch (returns immediately)
          │    └─ probe would not RUN or could not be POSED (transport, after retries;
          │         a cwd that is gone; a bin path that will not quote)?
          │         failed / sight-probe-error — NOT blindness
+         ├─ records the sight label the delivery gate reads ← a write that will not land
+         │    is refused HERE: failed / record-write-refused, nothing spent
          ├─ re-checks: record still running? claim still ours?  ← else abort, nothing spent
          ├─ records launch: exec-spawning  ← the SECOND window opens; a cancel landing
          │                                   here kills NOTHING and records kill-pending
@@ -287,7 +289,8 @@ dispatch (returns immediately)
          │    --model <m> -c model_reasoning_effort=<e>
          │    --output-last-message out.txt --color never  < prompt.md > run.log 2>&1
          ├─ resolves what it ACTUALLY spawned (the worker behind a .cmd wrapper) and
-         │    records codexPids / codexPgid, launch: exec   ← the window closes
+         │    records codexPids / codexPgid, launch: exec   ← the window closes; a write
+         │    that will not land KILLS codex: failed / record-write-refused
          └─ re-reads the record ← kill-pending? kill codex, verify, killed/cancelled-during-exec
 ```
 
@@ -325,10 +328,14 @@ those to "nothing there" made a transient error on a *live* holder's file the
 permission to break its lock — the one place in this runtime where an unreadable
 answer failed open. An unreadable holder file is evidence a holder **exists**, so
 it now reads as alive and no break follows; the age-only break is reserved for a
-holder that is genuinely absent, which since acquisition became atomic can only
-be a pre-upgrade artifact or a corrupt directory.
+holder that is genuinely absent (`ENOENT`) — **or for holder content no release
+of this runtime ever writes**, a file whose leading token is not a pid at all,
+which is corruption evidence rather than a live acquirer. Since acquisition
+became atomic, both of those can only be a pre-upgrade artifact, a hand-made
+directory or a corrupt one.
 
-**A visible lock always has a holder**, which is what makes that proof worth
+**No lock this release publishes is ever visible without a holder in it**, which
+is what makes that proof worth
 anything. `mkdir` followed by a write is two steps, and between them sits a lock
 with nothing inside it: a second writer stats it past the stale age, finds no
 holder to prove alive, breaks in — and the first, merely descheduled, resumes and
@@ -337,13 +344,30 @@ the critical section, which is the lost-update window reintroduced by the
 acquisition itself. So the lock is assembled out of sight and published in one
 step, the way role claims are: the holder file is written into a staging
 directory beside the lock, and the **rename of that directory onto the lock path
-is the acquisition**. A failed rename is "someone else has it", the answer
-`EEXIST` used to give, and the staging directory is removed; orphans left by an
-acquirer that died mid-stage are swept once they age past the stale mark, and are
-never mistaken for the lock, which is one exact path. A holderless lock is
-consequently no longer a live acquirer — it is a pre-upgrade artifact or a
-corrupt directory — and past the stale age it is still broken, because neither
-may wedge a job for ever.
+is the acquisition**. A failed rename is not one cause but three — somebody else
+holds the path (the answer `EEXIST` used to give), this process's own stage was
+swept out from under it while it aged, or the filesystem refused the move for a
+reason of its own — and all three mean the same thing to the caller: go round
+again. The staging directory is then removed best-effort; a cleanup that fails
+leaves an orphan the sweep is already responsible for. Those orphans become
+**sweep-eligible** once they age past the stale mark and are collected when a
+later acquisition in that job directory reaches the stale-break path — the sweep
+is opportunistic, not scheduled, so an orphan in a job nothing writes to again
+simply sits there, costing a directory. They are never mistaken for the lock,
+which is one exact path.
+
+**And nothing in this release empties a lock in place.** Every destructive step
+in the seam — the stale break, the sweep, and (since this release) the *release*
+itself — renames the directory to a unique tombstone before removing anything, so
+the last bare `rmSync` on the lock path is gone. Between the two halves of a
+recursive removal the holder file is already unlinked while the directory still
+stands, and that is exactly the holderless lock the staged acquisition exists to
+make impossible. What that buys is bounded and worth stating as such: the empty
+window is closed for locks *this* runtime writes and removes, which is what makes
+"a holderless lock is not a live acquirer" true again. A holderless lock is
+therefore a pre-upgrade artifact, a hand-made directory or a corrupt one — and
+past the stale age it is still broken, because none of those may wedge a job for
+ever.
 
 **The break is a rename to a tombstone, and the tombstone is checked before it is
 removed.** The rename alone was described as giving "exactly one winner"; it does
@@ -355,17 +379,26 @@ deletes it. Two writers again, by way of the mechanism that exists to prevent
 them. So the decision records what it condemned — the lock's mtime, which is
 never refreshed while a lock lives, and its holder as read at that moment — and
 the destructive step happens only against a tombstone that still matches both.
-A mismatch means a live successor was moved, so it is renamed straight back and
-never removed. The guarantee is therefore **per condemned lock**: the directory a
-breaker destroys is the directory it proved dead.
+A mismatch does not mean "a live successor was moved" — it means the breaker
+**cannot prove** this tombstone is what it condemned, and the causes are wider
+than the ABA: a successor really did take the path, or the tombstone will not
+stat, or its holder file will not read, or the decision was taken without a
+readable mtime in the first place. All of them answer the same conservative way.
+Nothing is removed; the directory is renamed straight back to the lock path if
+that path is free, and if the put-back fails it is left standing to be inspected
+(see the strand guard below). The guarantee is therefore **per condemned lock**:
+the directory a breaker destroys is the directory it proved dead, and a directory
+it cannot prove anything about is one it does not touch.
 
 **Sweeping is a rename first too**, for the same reason. A recursive `rmSync` of
 an aged staging directory unlinks the holder file first, and the stage's owner
 never checks its own stage before publishing — it checks the lock — so a hollowed
 stage gets renamed onto the lock path as an **empty** lock, which is precisely
 what the staged acquisition exists to make impossible. The sweep therefore
-renames an aged orphan to a unique tombstone (a failed rename means the owner or
-another sweeper has it, and its contents are never touched) and only then removes
+renames an aged orphan to a unique tombstone (a failed rename means the owner has
+republished it, another sweeper won it, it has already gone, or the filesystem
+refused the move — the sweep does not distinguish, and its contents are never
+touched either way) and only then removes
 what it moved. The owner's own rename then fails and it goes round again. The
 sweep collects abandoned **break** tombstones as well, under the same age gate
 plus one more test — the tombstone's holder must not be alive: a breaker that
@@ -383,8 +416,11 @@ never refreshed — and where a successor really has held for more than five
 seconds, restoring it is what its breaker was about to do anyway. The sweep also
 **re-reads the holder of the tombstone it won** before removing anything: winning
 a rename proves what is in it now, not what was in it when the decision was taken,
-and anything found alive is put back (on the lock path, or under its old name if
-that path is occupied) rather than deleted.
+and anything found alive is put back rather than deleted: **two renames are
+tried** — onto the lock path first, because a live lock belongs there, and back
+under its old name if that path is occupied — and if both fail the tombstone is
+left standing exactly where the sweep's own move put it, where the acquisition
+guard still reads it. It is never deleted on any of the three outcomes.
 
 **A live lock stranded in a tombstone while the lock path stands free is one
 terminal state behind three doors, and acquisition refuses past it.** A breaker
@@ -399,19 +435,40 @@ holder is alive — or unreadable, fail-closed like every other reading in this
 seam — blocks acquisition, which turns into the ordinary loud refusal at the
 deadline, naming the tombstone. A tombstone whose holder is *dead or absent* never
 blocks: it is litter awaiting the sweep, and waiting on a corpse would wedge the
-job. **The block is the mechanism, and it lasts exactly as long as the stranded
-holder's process** — while that process runs, every acquirer of the job is refused
+job. **The block is the mechanism, and a strand nothing repairs lasts as long as
+the stranded holder's process** — while that process runs, every acquirer of the
+job is refused
 loudly at its own deadline, which is correct, because that process still believes
 it holds the record; when it exits, the tombstone reads dead, stops blocking and is
 collected by a later sweep. The one repair that heals rather than backstops is the
 breaker's own: a breaker whose restore failed keeps the tombstone in hand and
 **retries the rename at every turn of its wait**, taking no lock itself until it
-lands, so a strand whose breaker survived is gone in milliseconds. The sweep's
-restore (above) and `removeJobDir`'s inner refusal sit *behind* the guard —
+lands. That retry is bounded by the breaker's own fifteen-second deadline and by
+nothing else: while the path stays occupied the restore keeps failing, and at the
+deadline the breaker refuses and leaves, naming the tombstone it is still holding.
+Where the path does come free the restore is usually the next turn — twenty
+milliseconds — and a strand repaired that way shortens the guard to however long
+the path was taken. A strand whose breaker **died** has no retry behind it at all,
+and that is the one that lasts the stranded holder's process lifetime. The sweep's
+restore (above) and `removeJobDir`'s inner refusals sit *behind* the guard —
 defense-in-depth for states nothing in-process can reach except the guard-to-stage
 TOCTOU. `clean` refuses a
 job directory holding such a tombstone for the same reason, per job, the way it
 refuses any directory it cannot finish removing.
+
+**And a guard that could not look has not cleared anything**, so the guard's
+answer is three-valued rather than yes/no. A `readdir` of the job directory that
+fails is not an absence of tombstones, it is an absence of evidence, and the
+fail-open reading of it readmits the silent double-hold the guard exists to
+close. `ENOENT` is the only failure that means "no blocker": a directory that is
+not there holds no tombstone, and staging's own `mkdir` should stay the fast,
+honest failure for that case rather than being pre-empted by a fifteen-second
+wait for a lock in a directory nobody will ever create. Every other errno —
+`EPERM`, `EBUSY`, `EIO`, an ACL, a cloud filter — is *unenumerable*, and both
+callers treat it as blocked: the acquirer waits out its deadline like any other
+contention and refuses **in words of its own** (naming the directory it could not
+read, never a tombstone nobody ever saw), and `removeJobDir` refuses the job
+rather than delete what it cannot prove is dead.
 
 **The wait bounds are monotonic.** The lock's fifteen seconds, the worker-resolve
 poll and the kill verification all measure with `performance.now()`: they are
@@ -420,12 +477,61 @@ NTP, a manual set, a VM resume — must not be able to shorten or extend a wait 
 caller is blocked in. Ages, grace windows and timestamps stay on the wall clock,
 because an mtime is a wall-clock fact and nothing else can be compared with one.
 
-Release is **by identity, not by path**. `rmSync` on the lock path removes
-whatever is there, and after a legitimate stale break that is somebody else's
-lock — the writer that finishes first deletes the directory the other still
-believes it holds. So a releaser reads the holder file back and removes the lock
-only while it still names its own pid; a lock that has changed hands is left
-exactly where it is, for its own holder to release or to age out.
+Release is **by identity, not by path, and by rename, not by removal** — a break
+of one's own lock, held to the same discipline as every other break. `rmSync` on
+the lock path removes whatever is there, and after a legitimate stale break that
+is somebody else's lock: the writer that finishes first deletes the directory the
+other still believes it holds. So a releaser reads the holder file back and
+removes the lock only while it still names its own pid, which is right and was
+not enough on its own: the read and the removal are two steps bound by a
+pathname, so a stale break landing between them made "ours" true about a lock
+that was somebody else's by the time it was deleted. And the removal itself is
+not atomic either: it
+unlinks the holder file before the directory goes, which is the empty-lock window
+again, in the one place still opening it. So the release renames the lock to a
+tombstone first and **verifies what it won** before removing it, four
+dispositions, three of them refusals to delete:
+
+- the holder is not ours: leave it, for its own holder to release or to age out;
+- the rename fails: the lock was already broken or stolen. Nothing is removed —
+  the same answer the identity test gave, one step later;
+- the won tombstone does not carry our own holder line, pid **and** nonce: a
+  break replaced the lock between the read and the rename, so this tombstone is
+  somebody else's lock. It goes back to the lock path if that path is free, is
+  left standing if it is not, is never removed, and says so loudly either way.
+  A holder that could not be **re-read** takes the same action and a different
+  sentence: microseconds after this release renamed its own lock, an unreadable
+  holder file is a transient far more often than it is a break, so the message
+  says the holder could not be re-read (with the errno) and that the lock is
+  going back **unverified**, rather than asserting a break nothing here proved —
+  the same correction the break's own ENOENT branch took;
+- it does carry our line: remove it. A failure there is swallowed, and what is
+  left is a tombstone whose holder is this process — dead the moment this process
+  exits, blocking nothing, collected by a later sweep. It does not wait that long
+  in the ordinary case: it names *this* pid, so it reads live to the acquisition
+  guard, and the guard's self-heal below clears it on this process's very next
+  acquisition of the job. Only a process that never acquires again leaves it
+  standing until it exits.
+
+**And a blocker holding our own live pid is our own release litter, which the
+guard clears rather than waits out.** The swallowed removal above leaves a
+`.stale-*` directory naming a live pid — this one — and the guard cannot tell
+that from a stranded holder, so it blocked: every later acquisition of that job,
+by any process *and by this one*, waited its fifteen seconds and refused, with
+the sweep that would collect the thing sitting behind the guard. A wedge until
+the releaser exits, produced by tidying up. So both consumers of the guard (the
+acquisition loop and `removeJobDir`, which also runs in-process) remove a blocker
+whose holder is this pid and carry on unblocked; a removal that fails changes
+nothing and they keep blocking. The predicate is the pid alone, not the nonce:
+this runtime is single-threaded and holds one record lock at a time, so at the
+moment the guard asks, no acquisition of ours is in flight and a tombstone of
+ours can only be litter — whichever acquisition left it. The one tombstone this
+never touches is the breaker's own stranded one, which holds somebody else's
+**live** lock and is passed to the guard as a blocker in its own right.
+
+For the microseconds between that rename and the removal the tombstone holds a
+**live** pid — ours — so another acquirer's guard reads it as a blocker, waits
+one 20ms turn, and takes the freed lock path on the next.
 
 **A pid and a nonce, and no start time** — which is a decision rather than an
 omission. The nonce is identity: sixty-four random bits written fresh on every
@@ -444,11 +550,69 @@ which is the exact action being prevented. What that leaves is in the known
 issues: a holder that dies and whose number is instantly reissued to something
 long-lived keeps the lock, and writers then refuse loudly instead of losing an
 update quietly.
-Each write bumps a `generation` counter, and callers may pass a precondition
-that is evaluated *inside* the lock ("only if this still says running"). And a
-write that could not take the lock is **reported, not swallowed**: a `cancel` whose
-kill worked but whose record would not update exits nonzero saying exactly that,
-because a kill nothing else can see is not a kill anything else may act on.
+Every *update* bumps a `generation` counter, and callers may pass a precondition
+that is evaluated *inside* the lock ("only if this still says running"). Two
+writes are outside that rule and are worth naming, because a counter that is
+described as universal invites being read as one: the record dispatch **creates**
+carries no `generation` field at all (the first update writes 1), and the byte-for-byte
+restore of a record a failed `clean` had already removed puts back exactly the
+bytes it read, generation included. Neither is a lost update — the first has
+nothing to lose, the second is a put-back of the last thing written — but neither
+increments, and a reader must not treat the counter as a write count.
+
+**A write whose loss would strand a record is checked and reported, not
+swallowed.** `updateRecordOutcome` answers `ok`, or one of `corrupt`,
+`precondition`, `locked`, and the rule this release finished applying is: every
+writer whose loss leaves a job reading something untrue — `running` with nothing
+behind it, a launch marker that never landed, a codex nobody can aim a kill at, a
+terminal verdict nobody can see — checks that answer and says that the write did
+not happen, where the person who ran the job will see it: on stderr for the
+verbs a human is watching, and in the job's own `run.log` as well for the
+detached supervisor, whose stderr nobody is reading. The message carries what
+resolves it, which is `cancel <id>` almost every time, because that is what
+resolves a record stuck on `running`. A `precondition` answer is never reported as a failure: it means a
+verdict was **found**, and the writer stands down. A `locked` answer is the one
+worth insisting on, since it clears by itself, and the two writers that cannot
+afford to lose retry it against a named budget — `TERMINAL_WRITE_RETRY` (five
+attempts inside a minute) for the supervisor's own exit verdict, which is the
+last act of a detached process that has already been paid for, and
+`LAUNCH_WRITE_RETRY` (two attempts inside twenty seconds) for the two
+spawn-adjacent writes, where holding a live codex hostage to a lock is worse than
+refusing. Those budgets cap the time before another attempt is *started*, not the
+time an attempt takes: a `locked` answer can have spent a full fifteen-second
+lock wait getting there, so the wall-clock worst cases are one lock wait longer —
+about 75s for `TERMINAL` (four attempts landing just inside the minute, then a
+fifth) and about 30s for `LAUNCH`, which is the "one full lock wait and one more"
+that budget was chosen to be. A `cancel` whose kill worked but whose record would not update exits
+nonzero saying exactly that, because a kill nothing else can see is not a kill
+anything else may act on.
+
+**What is still fire-and-forget is what a checked writer heals.** Dispatch's
+post-spawn `{supervisorPid, launch: 'spawned'}` write is unchecked, and the
+supervisor's own first act is the checked fallback for it: it writes its pid
+itself unless the record already names it, and refuses to run when *that* write
+cannot be made — telling the operator whether the record was corrupt or merely
+locked, which are different repairs. The other unchecked write is the
+worker-resolve `warning` field, whose text is already in `run.log` and whose loss
+costs nothing but a duplicate. Everything else in the kill seam, the launch path
+and the finalizer is checked.
+
+**Two of those checks refuse a launch outright: one before the spend, one after
+it.** The
+sight label — the only evidence the delivery gate ever reads — is written before
+codex exists, so a label that will not land is refused there rather than
+discovered after a paid run is undeliverable: `failed(record-write-refused)`,
+nothing launched, nothing billed. The codex-pid registration is the write that
+turns a spawned codex into a *killable* one, and it is the one place where a
+refusal arrives too late to be free: lost, the record keeps `launch:
+'exec-spawning'` with no pids, so every cancel writes `kill-pending` and kills
+nothing while codex bills to completion. So it is retried, and a failure **kills
+what was just spawned** and records the same `record-write-refused` — milliseconds
+of codex is a cheaper thing to lose than the only handle on it. That refusal is
+held to the runtime's usual kill bar: the role claim is released only if the kill
+verified (nothing survived *and* the process table could be read), and the
+report says what was spawned and what became of it rather than the "nothing was
+launched" the pre-launch refusals say.
 
 **Every writer in the kill seam carries a precondition, including the cancel.**
 The supervisor's exit handler and the `exec-spawning` mark wrote
@@ -490,6 +654,24 @@ process that wrote the verdict owns that decision too. Its kill target goes
 through the reaped-pid list first, like every other kill target in this runtime,
 and the spent pid files are consumed only after a kill that verified.
 
+**And dispatch's two "nothing was spawned" finalizations are the last two**, held
+to the tighter bar rather than to `stillCancellable`. A supervisor that will not
+spawn and the catch-all that closes a ghost both write
+`failed(supervisor-spawn-failed | dispatch-failed)` and release the role, and
+both were *checked* — they never claim a write they did not make — but
+unconditional. The record has said `launch: 'spawning'` since before the spawn
+was attempted, which is deliberately a state a cancel may act on, so a
+`kill-pending` written into that window was overwritten by a `failed` about a
+launch that never happened and its role handed away underneath it: the same
+defect the supervisor's seven pre-launch refusals had, on the parent's side of
+the same window. Both now carry `notCancelAuthored` — the identical predicate,
+shared rather than restated — and a lost precondition is read the same way: the
+verdict found is reported and not overwritten, and the role is released only when
+the found state is *not* cancel-authored. A cancel-authored one owns its own
+release decision, and this dispatch releases nothing. A write that could not be
+made at all is unchanged: no verdict was found, nothing was spawned, and the
+claim goes back as before.
+
 **And the supervisor's own cancelled-during-exec landing is the other one**, for
 the same reason and against the same opponent. That landing reads the record,
 kills codex — seconds, in a shell — and writes `killed` or `kill-failed`; the
@@ -530,12 +712,21 @@ which it used to carry, also accepts `kill-failed`, so a cancel reaching that
 verdict inside the gap would have been replaced by
 `killed(cancelled-during-registration)` with its survivors cleared and its role
 released, the very overwrite the other six forbid. It stands down on a lost
-precondition exactly as they do. All seven clear `killSurvivors` so a `failed` never inherits an
+precondition exactly as they do. All of them clear `killSurvivors` so a `failed` never inherits an
 earlier cancel's survivor list, and a lost precondition releases nothing.
 A write that could not be made *at all* is the one place these differ
 from the landings above: it found no verdict, and on every one of these paths
 codex was never launched and the supervisor is exiting, so the claim it holds is
 still its own to give back.
+
+**Two more refusals go through the same helper now, and the second breaks its
+"pre-launch" name.** The sight label that will not land is a pre-launch refusal
+like the seven above and behaves exactly like them. The codex-pid registration
+that will not land does not: codex exists by then, so that caller kills it first
+and passes two things the others never need — *do not release the claim unless
+that kill verified*, and *say what was spawned*, since "nothing was launched" is
+the one sentence that would be false there. Both write
+`failed(record-write-refused)`; both are the same compare-and-swap.
 
 **Dispatch records the supervisor's pid itself, at spawn time, before it returns.**
 The supervisor used to write its own, which left a window — record says `running`,
@@ -934,23 +1125,40 @@ than opening nothing and claiming otherwise.
   broken until that impostor exits.** The holder file carries a pid and a
   per-acquisition nonce, and no start time (the reasoning is under the write lock
   above) — the nonce is identity, not liveness — so a number that is alive
-  reads as a holder that is alive. The window is small — the lock is held for
-  milliseconds, and the holder has to die inside it — and the consequence is the
-  safe one: every writer waits its fifteen seconds and then REFUSES, saying the
+  reads as a holder that is alive. The window is the hold time, and that is not
+  uniformly short: an ordinary record update is a read, a JSON write and a rename
+  — milliseconds — but `clean` holds the lock across an entire job-directory
+  removal, every file in it, and a lock held that long is a lock with a
+  correspondingly wider window to die inside. The consequence is the
+  safe one wherever the window is: every writer waits its fifteen seconds and then REFUSES, saying the
   record could not be locked and to re-run, rather than writing over somebody.
-  `cancel`, `--force` and `clean` all report it. Removing the `job.json.lock`
+  Every writer that would strand a record by losing this says so (see the write
+  lock above); `cancel`, `--force` and `clean` report it by name. Removing the `job.json.lock`
   directory by hand is the manual cure, and it is safe once nothing is running.
 - **The staged-lock rename narrows a POSIX replace, it does not close it.**
   `rename(2)` replaces an existing *empty* directory where Windows refuses, so
   an acquisition could land on a lock at age zero and skip the stale-age
   discipline — but only on a lock that is empty, and every lock this release
-  publishes already contains its holder. The one empty lock in reach is an
-  **old** release's, caught between its bare `mkdir` and its holder write. The
+  publishes already contains its holder, from the rename that publishes it to the
+  rename that releases it. The empty lock in reach is another release's: an old
+  acquirer caught between its bare `mkdir` and its holder write, or an old
+  releaser caught inside the recursive `rmSync` this release stopped doing. The
   acquirer now treats the lock path merely existing as contention, which leaves
   the check-to-rename gap and nothing wider; the precondition is POSIX plus two
-  different releases writing the same job directory at the same time, which is
-  already the record-version-mismatch domain — a mismatch a supervisor refuses
-  on sight. One runtime per jobs root is the cure, and it is the rule anyway.
+  different releases writing the same job directory at the same time.
+
+  **Nothing detects that mixed-version case, and no version gate can.**
+  `recordVersion` is a *schema* stamp — 2 since 0.5.0, unmoved since — and it
+  gates delivery and the supervisor's willingness to run, not locking: two
+  releases whose lock protocols differ (0.8.1's bare `mkdir`-and-remove against
+  0.8.4's staged, tombstoned one) both write and both accept 2, so the mismatch
+  refusal cannot see the skew, and bumping the stamp would not help — it would
+  refuse *records*, and the concurrency here is between processes, one of which
+  is an old binary that never heard of the new number. So this is not a covered
+  case with a residual: **"one runtime per jobs root" is a rule the operator
+  keeps, not an invariant anything enforces.** It is stated here for the same
+  reason the pid-reuse window is: it is the honest description of what is and is
+  not checked.
 - **A break that moved a live successor puts it back, and the put-back can
   lose — but a lost put-back is no longer a hole anybody can fall into.** The
   stale break is bound to the condemned lock's identity, so a breaker that finds
@@ -962,8 +1170,11 @@ than opening nothing and claiming otherwise.
   changed is what happens next. Nobody acquires past it — a `.stale-*` tombstone
   whose holder is live or unreadable blocks staging and turns into the loud
   refusal at the deadline — and `clean` refuses to remove a job directory holding
-  one. The breaker retries its restore at every turn of its own wait, so a strand
-  whose breaker survived is repaired in milliseconds; a strand whose breaker did
+  one. The breaker retries its restore at every turn of its own wait — until that
+  wait's own fifteen-second deadline and no longer, at which point it refuses and
+  leaves, naming the tombstone it still holds — so a strand whose breaker survived
+  is usually repaired within a turn of the lock path coming free, and is repaired
+  at all only if that happens inside the breaker's remaining wait. A strand whose breaker did
   not survive is **held safe by the guard until its stranded holder's process
   exits**, at which point the tombstone is dead litter and a later sweep collects
   it. The sweep's restore is a backstop behind that guard, not the cure.
@@ -986,31 +1197,63 @@ than opening nothing and claiming otherwise.
     of reach of anything but sixty-four-bit chance.
 
   And what the guard itself costs, stated rather than implied away:
-  - **The wedge lasts the stranded holder's process lifetime.** Every acquirer of
+  - **A wedge nothing repairs lasts the stranded holder's process lifetime.**
+    Every acquirer of
     that one job waits its fifteen seconds and refuses, loudly, for as long as the
-    process named in the tombstone runs. That is bounded, visible and per job, and
+    process named in the tombstone runs — unless the breaker that cut the strand is
+    still alive to retry its restore, in which case it usually ends in one 20ms
+    turn after the lock path frees, and at the latest when that breaker's own
+    fifteen seconds run out. That is bounded, visible and per job, and
     it is the price of the state it replaced: 0.8.3 reached the same state as a
     **silent double-hold**, two writers under one record with nothing printed.
-  - **A tombstone whose holder file is UNREADABLE is a manual-repair wedge.** It
-    can never read as dead, so nothing lifts the block on its own; the refusal
-    names the tombstone path and says to inspect and remove it by hand once nothing
-    is running. Deliberate: every other reading in this seam is fail-closed, and a
-    lock this runtime cannot read the owner of is the last place to start guessing.
-  - **A restore that lands after its victim finished re-wedges for the same
-    duration.** A lock put back on the canonical path after its holder has left its
-    critical section is unreleasable — release is by identity and that holder will
-    never ask again — so it stands until the sweep's stale age and the next
-    breaker, i.e. until roughly the same process lifetime the tombstone would have
-    blocked for. The restore is therefore neutral-to-better rather than a fix, and
-    that is precisely why the guard's blocking, not the restore, is the accepted
-    contract.
+  - **A tombstone whose holder file stays UNREADABLE is a manual-repair wedge.**
+    The guard re-reads it on every turn of every acquirer's wait, so a *transient*
+    unreadability — a scanner with the file open, a cloud filter waking it — clears
+    on a later turn and the block lifts by itself. What does not lift is a
+    persistent one: while the file cannot be read it cannot read as dead, so an
+    ACL, a broken permission or a damaged directory wedges the job until somebody
+    repairs it. The refusal names the tombstone path and says to inspect it and, if
+    it persists, remove it by hand once nothing is running. Deliberate: every other
+    reading in this seam is fail-closed, and a lock this runtime cannot read the
+    owner of is the last place to start guessing.
+  - **A restore that lands after its victim finished re-wedges, and can outlast
+    the strand it replaced.** A lock put back on the canonical path after its
+    holder has left its critical section is unreleasable — release is by identity
+    and that holder will never ask again — so it stands until three things are
+    true at once: the holder reads dead, the lock is past the stale age, and some
+    acquirer comes along to break it. The holder reading dead means that process
+    exiting, which is the same bound the tombstone had; the stale age is where
+    they differ. A rename does not normally touch a directory's own mtime, so the
+    restored lock usually arrives already aged — but where the filesystem gives it
+    a **fresh** one, the job stays blocked for the remainder of that five-second
+    interval *after* the process exits, whereas a dead tombstone stops blocking
+    the instant it does. So the restore is neutral-to-slightly-worse in that
+    corner rather than a fix, and that is precisely why the guard's blocking, not
+    the restore, is the accepted contract; the restore is kept because a live lock
+    belongs on the lock path.
   - **The two backstop branches have no in-process trigger path, and so no test
     covers them.** The sweep's live-holder restore and the verify-after-win
-    rename-back are reachable only through the guard-to-stage TOCTOU or a
-    source-path ABA between two sweepers — microsecond windows nothing in this
-    runtime can produce on demand. They are unit-reachable only by fabricating the
+    rename-back are reachable through the guard-to-stage TOCTOU, a source-path ABA
+    between two sweepers, or — for the verify-after-win branch specifically — a
+    holder that changes its answer between the sweep's two reads: the first said
+    dead-or-absent (or it would have restored instead), the second says alive,
+    which needs the pid reissued or the holder file becoming *unreadable* in
+    between, since unreadable reads as alive. All of them are microsecond windows
+    against another process's lifecycle, and nothing in this
+    runtime can produce them on demand. They are unit-reachable only by fabricating the
     directory state, which asserts the branch rather than the race. Said plainly:
     defense-in-depth, unexercised.
+  - **`removeJobDir`'s own read-refusal is shadowed, and is kept anyway.** Before
+    it unlinks anything it reads `job.json` into memory, so a failed `rmdir` can
+    put the record back; any failure of *that* read refuses the job untouched. It
+    cannot fire through the one caller there is: `clean` reads the same record
+    under the same held lock microseconds earlier and treats an unreadable one as
+    corrupt, which refuses the removal a step higher. Reaching it needs the file
+    to become unreadable between two reads inside one lock hold — an external hand
+    or a scanner, not anything this runtime does. Unreachable via `clean`, listed
+    with the other unexercised branches, and kept because the ordering it protects
+    (bytes in hand before the first unlink) is what makes the put-back possible at
+    all.
 - **Windows `shell: true` quoting refuses what it cannot escape.** `codex.cmd`
   needs a shell, so `spawnCodex`/`runCodexSync` join argv into one command line
   with `cmdQuote`. Three characters cannot survive that command line and are

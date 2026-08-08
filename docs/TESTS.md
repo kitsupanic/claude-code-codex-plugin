@@ -242,8 +242,8 @@ tests and two unit ones:
 - **a `kill-pending` that could not be written is never reported as one** — the
   record lock held by a live process named in the lock's own holder file. The
   cancel waits it out, reports that nothing was killed and nothing recorded, and
-  the record is untouched. The same fixture is half of the lock fix: a lock whose
-  holder is alive is not stale however old it gets;
+  the record is untouched. The same fixture is half of the 0.8.1 lock fix: a lock
+  whose holder is alive is not stale however old it gets;
 - **a live holder stalled past the stale age keeps the record lock** — the other
   half, with a real writer descheduled inside its critical section by
   `CODEX_DISPATCH_TEST_RECORD_PAUSE_MS` for longer than the five-second break.
@@ -263,7 +263,25 @@ tests and two unit ones:
   that expected ownerless (and is left standing), and a relative
   `CODEX_DISPATCH_JOBS` comes back absolute.
 
-**Fourteen test-only knobs live in the runtime**, each standing in for a condition
+Those two lock tests are no longer the whole of it. Across 0.8.2–0.8.5 the record
+lock grew a drill for each step of its protocol: **sixteen** tests now stand on
+the mechanism itself — a live holder stalled past the stale age, a `kill-pending`
+that could not be written, staged publication and the orphan that is never
+mistaken for the lock, a holder that cannot be read, a lock that changed hands, a
+break that removes only what it condemned, the sweep moving before it removes,
+the tombstone it strands when interrupted and the abandoned one that ages out, a
+live lock stranded in a tombstone and the dead one that blocks nothing, a restore
+that lost the path and lands when it frees, the pid-and-nonce holder line, a job
+directory that cannot be enumerated, and `clean` both refusing a job that holds a
+live strand and giving the lock back after a removal it could not finish.
+**Four** more stand on the writers that
+depend on it, each wedging the lock or corrupting the record at one exact
+instant: the finalizer's verdict, the pre-spawn launch marker, the sight label,
+and the codex-pid registration. Fourteen of the twenty carry a written
+non-vacuity note — what the test does against a deliberately broken copy of the
+thing it covers, observed rather than assumed.
+
+**Twenty test-only knobs live in the runtime**, each standing in for a condition
 that cannot be produced on demand in CI, on both platforms, from both shells. What
 is under test in every case is the runtime's *decision*, never the mechanism that
 would have caused the condition:
@@ -317,10 +335,44 @@ would have caused the condition:
   short-circuiting `preflight`, so the version, auth and sandbox checks it exists
   to make actually run — against a stand-in that answers the way codex-cli does.
   Only the short-circuit is injected; every check below it is the real one.
+- `CODEX_DISPATCH_TEST_VERDICT_PAUSE_MS=<ms>` — a cancel is descheduled between
+  the kill and the write that records it, which is the one interleaving the
+  earlier kill pauses cannot pose: they sit before the trigger, where the
+  pre-trigger bail already answers.
+- `CODEX_DISPATCH_TEST_PRELAUNCH_PAUSE_MS=<ms>` — the supervisor is held between
+  its last pre-launch read of the record and the `exec-spawning` compare-and-swap,
+  the fence a cancel has to be able to land inside. The real gap is shell time
+  measured in milliseconds and cannot be aimed at.
+- `CODEX_DISPATCH_TEST_BREAK_PAUSE_MS=<ms>` — a breaker is descheduled between
+  condemning a stale lock and moving it, which is the window in which somebody
+  else can break that lock and publish a LIVE successor at the same path. What is
+  under test is that the removal is bound to the evidence, not to the pathname.
+- `CODEX_DISPATCH_TEST_RESTORE_PAUSE_MS=<ms>` — the same breaker is descheduled
+  between moving a successor into its tombstone and putting it back, which is the
+  window in which a third writer takes the freed path and makes the restore fail.
+  The retry, not the failure, is what is under test.
+- `CODEX_DISPATCH_TEST_SWEEP_PAUSE_MS=<ms>` — a sweeper is descheduled between
+  the rename that wins an orphan and the removal of what it won, standing in for
+  the sweeper dying there. What is under test is the state visible from outside
+  that window: the orphan gone from its own path, and a tombstone to show for it.
+- `CODEX_DISPATCH_TEST_WRITE_BUDGET_MS=<ms>` — the time budget half of both
+  checked-write retries (`TERMINAL_WRITE_RETRY`, `LAUNCH_WRITE_RETRY`), and
+  nothing else. Reaching either retry means a wedged lock and every attempt inside
+  one costs a full fifteen-second lock wait, so the unshortened version is a test
+  nobody would run. The attempt caps, the decision to retry only `locked`, and
+  every message stay exactly as they ship.
 
 They are all injections of a *condition*, never of an *answer*: every one of them
 makes the world behave a certain way and then asserts what the runtime decides
 about it.
+
+The fake codex carries **fourteen** of its own, listed at the top of this file
+plus two the lock work added: `FAKE_CODEX_SANDBOX_MARK=<path>` writes a file the
+moment the sight probe starts, and `FAKE_CODEX_SANDBOX_DELAY_MS=<ms>` holds the
+probe open for that long. Together they give a test a window it can aim at
+between the writes that precede the sight label and the label itself — "after the
+dispatch exits" is not after them under load, because the write before the label
+spends PowerShell time and a wedge aimed by that clock lands on the wrong write.
 
 The suite also pins each dispatch's cwd to the repo root rather than inheriting the
 runner's: a job's cwd is what sight is proven against, and a suite whose

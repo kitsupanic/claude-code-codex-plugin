@@ -135,6 +135,15 @@ test('dispatch returns immediately, job dir is complete, result is verbatim', as
   assert.ok(await poll(() => done(id)), 'job should finish and the RECORD should say so');
   assert.ok(fs.existsSync(path.join(dir, 'out.txt')), 'and the answer file should be there');
   assert.ok(fs.existsSync(path.join(dir, 'run.log')), 'run.log should exist');
+  // A RELEASE THAT IS NOW A RENAME STILL HAS TO LEAVE NOTHING BEHIND. Releasing
+  // the record lock moves it to a tombstone and removes THAT, rather than
+  // removing the live path — so a release that lost track of what it moved would
+  // leave a `job.json.lock.stale-*` directory in every finished job, and the next
+  // acquirer would sit behind it for as long as its holder lived. This job took
+  // the lock half a dozen times on its way through; nothing lock-shaped may
+  // survive it.
+  assert.equal(fs.readdirSync(dir).some((n) => n.startsWith('job.json.lock')), false,
+    `every lock this job took was given back whole: ${fs.readdirSync(dir).join(', ')}`);
 
   const st = run(['status', id]);
   assert.match(st.stdout, /^state: done$/m);
@@ -4130,6 +4139,16 @@ test('a record lock that changed hands is not removed by the writer that finishe
     assert.equal(fs.existsSync(lock), true,
       'the lock it no longer holds is NOT its to remove — its own holder releases it');
     assert.equal(fs.readFileSync(holder, 'utf8'), mine, 'and it is untouched, holder and all');
+    // AND IT WAS NEVER MOVED EITHER. Releasing is a rename to a tombstone now,
+    // and the identity test still comes first: a release that renamed and then
+    // asked would have taken this live lock off its path for as long as the
+    // self-check took, which is the holderless-lock window the staged
+    // acquisition exists to make impossible.
+    assert.deepEqual(fs.readdirSync(dir).filter((n) => n.startsWith('job.json.lock.stale-')), [],
+      'a lock that is not ours is not ours to MOVE, not merely not ours to delete');
+    assert.equal(/was NOT this writer's by the time it was released/.test(done.stderr), false,
+      'and the release has nothing to report: it asked before it moved, so it never found out'
+      + ' the hard way that what it was holding had changed hands');
   } finally {
     fs.rmSync(lock, { recursive: true, force: true });
   }
@@ -4827,6 +4846,351 @@ test('the record a failed clean puts back is written under the lock, and the loc
       fs.rmSync(room, { recursive: true, force: true });
     }
   });
+
+// ----------------------------------------------- writes that cannot be made
+//
+// A WEDGE EVERY WRITER IN A JOB HAS TO WAIT OUT, planted from outside and lifted
+// on demand. The acquisition guard refuses to stage past a tombstone whose holder
+// is ALIVE (the strand test above pins that rule), and this test runner is alive
+// for as long as the suite is — so a `.stale-*` directory naming its pid makes
+// every locked write to that record answer `locked`, whichever phase of a run is
+// trying to make one. Planting it before the phase under test and lifting it
+// after is how each of these reaches a write-refused branch that nothing else can
+// produce on demand. Fresh rather than aged, so no sweep can collect it out from
+// under a test; removing it lets the very next 20ms turn of the wait through.
+const wedgeRecord = (dir) =>
+  lockLike(path.join(dir, 'job.json.lock.stale-424242-wedge'), holderText(process.pid));
+const liftWedge = (p) => fs.rmSync(p, { recursive: true, force: true });
+
+// The job's own log, which is where every one of these refusals has to appear.
+const runLogOf = (dir) => {
+  try { return fs.readFileSync(path.join(dir, 'run.log'), 'utf8'); } catch { return ''; }
+};
+
+test('a verdict the finalizer cannot record is INSISTED on, then said out loud in both places',
+  async () => {
+    // THE WORST CASE THIS PASS CLOSES. codex ran, codex answered, and the one
+    // write that turns that into a finished job could not be made. Unchecked, that
+    // was SILENT: `updateRecord` answered null, the exit handler walked straight on
+    // to the role release, and what was left was a job reading `stale` for ever
+    // beside an out.txt nobody would ever be allowed to deliver, with nothing
+    // anywhere saying why. The write is insisted on now, and when it still cannot
+    // be made the job's log and the supervisor's stderr both say so, name the
+    // answer file, and name the one command that resolves it.
+    //
+    // The wedge goes in AFTER registration, so the only write it can catch is the
+    // finalization. The budget knob is what keeps this test to half a minute
+    // rather than the full shipped minute; 20s buys exactly two attempts, which is
+    // what "it retried" means here.
+    const brief = writeBrief('briefwedgefin.md', 'the finalizer will not be able to write');
+    const d = run(['dispatch', '--brief', brief, '--role', 'wedgefin'], {
+      FAKE_CODEX_SLEEP_MS: '5000',
+      CODEX_DISPATCH_TEST_WRITE_BUDGET_MS: '20000',
+    });
+    assert.equal(d.status, 0, d.stderr);
+    const id = jobIdFrom(d.stdout);
+    const dir = path.join(JOBS, id);
+    assert.ok(await poll(() => record(id).launch === 'exec', 20000, 25),
+      'codex must be registered before the wedge goes in, or this wedges the wrong write');
+    const wedge = wedgeRecord(dir);
+    try {
+      assert.equal(record(id).state, 'running',
+        'and it must be in before codex exits, or the write under test already happened');
+      assert.ok(await poll(() => fs.existsSync(path.join(dir, 'out.txt')), 30000, 25),
+        'codex must finish and leave an answer: that is what makes a lost verdict expensive');
+      const t0 = Date.now();
+      assert.ok(await poll(() => /verdict could not be recorded/.test(runLogOf(dir)), 60000, 100),
+        `the finalizer must say so in the job's own log:\n${runLogOf(dir)}`);
+      const waited = Date.now() - t0;
+      // Non-vacuity (observed): with the finalization reverted to the unchecked
+      // `updateRecord`, the supervisor exits in silence — run.log ends at codex's
+      // own last line, supervisor.log is empty, and the poll above times out.
+      // Nothing else about the run changes, which is exactly the defect: the job
+      // reads stale and no message anywhere explains it.
+      assert.ok(waited > 20000,
+        `one refusal is not an answer: the write is retried to its budget (gave up after ${waited}ms)`);
+
+      const log = runLogOf(dir);
+      assert.match(log, /supervisor: codex exited 0, but its verdict could not be recorded \(locked\)/);
+      assert.ok(log.includes(path.join(dir, 'out.txt')),
+        'and it names the answer file, because that is the thing being left undeliverable');
+      assert.match(log, new RegExp(`Resolve the record: cancel ${id}`),
+        'and the one command that ends the state it is describing');
+      const sup = fs.readFileSync(path.join(dir, 'supervisor.log'), 'utf8');
+      assert.match(sup, /verdict could not be recorded/,
+        "on stderr as well as in the log: a detached supervisor's two places a human looks");
+      assert.match(sup, /not releasing the "wedgefin" role/,
+        'and a job that still reads running keeps its claim — the record is what decides that');
+
+      assert.equal(record(id).state, 'running',
+        'the record says exactly what it said: nothing was written under a lock never taken');
+      assert.ok(await poll(() => !pidAlive(record(id).supervisorPid), 20000),
+        'the supervisor exits rather than hanging on the wedge for ever');
+      assert.match(run(['status', id]).stdout, /^state: stale$/m,
+        'which is the state the message promised: stale, holding its role, waiting for a cancel');
+
+      // And the advice is real advice: lift the wedge and the named cure works.
+      liftWedge(wedge);
+      const c = run(['cancel', id]);
+      assert.equal(c.status, 0, `the cure the message names must be one: ${c.stderr}`);
+      assert.equal(record(id).state, 'killed',
+        'the cancel resolves the record the finalizer could not, and the job stops reading stale');
+    } finally {
+      liftWedge(wedge);
+      run(['cancel', id]);
+    }
+  });
+
+// A directory whose CONTENTS cannot be listed while it can still be entered and
+// written: readdir fails, and `mkdir` of a staging directory inside it does not.
+// Windows by ACL — a deny of FILE_LIST_DIRECTORY (RD) on this user — and POSIX by
+// dropping the read bit while keeping write and traverse. Returns the undo, or
+// null when the platform would not cooperate (an elevated or root runner can read
+// through both of these), so the caller can say so rather than assert nothing.
+function denyListing(dir) {
+  const readable = () => { try { fs.readdirSync(dir); return true; } catch { return false; } };
+  if (process.platform === 'win32') {
+    const who = process.env.USERNAME;
+    if (!who) return null;
+    const undo = () => spawnSync('icacls', [dir, '/remove:d', who],
+      { encoding: 'utf8', windowsHide: true });
+    const r = spawnSync('icacls', [dir, '/deny', `${who}:(RD)`], { encoding: 'utf8', windowsHide: true });
+    if (r.status !== 0 || readable()) { undo(); return null; }
+    return undo;
+  }
+  const before = fs.statSync(dir).mode;
+  const undo = () => fs.chmodSync(dir, before);
+  fs.chmodSync(dir, 0o311);
+  if (readable()) { undo(); return null; }
+  return undo;
+}
+
+test('a job directory that cannot be ENUMERATED blocks the lock, in words of its own', async () => {
+  // A GUARD THAT COULD NOT LOOK HAS NOT CLEARED ANYTHING. The acquisition guard
+  // reads the job directory to find a live lock stranded in a tombstone, and a
+  // `readdir` that FAILS used to be swallowed into "no tombstone here" — the one
+  // fail-open direction in the seam, which readmits the silent double-hold it was
+  // built to close. Unproven absence does not stage: every errno but ENOENT is
+  // treated as blocked, and the refusal that follows is its own, because routing
+  // it through the tombstone text would name a directory nobody ever read.
+  const id = 'lockblind-1-99972';
+  const dir = lockJob(id, 'lockblind', {
+    started: new Date(Date.now() - 3600000).toISOString(), launch: 'exec',
+  });
+  const undo = denyListing(dir);
+  if (!undo) {
+    process.stderr.write('NOTE: this runner can list a directory it was denied listing on ' +
+      '(elevated or root); the unenumerable-job-dir test did not fire.\n');
+    return;
+  }
+  try {
+    assert.equal(fs.existsSync(path.join(dir, 'job.json')), true,
+      'the record is still READABLE by name — only the listing is denied, or this proves nothing');
+    const t0 = Date.now();
+    const c = run(['cancel', id]);
+    // Non-vacuity (observed): with `liveLockTomb`'s unenumerable branch reverted
+    // to a bare `catch { return { tomb: null } }`, this cancel stages straight
+    // past the directory it could not read, takes the lock in ~80ms and records
+    // `killed` — the timing, the message and the state assertions all fail.
+    assert.notEqual(c.status, 0, `an unreadable directory is not an empty one: ${c.stderr}`);
+    assert.match(c.stderr, /KILL NOT RECORDED/);
+    assert.match(c.stderr, /could not be taken: the job directory could not be\s+enumerated \(/,
+      'the refusal is the could-not-look one');
+    assert.equal(/a lock whose holder is still ALIVE/.test(c.stderr), false,
+      'and NOT the tombstone refusal: it would name a path this process never read');
+    assert.ok(c.stderr.includes(dir),
+      'it names the directory to investigate, which is the only lead there is');
+    assert.ok(Date.now() - t0 > 10000,
+      'and it waited its deadline out like any other contention rather than failing fast');
+    assert.equal(record(id).state, 'running', 'nothing was written under a lock never taken');
+  } finally {
+    undo();
+  }
+});
+
+test('a launch marker that could not be written stops the dispatch BEFORE it spawns anything',
+  async () => {
+    // `launch: 'spawning'` is what stops a cancel reading the registration window
+    // as "nothing was ever started". Written unchecked, a refused one left the
+    // record saying `launch: 'pending'` under a supervisor that was launched
+    // anyway — the one reading that lets a cancel call a running job dead. So the
+    // marker is checked, and a marker that did not land means the spawn does not
+    // happen: everything to that point is reversible and a spawned supervisor is
+    // not.
+    //
+    // The record is corrupted rather than locked, in the claim-pause window that
+    // sits between writing it and marking it: `corrupt` is refused on the first
+    // attempt where `locked` costs a fifteen-second wait, and this branch does not
+    // care which refusal it was handed. It also gives the second half of the test
+    // for free — the catch-all's own finalization is refused for the same reason,
+    // which is the branch that must not claim a failure it never recorded.
+    const brief = writeBrief('briefmarkerwedge.md', 'nothing may be spawned behind this record');
+    const child = spawn(process.execPath,
+      [RUNTIME, 'dispatch', '--brief', brief, '--role', 'markerwedge'],
+      { env: { ...baseEnv, CODEX_DISPATCH_TEST_CLAIM_PAUSE_MS: '6000' }, cwd: REPO });
+    let stdout = '', stderr = '';
+    child.stdout.on('data', (d) => { stdout += d; });
+    child.stderr.on('data', (d) => { stderr += d; });
+    const closed = new Promise((r) => child.on('close', r));
+    const dirOf = () => {
+      const name = fs.readdirSync(JOBS).find((n) => n.startsWith('markerwedge-'));
+      return name ? path.join(JOBS, name) : null;
+    };
+    assert.ok(await poll(() => !!dirOf() && fs.existsSync(path.join(dirOf(), 'job.json')), 20000, 25),
+      'the dispatch must have written its record before this can break it');
+    const dir = dirOf();
+    fs.writeFileSync(path.join(dir, 'job.json'), '{ not json');
+
+    const code = await closed;
+    // Non-vacuity (observed): with the marker reverted to an unchecked
+    // `updateRecord`, this dispatch spawns its supervisor anyway — supervisor.log
+    // appears, the last assertion fails, and the job goes on behind a record that
+    // still reads as never having started.
+    assert.notEqual(code, 0, `a marker that did not land is not a launch: ${stderr}`);
+    assert.match(stderr, /the pre-spawn launch marker could not be written to the record \(corrupt\)/,
+      'and it says which write it was and what answer it got');
+    assert.match(stderr, /The failure could NOT be recorded \(dispatch-failed\)/,
+      'the catch-all may not claim a finalization it could not make either');
+    assert.match(stderr, /Resolve the record: cancel markerwedge-/,
+      'so it hands over the one thing that resolves it instead');
+    assert.equal(/is recorded as failed \(dispatch-failed\)/.test(stderr), false,
+      'the sentence that would be a lie here is the one branch this fix exists to remove');
+    assert.equal(/^job: /m.test(stdout), false, 'and no job handle is printed for a job that never ran');
+    assert.equal(fs.existsSync(path.join(dir, 'prompt.md')), true,
+      'the job dir was reached, or this test wedged something else entirely');
+    assert.equal(fs.existsSync(path.join(dir, 'supervisor.log')), false,
+      'and NOTHING was spawned: that log is opened by the same line that spawns the supervisor');
+  });
+
+test('a sight label that will not land is refused BEFORE codex is spawned', async () => {
+  // The sight label is the only evidence the delivery gate ever reads, so a label
+  // that does not land is a run that can never be delivered however well it goes:
+  // `result` looks for `sight`, finds nothing, and refuses the answer codex was
+  // paid to produce. Written fire-and-forget, that was discovered AFTER the spend;
+  // now it is refused before it, while everything is still reversible.
+  //
+  // THE PROBE IS THE WINDOW, and the fake says when it is open. Two writes come
+  // before the label — the dispatch's registration and the supervisor's own
+  // fallback one — and both carry a `startTimesFor` that spends PowerShell time,
+  // so "after the dispatch process exits" is not after them under load: a wedge
+  // aimed by that clock landed on the supervisor's pid write instead, which
+  // refuses in another place entirely (supervisor.log, not run.log) and leaves
+  // this test hanging on a message nobody was ever going to write. The probe mark
+  // is downstream of both.
+  const brief = writeBrief('briefsightwedge.md', 'the label will not land');
+  // Outside the jobs root: everything in there is a job directory as far as this
+  // runtime is concerned, and a stray file in it is not this test's to invent.
+  const mark = path.join(os.tmpdir(), `codex-dispatch-sightwedge-${process.pid}.mark`);
+  fs.rmSync(mark, { force: true });
+  const child = spawn(process.execPath,
+    [RUNTIME, 'dispatch', '--brief', brief, '--role', 'sightwedge'], {
+      env: {
+        ...baseEnv,
+        FAKE_CODEX_SLEEP_MS: '60000',
+        FAKE_CODEX_SANDBOX_DELAY_MS: '10000',
+        FAKE_CODEX_SANDBOX_MARK: mark,
+        CODEX_DISPATCH_TEST_WRITE_BUDGET_MS: '1000',
+      },
+      cwd: REPO,
+    });
+  child.stdout.resume();
+  child.stderr.resume();
+  const dirOf = () => {
+    const name = fs.readdirSync(JOBS).find((n) => n.startsWith('sightwedge-'));
+    return name ? path.join(JOBS, name) : null;
+  };
+  assert.ok(await poll(() => fs.existsSync(mark) && !!dirOf(), 40000, 20),
+    'the supervisor must be inside its sight probe, which is the write before the label');
+  const dir = dirOf();
+  const id = path.basename(dir);
+  const wedge = wedgeRecord(dir);
+  try {
+    assert.equal(record(id).sight, undefined,
+      'the wedge must be in before the label is written, or this test proves nothing');
+    assert.ok(await poll(() => /SIGHT LABEL COULD NOT BE RECORDED/.test(runLogOf(dir)), 60000, 100),
+      `the supervisor must refuse the run rather than spend on an undeliverable one:\n` +
+      `run.log: ${runLogOf(dir)}\nsupervisor.log: ${
+        (() => { try { return fs.readFileSync(path.join(dir, 'supervisor.log'), 'utf8'); } catch { return '(none)'; } })()}`);
+    const log = runLogOf(dir);
+    assert.match(log, /THE SIGHT LABEL COULD NOT BE RECORDED \(locked\) — refusing to run\./);
+    assert.match(log, /Nothing has been launched, so nothing was billed/);
+  } finally {
+    liftWedge(wedge);
+    fs.rmSync(mark, { force: true });
+  }
+  // Lifted, the refusal itself lands — which is the other half of the contract:
+  // the job is FAILED with a reason the docs carry, not left reading running.
+  assert.ok(await poll(() => record(id).state === 'failed', 20000, 50),
+    `the refusal lands once the lock comes free: ${JSON.stringify(record(id))}`);
+  assert.equal(record(id).reason, 'record-write-refused');
+  // Non-vacuity (observed): with `recordSightLabel` reverted to the fire-and-forget
+  // `updateRecord`, nothing is said about the label at all — the poll above times
+  // out, run.log is empty, and the supervisor walks on to the next write and dies
+  // against it with a message about the record no longer saying "running". What is
+  // left is a job reading `running` with NO sight on it: stale for ever, holding
+  // its role, and refused as unvouched if it had ever produced anything.
+  assert.equal(fs.existsSync(path.join(dir, 'received-brief.bin')), false,
+    'codex was never reached: the fake writes that file the moment it starts');
+  assert.equal(fs.existsSync(path.join(dir, 'child.pid')), false, 'nor anything under it');
+  assert.equal(fs.existsSync(path.join(dir, 'out.txt')), false, 'and nothing was produced or billed');
+});
+
+test('codex that was spawned and could not be recorded is KILLED, not left billing', async () => {
+  // The write that turns a spawned codex into a KILLABLE one. Lost, the record
+  // keeps `launch: 'exec-spawning'` and no `codexPids`, so every cancel writes
+  // `kill-pending` and kills nothing while codex runs on and bills — a run nobody
+  // can stop except by promise. So the registration is insisted on, and a failure
+  // kills what was just spawned rather than leaving it unkillable.
+  //
+  // The exec pause is the seam — it holds the supervisor between codex existing
+  // and its pids being written down — and the record is corrupted inside it: the
+  // branch does not care which refusal it got, and `corrupt` is refused at once
+  // where `locked` costs a lock wait.
+  const brief = writeBrief('briefregwedge.md', 'this codex will never be recorded');
+  const d = run(['dispatch', '--brief', brief, '--role', 'regwedge'], {
+    FAKE_CODEX_SLEEP_MS: '60000',
+    CODEX_DISPATCH_TEST_EXEC_PAUSE_MS: '5000',
+  });
+  assert.equal(d.status, 0, d.stderr);
+  const id = jobIdFrom(d.stdout);
+  const dir = path.join(JOBS, id);
+  assert.ok(await poll(() => fs.existsSync(path.join(dir, 'child.pid')), 30000, 25),
+    'codex must be up and the supervisor inside the exec window');
+  fs.writeFileSync(path.join(dir, 'job.json'), '{ not json');
+  const grandchild = Number(fs.readFileSync(path.join(dir, 'child.pid'), 'utf8').trim());
+
+  // Non-vacuity (observed): with the registration reverted to the fire-and-forget
+  // `updateRecord`, nothing is said and nothing is killed — the poll below times
+  // out, the fake codex is still alive at the end of it, and it goes on to write
+  // its answer sixty seconds later under a record that cannot name a target.
+  assert.ok(await poll(() => /COULD NOT BE RECORDED/.test(runLogOf(dir)), 40000, 100),
+    `a codex that cannot be recorded must be refused out loud:\n${runLogOf(dir)}`);
+  // The refusal write's own report is the LAST line of this sequence and it is
+  // appended a kill later, so it is waited for rather than read out of a snapshot
+  // taken the instant the first message landed.
+  assert.ok(await poll(() => /refusal could not be written/.test(runLogOf(dir)), 30000, 50),
+    `the refusal write is checked too, and reported:\n${runLogOf(dir)}`);
+  const log = runLogOf(dir);
+  assert.match(log, /supervisor: CODEX WAS SPAWNED AND COULD NOT BE RECORDED \(corrupt\) — refusing to run it\./);
+  assert.match(log, /A codex whose pids are not on the record cannot be cancelled/);
+  assert.match(log, /It has been killed\s+instead, and verified dead/,
+    'and the kill is stated with its verification, like every other kill here');
+  assert.match(log, /this refusal could not be written to the record \(corrupt\)/,
+    'the refusal write is checked too: a record it could not reach is reported, never assumed');
+  assert.match(log, /What was spawned has been killed and verified dead; the\s+"regwedge" role claim has been released/,
+    'and it says what really happened here: this is the one refusal path that reaches this report AFTER a spawn');
+  assert.equal(/Nothing was launched/.test(log), false,
+    'the generic sentence is a lie on this path — codex existed, was killed, and was watched die');
+
+  const pids = fs.readFileSync(path.join(dir, 'codex.pid'), 'utf8').trim().split(/\r?\n/).map(Number);
+  assert.ok(pids.length && pids.every(isFinite), `codex's pids were written down: ${pids}`);
+  assert.ok(await poll(() => pids.every((p) => !pidAlive(p)), 20000),
+    'codex is dead — milliseconds of it are cheaper than the only handle on it');
+  assert.ok(await poll(() => !pidAlive(grandchild), 20000),
+    'and so is its child: the kill goes through the tree, or "verified dead" means nothing');
+  assert.equal(fs.existsSync(path.join(dir, 'out.txt')), false,
+    'it never got as far as an answer, which is the trade this branch makes on purpose');
+});
 
 test('every state/reason pair this suite put on disk is one the docs allow', () => {
   // The record-level half of the pair contract (the source-level half is in

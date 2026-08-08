@@ -374,4 +374,31 @@ Things the brief left open, decided here:
   wrapper-pid defect lived under full coverage. A test suite that cannot reach a
   code path is not evidence about that code path, and the cheapest fix was eight
   lines of batch file.
+- **A refusal reached after a spawn says so, and it takes a flag to know.** The
+  supervisor's pre-launch refusals share one helper, and its report for a record
+  it could not write ended "nothing was launched" — true for all of them until
+  the codex-pid registration became a refusal too, which is reached with codex
+  spawned, killed and verified dead. Neither of the two things already on hand
+  could stand in for the distinction: the `release` flag is set from whether the
+  *kill* verified, so a verified one arrives looking exactly like a pre-launch
+  refusal, and the reason (`record-write-refused`) is shared with the sight-label
+  refusal, where nothing is spawned. So the caller that spawned passes
+  `spawned: true` and gets a sentence about what it killed. A message that is
+  false in one caller is the same defect class as everything else in this
+  catalog — a claim rather than a fact — and it costs one option to not make it.
+- **The acquisition guard's self-heal matches on the PID ALONE, not on the
+  nonce.** A tombstone naming this process is what a release whose final `rmSync`
+  failed leaves behind, and the guard reads it as a live blocker: every later
+  acquisition of that job — including this process's own — then waits its fifteen
+  seconds and refuses, with the sweep that would collect it sitting behind the
+  guard. Clearing it is finishing our own release, so both guard consumers remove
+  it and carry on. The nonce is the right test everywhere else (a breaker must
+  prove the tombstone is the *acquisition* it condemned, not merely that pid's),
+  and it is the wrong one here: it would refuse to clear litter left by an earlier
+  acquisition of this same process, which is most of it. What makes the wider
+  match safe is a property of this runtime rather than of the filesystem — it is
+  single-threaded and holds one record lock at a time, so at the moment the guard
+  asks there is no acquisition of ours in flight and a self-pid tombstone can only
+  be litter. If anything here ever becomes concurrent, this predicate is one of
+  the things that has to be rewritten before it is.
 
